@@ -1,0 +1,797 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Image Optimizer</title>
+<style>
+:root {
+  --bg: #f5f2ed;
+  --surface: #ffffff;
+  --surface2: #f0ece6;
+  --border: #d9d3cb;
+  --text: #3d3833;
+  --text2: #8a8580;
+  --accent: #588b8b;
+  --accent2: #4a7a7a;
+  --green: #7a9e7e;
+  --red: #c96b6b;
+  --yellow: #d4a85c;
+  --radius: 8px;
+  --shadow: 0 1px 6px rgba(0,0,0,.08);
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans SC", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  font-size: 14px;
+  line-height: 1.5;
+}
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--surface); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+/* Header */
+header {
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding: 16px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+header h1 { font-size: 20px; font-weight: 700; }
+header h1 span { color: var(--accent); }
+.header-right { display: flex; align-items: center; gap: 16px; font-size: 13px; color: var(--text2); }
+.status-dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  margin-right: 6px;
+}
+.status-dot.ok { background: var(--green); }
+.status-dot.warn { background: var(--yellow); }
+.status-dot.err { background: var(--red); }
+
+/* Main Layout */
+.container { max-width: 1200px; margin: 0 auto; padding: 20px 24px; display: flex; flex-direction: column; gap: 20px; }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+}
+
+.card-title {
+  font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px;
+  color: var(--text2); margin-bottom: 14px;
+}
+
+/* Input Section */
+.input-row { display: flex; gap: 8px; margin-bottom: 14px; }
+.input-row input[type="text"] {
+  flex: 1; padding: 10px 14px; background: var(--bg); border: 1px solid var(--border);
+  border-radius: var(--radius); color: var(--text); font-size: 14px; outline: none;
+  transition: border-color .2s;
+}
+.input-row input[type="text"]:focus { border-color: var(--accent); }
+.btn {
+  padding: 10px 20px; border: none; border-radius: var(--radius); cursor: pointer;
+  font-size: 14px; font-weight: 500; transition: all .2s; white-space: nowrap;
+}
+.btn-primary { background: var(--accent); color: #000; }
+.btn-primary:hover { background: var(--accent2); }
+.btn-primary:disabled { opacity: .4; cursor: not-allowed; }
+.btn-secondary { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
+.btn-secondary:hover { background: var(--border); }
+.btn-danger { background: var(--red); color: #fff; }
+.btn-danger:hover { opacity: .8; }
+
+.drop-zone {
+  border: 2px dashed var(--border); border-radius: var(--radius);
+  padding: 40px; text-align: center; color: var(--text2); cursor: pointer;
+  transition: all .2s;
+}
+.drop-zone:hover, .drop-zone.drag-over { border-color: var(--accent); background: rgba(79,195,247,.05); }
+.drop-zone-icon { font-size: 36px; margin-bottom: 8px; }
+.drop-zone-text { font-size: 15px; }
+.drop-zone-hint { font-size: 12px; margin-top: 4px; }
+
+/* Config */
+.config-grid { display: flex; gap: 24px; flex-wrap: wrap; }
+.config-group { display: flex; flex-direction: column; gap: 6px; }
+.config-group label { font-size: 12px; color: var(--text2); text-transform: uppercase; letter-spacing: .5px; }
+.config-group select, .config-group input[type="number"] {
+  padding: 8px 12px; background: var(--bg); border: 1px solid var(--border);
+  border-radius: var(--radius); color: var(--text); font-size: 14px; outline: none;
+  min-width: 140px;
+}
+.config-group select:focus, .config-group input:focus { border-color: var(--accent); }
+.radio-group { display: flex; gap: 4px; background: var(--bg); border-radius: var(--radius); padding: 3px; }
+.radio-group label {
+  padding: 6px 16px; border-radius: 5px; cursor: pointer; font-size: 13px;
+  color: var(--text2); transition: all .2s; user-select: none;
+}
+.radio-group input { display: none; }
+.radio-group input:checked + label { background: var(--accent); color: #000; font-weight: 500; }
+
+/* File List */
+.file-stats { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; font-size: 13px; color: var(--text2); }
+.file-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px;
+  max-height: 360px; overflow-y: auto;
+}
+.file-card {
+  background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 8px; cursor: pointer; transition: all .2s; position: relative;
+}
+.file-card:hover { border-color: var(--accent); }
+.file-card.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.file-card .thumb {
+  width: 100%; aspect-ratio: 16/10; object-fit: cover; border-radius: 4px;
+  background: #222; display: block;
+}
+.file-card .fname {
+  font-size: 12px; margin-top: 6px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-card .fsize { font-size: 11px; color: var(--text2); }
+.file-card .check {
+  position: absolute; top: 4px; right: 4px; width: 18px; height: 18px;
+  border-radius: 50%; background: rgba(0,0,0,.6); border: 2px solid rgba(255,255,255,.3);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; color: transparent; transition: all .2s;
+}
+.file-card.selected .check { background: var(--accent); border-color: var(--accent); color: #000; }
+.file-list-empty {
+  text-align: center; padding: 30px; color: var(--text2);
+}
+
+/* Progress */
+.progress-bar {
+  height: 6px; background: var(--bg); border-radius: 3px; overflow: hidden; margin-bottom: 12px;
+}
+.progress-bar-fill {
+  height: 100%; background: linear-gradient(90deg, var(--accent), var(--green));
+  border-radius: 3px; transition: width .3s; width: 0%;
+}
+.progress-info { display: flex; justify-content: space-between; font-size: 13px; color: var(--text2); margin-bottom: 10px; }
+.log-box {
+  background: var(--bg); border-radius: var(--radius); padding: 12px 16px;
+  max-height: 240px; overflow-y: auto; font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", monospace;
+  font-size: 12px; line-height: 1.7;
+}
+.log-entry { color: var(--text2); }
+.log-entry.ok { color: var(--green); }
+.log-entry.err { color: var(--red); }
+.log-entry.info { color: var(--accent); }
+
+/* Results */
+.result-summary {
+  display: flex; gap: 24px; margin-bottom: 16px; flex-wrap: wrap;
+}
+.result-stat { text-align: center; min-width: 100px; }
+.result-stat .value { font-size: 24px; font-weight: 700; }
+.result-stat .value.green { color: var(--green); }
+.result-stat .value.accent { color: var(--accent); }
+.result-stat .label { font-size: 12px; color: var(--text2); margin-top: 2px; }
+
+.result-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px;
+  max-height: 400px; overflow-y: auto;
+}
+.result-card {
+  background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 10px; transition: all .2s;
+}
+.result-card:hover { border-color: var(--accent); }
+.result-card .thumb {
+  width: 100%; aspect-ratio: 16/10; object-fit: cover; border-radius: 4px;
+  background: #222; display: block;
+}
+.result-card .rname { font-size: 12px; margin-top: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.result-card .rstats { font-size: 11px; color: var(--text2); margin-top: 2px; }
+.result-card .rsaved { font-size: 13px; font-weight: 600; color: var(--green); margin-top: 4px; }
+.result-card .compare-btn {
+  display: inline-block; margin-top: 6px; padding: 4px 12px; font-size: 11px;
+  background: var(--surface2); color: var(--accent); border: 1px solid var(--border);
+  border-radius: 4px; cursor: pointer; text-decoration: none; transition: all .2s;
+}
+.result-card .compare-btn:hover { background: var(--border); }
+
+/* Sections visibility */
+.section { display: none; }
+.section.active { display: block; }
+
+/* Action bar */
+.action-bar { display: flex; gap: 10px; align-items: center; }
+.action-bar .btn { flex-shrink: 0; }
+.action-bar .spacer { flex: 1; }
+
+/* Responsive */
+@media (max-width: 640px) {
+  .container { padding: 12px; }
+  .input-row { flex-direction: column; }
+  .config-grid { flex-direction: column; }
+  .file-grid { grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); }
+}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Image Optimizer</h1>
+  <div class="header-right">
+    <span id="health-status"><span class="status-dot warn"></span>Checking...</span>
+    <span id="workspace-info"></span>
+  </div>
+</header>
+
+<div class="container">
+
+  <!-- Input Section -->
+  <div class="card" id="input-section">
+    <div class="card-title">Select Images</div>
+    <div class="input-row">
+      <input type="text" id="dir-path" placeholder="Screenshots folder path, e.g. D:\screenshots" />
+      <button class="btn btn-primary" id="scan-btn">Scan Folder</button>
+      <button class="btn btn-secondary" id="browse-folder-btn">Browse Folder...</button>
+      <button class="btn btn-secondary" id="browse-files-btn">Browse Files...</button>
+    </div>
+    <div style="margin-bottom:12px;display:flex;align-items:center;gap:8px;font-size:13px">
+      <label style="cursor:pointer;user-select:none;display:flex;align-items:center;gap:4px">
+        <input type="checkbox" id="recursive-scan" checked /> Include subfolders
+      </label>
+    </div>
+    <div class="drop-zone" id="drop-zone">
+      <div class="drop-zone-icon"></div>
+      <div class="drop-zone-text">Drag & drop images or folders here</div>
+      <div class="drop-zone-hint">Supports .png .jpg .jpeg .bmp .tiff</div>
+    </div>
+    <input type="file" id="file-input" accept="image/png,image/jpeg,image/bmp" multiple style="display:none" />
+    <input type="file" id="folder-input" webkitdirectory style="display:none" />
+  </div>
+
+  <!-- Output Path -->
+  <div class="card" id="output-section">
+    <div class="card-title">Output Path (optional)</div>
+    <div class="input-row">
+      <input type="text" id="output-dir" placeholder="Leave empty = save temp folder, or set a folder path" />
+      <button class="btn btn-secondary" id="output-browse-btn">Browse Folder...</button>
+    </div>
+    <div class="drop-zone" id="output-drop-zone" style="padding:16px;cursor:default">
+      <div class="drop-zone-text" style="font-size:13px">Drag & drop a folder here to open folder picker</div>
+    </div>
+  </div>
+
+  <!-- Config + Action -->
+  <div class="card section" id="config-section">
+    <div class="card-title">Settings</div>
+    <div class="config-grid" style="margin-bottom:16px">
+      <div class="config-group">
+        <label>Quality</label>
+        <div class="radio-group" id="quality-group">
+          <input type="radio" name="quality" id="q-high" value="high"><label for="q-high">High</label>
+          <input type="radio" name="quality" id="q-med" value="medium" checked><label for="q-med">Medium</label>
+          <input type="radio" name="quality" id="q-low" value="low"><label for="q-low">Low</label>
+        </div>
+      </div>
+      <div class="config-group">
+        <label>Max Width</label>
+        <select id="max-width">
+          <option value="0">No resize</option>
+          <option value="1920">1920px</option>
+          <option value="1500">1500px</option>
+          <option value="1200">1200px</option>
+        </select>
+      </div>
+      <div class="config-group">
+        <label>Output Format</label>
+        <div class="radio-group" id="format-group">
+          <input type="radio" name="format" id="fmt-png" value="png" checked><label for="fmt-png">PNG</label>
+          <input type="radio" name="format" id="fmt-webp" value="webp" disabled><label for="fmt-webp" style="opacity:.4">WebP</label>
+        </div>
+      </div>
+    </div>
+    <div class="action-bar">
+      <div class="spacer"></div>
+      <span style="font-size:13px;color:var(--text2)" id="file-count-info"></span>
+      <button class="btn btn-primary" id="start-btn" disabled>Start</button>
+    </div>
+  </div>
+
+  <!-- File List -->
+  <div class="card section" id="files-section">
+    <div class="file-stats">
+      <span id="file-stats-text"></span>
+      <label style="font-size:13px;cursor:pointer;user-select:none">
+        <input type="checkbox" id="select-all" checked /> Select all
+      </label>
+    </div>
+    <div class="file-grid" id="file-grid">
+      <div class="file-list-empty">Select a folder or drop images here</div>
+    </div>
+  </div>
+
+  <!-- Progress -->
+  <div class="card section" id="progress-section">
+    <div class="card-title">Progress</div>
+    <div class="progress-bar"><div class="progress-bar-fill" id="progress-fill"></div></div>
+    <div class="progress-info">
+      <span id="progress-text">Waiting...</span>
+      <span><button class="btn btn-danger btn-sm" id="cancel-btn" style="padding:4px 12px;font-size:12px">Cancel</button></span>
+    </div>
+    <div class="log-box" id="log-box"></div>
+  </div>
+
+  <!-- Results -->
+  <div class="card section" id="results-section">
+    <div class="card-title">Results</div>
+    <div class="result-summary" id="result-summary"></div>
+    <div class="action-bar" style="margin-bottom:12px">
+      <span id="output-path-info" style="font-size:12px;color:var(--text2)"></span>
+      <div class="spacer"></div>
+      <button class="btn btn-primary" id="download-btn" style="display:none">Download All (ZIP)</button>
+      <button class="btn btn-secondary" id="reset-btn">Reset</button>
+    </div>
+    <div class="result-grid" id="result-grid"></div>
+  </div>
+
+</div>
+
+<script>
+const STATE = {
+  files: [],
+  results: [],
+  wsName: '',
+  isRunning: false,
+  pollTimer: null,
+};
+
+// DOM refs
+const $ = id => document.getElementById(id);
+const dirPath = $('dir-path'),
+      scanBtn = $('scan-btn'),
+      dropZone = $('drop-zone'),
+      fileInput = $('file-input'),
+      folderInput = $('folder-input'),
+      outputDir = $('output-dir'),
+      outputBrowseBtn = $('output-browse-btn'),
+      outputDropZone = $('output-drop-zone'),
+      fileGrid = $('file-grid'),
+      fileStatsText = $('file-stats-text'),
+      selectAll = $('select-all'),
+      fileCountInfo = $('file-count-info'),
+      startBtn = $('start-btn'),
+      progressSection = $('progress-section'),
+      progressFill = $('progress-fill'),
+      progressText = $('progress-text'),
+      cancelBtn = $('cancel-btn'),
+      logBox = $('log-box'),
+      resultsSection = $('results-section'),
+      resultSummary = $('result-summary'),
+      resultGrid = $('result-grid'),
+      downloadBtn = $('download-btn'),
+      resetBtn = $('reset-btn'),
+      healthStatus = $('health-status'),
+      configSection = $('config-section'),
+      filesSection = $('files-section');
+
+// Utility
+function fmtSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / 1048576).toFixed(2) + ' MB';
+}
+
+// Health check
+async function checkHealth() {
+  try {
+    const r = await fetch('/api/health');
+    const d = await r.json();
+    const tools = [];
+    if (d.pngquant) tools.push('pngquant ✓');
+    else tools.push('pngquant ✗');
+    if (d.oxipng) tools.push('oxipng ✓');
+    else tools.push('oxipng ✗');
+    const allOk = d.pngquant && d.oxipng;
+    healthStatus.innerHTML =
+      `<span class="status-dot ${allOk ? 'ok' : 'warn'}"></span>${tools.join(' ')}`;
+    startBtn.disabled = true;
+    return allOk;
+  } catch(e) {
+    healthStatus.innerHTML = '<span class="status-dot err"></span>Connection failed';
+    return false;
+  }
+}
+
+// Scan directory
+scanBtn.addEventListener('click', async () => {
+  const path = dirPath.value.trim();
+  if (!path) { alert('Please enter a folder path'); return; }
+  const recursive = $('recursive-scan').checked;
+  scanBtn.disabled = true;
+  scanBtn.textContent = 'Scanning...';
+  try {
+    const r = await fetch('/api/scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ directory: path, recursive }),
+    });
+    const d = await r.json();
+    if (d.error) { alert(d.error); return; }
+    STATE.files = d.files;
+    STATE.wsName = d.files[0]?.thumbnail?.split('/')[3] || '';
+    renderFiles();
+    showConfigSection();
+  } catch(e) {
+    alert('Scan failed: ' + e.message);
+  } finally {
+    scanBtn.disabled = false;
+    scanBtn.textContent = 'Scan Folder';
+  }
+});
+
+// File input via browse button
+$('browse-files-btn').addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', async (e) => {
+  const files = e.target.files;
+  if (!files.length) return;
+  await uploadFiles(files);
+});
+
+// Folder input via browse folder button
+$('browse-folder-btn').addEventListener('click', () => folderInput.click());
+folderInput.addEventListener('change', async (e) => {
+  const files = e.target.files;
+  if (!files.length) return;
+  await uploadFolder(files);
+});
+
+// Output path browse button
+outputBrowseBtn.addEventListener('click', async () => {
+  try {
+    outputBrowseBtn.disabled = true;
+    outputBrowseBtn.textContent = 'Selecting...';
+    const r = await fetch('/api/browse-folder');
+    const d = await r.json();
+    if (d.path) outputDir.value = d.path;
+  } catch(e) {
+    // fallback: ignore
+  } finally {
+    outputBrowseBtn.disabled = false;
+    outputBrowseBtn.textContent = 'Browse Folder...';
+  }
+});
+
+// Output path drag & drop — opens native folder picker to get real path
+outputDropZone.addEventListener('dragover', (e) => {
+  e.preventDefault();
+  outputDropZone.classList.add('drag-over');
+});
+outputDropZone.addEventListener('dragleave', () => {
+  outputDropZone.classList.remove('drag-over');
+});
+outputDropZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  outputDropZone.classList.remove('drag-over');
+  // Show hint that drop triggers folder picker
+  const orig = outputDropZone.querySelector('.drop-zone-text');
+  if (orig) orig.textContent = 'Opening folder picker...';
+  fetch('/api/browse-folder').then(r => r.json()).then(d => {
+    if (d.path) outputDir.value = d.path;
+    if (orig) orig.textContent = 'Or drag & drop a folder here to set output path';
+  }).catch(() => {
+    if (orig) orig.textContent = 'Or drag & drop a folder here to set output path';
+  });
+});
+
+// Drag & drop
+dropZone.addEventListener('click', () => fileInput.click());
+dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+dropZone.addEventListener('drop', async (e) => {
+  e.preventDefault();
+  dropZone.classList.remove('drag-over');
+  const files = e.dataTransfer.files;
+  if (files.length) await uploadFiles(files);
+});
+
+async function uploadFiles(files) {
+  const formData = new FormData();
+  for (const f of files) formData.append('files', f);
+  dropZone.textContent = 'Uploading...';
+  try {
+    const r = await fetch('/api/upload', { method: 'POST', body: formData });
+    const d = await r.json();
+    STATE.files = d.files;
+    STATE.wsName = d.files[0]?.thumbnail?.split('/')[3] || '';
+    renderFiles();
+    showConfigSection();
+  } catch(e) {
+    alert('Upload failed: ' + e.message);
+  }
+}
+
+// Folder upload via Browse Folder... (webkitdirectory input)
+async function uploadFolder(files) {
+  const formData = new FormData();
+  for (const f of files) {
+    const path = f.webkitRelativePath || f.name;
+    formData.append('files', new File([f], path, { type: f.type }));
+  }
+  dropZone.textContent = 'Uploading...';
+  try {
+    const r = await fetch('/api/upload', { method: 'POST', body: formData });
+    const d = await r.json();
+    STATE.files = d.files;
+    STATE.wsName = d.files[0]?.thumbnail?.split('/')[3] || '';
+    renderFiles();
+    showConfigSection();
+  } catch(e) {
+    alert('Upload failed: ' + e.message);
+  }
+}
+
+// Render file grid
+function renderFiles() {
+  const files = STATE.files;
+  if (!files.length) {
+    fileGrid.innerHTML = '<div class="file-list-empty">No images found</div>';
+    fileStatsText.textContent = '';
+    selectAll.checked = true;
+    return;
+  }
+  let html = '';
+  for (const f of files) {
+    html += `
+      <div class="file-card selected" data-id="${f.id}" onclick="toggleFile('${f.id}')">
+        <img class="thumb" src="${f.thumbnail}" alt="${f.name}" loading="lazy" />
+        <div class="fname" title="${f.name}">${f.name}</div>
+        <div class="fsize">${fmtSize(f.size)}</div>
+        <div class="check">✓</div>
+      </div>
+    `;
+  }
+  fileGrid.innerHTML = html;
+  const total = files.reduce((s, f) => s + f.size, 0);
+  fileStatsText.textContent = `${files.length} file(s), ${fmtSize(total)} total`;
+  selectAll.checked = true;
+}
+
+function toggleFile(id) {
+  const el = fileGrid.querySelector(`[data-id="${id}"]`);
+  if (!el) return;
+  el.classList.toggle('selected');
+  const all = fileGrid.querySelectorAll('.file-card');
+  const sel = fileGrid.querySelectorAll('.file-card.selected');
+  selectAll.checked = all.length === sel.length;
+}
+
+selectAll.addEventListener('change', () => {
+  const checked = selectAll.checked;
+  fileGrid.querySelectorAll('.file-card').forEach(el => el.classList.toggle('selected', checked));
+});
+
+// Show config and files sections
+function showConfigSection() {
+  configSection.classList.add('active');
+  filesSection.classList.add('active');
+  const files = STATE.files;
+  fileCountInfo.textContent = `${files.length} files ready`;
+  startBtn.disabled = false;
+}
+
+// Start optimization
+startBtn.addEventListener('click', async () => {
+  const selected = fileGrid.querySelectorAll('.file-card.selected');
+  const ids = Array.from(selected).map(el => el.dataset.id);
+
+  const quality = document.querySelector('input[name="quality"]:checked').value;
+  const maxWidth = parseInt($('max-width').value);
+  const format = 'png';
+  const outputDir = $('output-dir').value.trim();
+
+  STATE.isRunning = true;
+  STATE.results = [];
+
+  // Show progress section
+  progressSection.classList.add('active');
+  resultsSection.classList.remove('active');
+  logBox.innerHTML = '';
+  progressFill.style.width = '0%';
+  progressText.textContent = 'Starting...';
+  startBtn.disabled = true;
+
+  try {
+    const r = await fetch('/api/optimize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file_ids: ids, quality, max_width: maxWidth, output_format: format, output_dir: outputDir }),
+    });
+    const d = await r.json();
+    if (d.error) { alert(d.error); return; }
+
+    // Poll progress
+    STATE.pollTimer = setInterval(pollProgress, 400);
+  } catch(e) {
+    alert('Start failed: ' + e.message);
+    startBtn.disabled = false;
+  }
+});
+
+async function pollProgress() {
+  try {
+    const r = await fetch('/api/progress');
+    const d = await r.json();
+
+    STATE.isRunning = d.running;
+
+    // Update progress bar
+    const pct = d.total > 0 ? Math.round(d.current / d.total * 100) : 0;
+    progressFill.style.width = pct + '%';
+    progressText.textContent = d.running ? `Processing ${d.current}/${d.total}` : `${d.current}/${d.total}`;
+
+    // Update logs
+    if (d.logs && d.logs.length) {
+      const logs = d.logs;
+      const lastLog = logs[logs.length - 1] || '';
+      let cls = 'log-entry';
+      if (lastLog.startsWith('  ✓')) cls += ' ok';
+      else if (lastLog.startsWith('  ✗')) cls += ' err';
+      else if (lastLog.startsWith('  ')) cls += ' info';
+      logBox.innerHTML = logs.map((l, i) => {
+        let c = 'log-entry';
+        if (l.startsWith('  ✓')) c += ' ok';
+        else if (l.startsWith('  ✗')) c += ' err';
+        else if (l.startsWith('  ')) c += ' info';
+        return `<div class="${c}">${l}</div>`;
+      }).join('');
+      logBox.scrollTop = logBox.scrollHeight;
+    }
+
+    // Check if done
+    if (!d.running && d.results && d.results.length > 0) {
+      clearInterval(STATE.pollTimer);
+      STATE.results = d.results;
+      STATE.wsName = STATE.files[0]?.thumbnail?.split('/')[3] || '';
+      showResults();
+    }
+
+    if (!d.running && d.current === 0) {
+      clearInterval(STATE.pollTimer);
+    }
+  } catch(e) {
+    // ignore poll errors
+  }
+}
+
+// Cancel
+cancelBtn.addEventListener('click', async () => {
+  await fetch('/api/cancel', { method: 'POST' });
+});
+
+// Show results
+function showResults() {
+  resultsSection.classList.add('active');
+  const results = STATE.results;
+  const success = results.filter(r => r.success);
+
+  // Summary
+  const totalOrig = success.reduce((s, r) => s + r.original_size, 0);
+  const totalComp = success.reduce((s, r) => s + r.compressed_size, 0);
+  const saved = totalOrig - totalComp;
+  const pct = totalOrig > 0 ? (saved / totalOrig * 100).toFixed(1) : 0;
+  resultSummary.innerHTML = `
+    <div class="result-stat">
+      <div class="value accent">${results.length}</div>
+      <div class="label">Files</div>
+    </div>
+    <div class="result-stat">
+      <div class="value green">${pct}%</div>
+      <div class="label">Compression</div>
+    </div>
+    <div class="result-stat">
+      <div class="value accent">${fmtSize(totalOrig)}</div>
+      <div class="label">Original</div>
+    </div>
+    <div class="result-stat">
+      <div class="value green">${fmtSize(totalComp)}</div>
+      <div class="label">Compressed</div>
+    </div>
+    <div class="result-stat">
+      <div class="value accent">${fmtSize(saved)}</div>
+      <div class="label">Saved</div>
+    </div>
+  `;
+
+  // Result cards
+  let html = '';
+  for (const r of results) {
+    if (!r.success) {
+      html += `
+        <div class="result-card" style="opacity:.5">
+          <div class="rname">✗ ${r.name}</div>
+          <div class="rstats">${r.error || 'Failed'}</div>
+        </div>`;
+      continue;
+    }
+    // Build preview URL
+    let previewUrl = '#';
+    const wsName = STATE.wsName;
+    previewUrl = `/api/preview/${wsName}/${r.id}`;
+
+    // Get relative path for result URL
+    const origPath = r.original_path || '';
+    const results = STATE.results;
+
+    html += `
+      <div class="result-card">
+        <div class="rname" title="${r.name}">${r.name}</div>
+        <div class="rstats">${fmtSize(r.original_size)} → ${fmtSize(r.compressed_size)}</div>
+        <div class="rsaved">Saved ${r.savings_percent}%</div>
+        <a class="compare-btn" href="${previewUrl}" target="_blank">Compare</a>
+      </div>`;
+  }
+  resultGrid.innerHTML = html;
+
+  // Show output path info
+  const outputDir = $('output-dir').value.trim();
+  if (outputDir) {
+    $('output-path-info').textContent = 'Output: ' + outputDir;
+  } else {
+    $('output-path-info').textContent = '';
+  }
+
+  // Enable download
+  if (success.length > 0) {
+    downloadBtn.style.display = 'inline-block';
+  }
+  startBtn.disabled = false;
+  progressText.textContent = 'Complete';
+}
+
+// Download
+downloadBtn.addEventListener('click', async () => {
+  const wsName = STATE.wsName;
+  if (!wsName) return;
+  const a = document.createElement('a');
+  a.href = `/api/download/${wsName}`;
+  a.download = 'optimized_images.zip';
+  a.click();
+});
+
+// Reset
+resetBtn.addEventListener('click', () => {
+  STATE.files = [];
+  STATE.results = [];
+  STATE.wsName = '';
+  progressSection.classList.remove('active');
+  resultsSection.classList.remove('active');
+  configSection.classList.remove('active');
+  filesSection.classList.remove('active');
+  fileGrid.innerHTML = '<div class="file-list-empty">Select a folder or drop images here</div>';
+  fileStatsText.textContent = '';
+  startBtn.disabled = true;
+  fileCountInfo.textContent = '';
+  downloadBtn.style.display = 'none';
+  $('output-path-info').textContent = '';
+  logBox.innerHTML = '';
+  progressFill.style.width = '0%';
+  progressText.textContent = 'Waiting...';
+});
+
+// Init
+checkHealth();
+
+// Auto-scan from URL params
+const params = new URLSearchParams(window.location.search);
+const autoDir = params.get('dir');
+if (autoDir) {
+  dirPath.value = autoDir;
+  scanBtn.click();
+}
+</script>
+</body>
+</html>
