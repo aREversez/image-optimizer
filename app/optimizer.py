@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -9,6 +10,9 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from PIL import Image
+
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+HEX_COLOR_RE = re.compile(r"^#?[0-9A-Fa-f]{6}$")
 
 
 class Optimizer:
@@ -42,6 +46,27 @@ class Optimizer:
         self.oxipng_path = self._find_binary("oxipng")
 
     @staticmethod
+    def _is_png(path: Path) -> bool:
+        try:
+            with open(path, "rb") as f:
+                return f.read(8) == PNG_MAGIC
+        except Exception:
+            return False
+
+    @staticmethod
+    def _ensure_png(src: Path, dst: Path):
+        """Re-encode any Pillow-readable image (jpg/bmp/tiff/...) into a real PNG.
+
+        This is required because pngquant/oxipng only understand PNG input; without
+        this step, non-PNG sources that skip the resize path get silently copied
+        through unchanged but renamed to .png (invalid/mislabeled output).
+        """
+        img = Image.open(src)
+        if img.mode == "CMYK":
+            img = img.convert("RGB")
+        img.save(dst, format="PNG")
+
+    @staticmethod
     def _resize_image(src: Path, dst: Path, max_width: int):
         img = Image.open(src)
         w, h = img.size
@@ -52,14 +77,41 @@ class Optimizer:
         img = img.resize(new_size, Image.Resampling.LANCZOS)
         img.save(dst, format="PNG")
 
+    @staticmethod
+    def _make_color_map(colors: list[str], dst: Path) -> bool:
+        """Build a tiny reference PNG containing the given hex colors, one pixel each.
+
+        Passed to pngquant via --map so it treats these colors as important and
+        prioritizes keeping them in the generated palette (not a hard guarantee).
+        """
+        rgbs = []
+        for c in colors:
+            c = c.strip()
+            if not HEX_COLOR_RE.match(c):
+                continue
+            c = c.lstrip("#")
+            rgbs.append(tuple(int(c[i:i + 2], 16) for i in (0, 2, 4)))
+        if not rgbs:
+            return False
+        img = Image.new("RGB", (len(rgbs), 1))
+        img.putdata(rgbs)
+        img.save(dst, format="PNG")
+        return True
+
     async def optimize_png(
         self,
         input_path: Path,
         output_path: Path,
         quality: str = "medium",
         max_width: int = 0,
+        compression_mode: str = "standard",
+        protected_colors: Optional[list[str]] = None,
+        dithering: bool = True,
         progress_callback: Optional[Callable] = None,
     ) -> dict:
+        if compression_mode not in ("standard", "lossless", "resize_only"):
+            compression_mode = "standard"
+
         original_size = os.path.getsize(input_path)
         result = {
             "success": False,
@@ -72,18 +124,29 @@ class Optimizer:
 
         try:
             working_path = input_path
+            loop = asyncio.get_event_loop()
+
+            # Step 0: guarantee we're working with a real PNG from here on, regardless
+            # of the source format and regardless of whether a resize happens next.
+            if not self._is_png(working_path):
+                normalized = output_path.with_suffix(".src.png")
+                await loop.run_in_executor(None, self._ensure_png, working_path, normalized)
+                if normalized.exists():
+                    if progress_callback:
+                        await progress_callback("converted to PNG")
+                    working_path = normalized
+                    temp_files.append(normalized)
 
             if max_width > 0:
-                resized = output_path.with_suffix(f".resized{input_path.suffix}")
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, self._resize_image, input_path, resized, max_width)
+                resized = output_path.with_suffix(".resized.png")
+                await loop.run_in_executor(None, self._resize_image, working_path, resized, max_width)
                 if resized.exists():
                     if progress_callback:
                         await progress_callback(f"resized to <= {max_width}px")
                     working_path = resized
                     temp_files.append(resized)
 
-            if self.pngquant_path:
+            if compression_mode == "standard" and self.pngquant_path:
                 pngquant_tmp = output_path.with_suffix(".pngquant.png")
                 quality_map = {"high": "80-100", "medium": "65-80", "low": "50-65"}
                 q_range = quality_map.get(quality, "65-80")
@@ -91,15 +154,31 @@ class Optimizer:
                 if progress_callback:
                     await progress_callback("color quantization...")
 
+                cmd = [
+                    str(self.pngquant_path),
+                    "--quality", q_range,
+                    "--speed", "1",
+                    "--strip",
+                    "--skip-if-larger",
+                ]
+                if not dithering:
+                    cmd.append("--nofs")
+
+                map_path: Optional[Path] = None
+                if protected_colors:
+                    map_path = output_path.with_suffix(".mapcolors.png")
+                    made = await loop.run_in_executor(None, self._make_color_map, protected_colors, map_path)
+                    if made:
+                        cmd += ["--map", str(map_path)]
+                        temp_files.append(map_path)
+                    else:
+                        map_path = None
+
+                cmd += ["--output", str(pngquant_tmp), str(working_path)]
+
                 async with self._semaphore:
                     proc = await asyncio.create_subprocess_exec(
-                        str(self.pngquant_path),
-                        "--quality", q_range,
-                        "--speed", "1",
-                        "--strip",
-                        "--skip-if-larger",
-                        "--output", str(pngquant_tmp),
-                        str(working_path),
+                        *cmd,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
@@ -113,6 +192,8 @@ class Optimizer:
                     if progress_callback:
                         await progress_callback(f"pngquant: {msg} (skipped)")
                     result["warning"] = msg
+            elif compression_mode != "standard" and progress_callback:
+                await progress_callback(f"skipping color quantization ({compression_mode} mode)")
 
             if self.oxipng_path and working_path.suffix.lower() == ".png":
                 oxipng_tmp = output_path.with_suffix(".oxipng.png")

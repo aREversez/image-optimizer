@@ -97,6 +97,12 @@ header h1 span { color: var(--accent); }
 .drop-zone-icon { font-size: 36px; margin-bottom: 8px; }
 .drop-zone-text { font-size: 15px; }
 .drop-zone-hint { font-size: 12px; margin-top: 4px; }
+/* Output Path drop-zone: same visual language as the main drop-zone, just a
+   little more compact since it's an optional/secondary action. */
+.drop-zone-compact { padding: 24px; }
+.drop-zone-compact .drop-zone-icon { font-size: 26px; margin-bottom: 6px; }
+.drop-zone-compact .drop-zone-text { font-size: 13px; }
+.drop-zone-compact .drop-zone-hint { font-size: 11px; }
 
 /* Config */
 .config-grid { display: flex; gap: 24px; flex-wrap: wrap; }
@@ -108,6 +114,12 @@ header h1 span { color: var(--accent); }
   min-width: 140px;
 }
 .config-group select:focus, .config-group input:focus { border-color: var(--accent); }
+.config-group input[type="text"] {
+  padding: 8px 12px; background: var(--bg); border: 1px solid var(--border);
+  border-radius: var(--radius); color: var(--text); font-size: 14px; outline: none;
+  min-width: 180px;
+}
+.config-group.disabled-group { opacity: .45; }
 .radio-group { display: flex; gap: 4px; background: var(--bg); border-radius: var(--radius); padding: 3px; }
 .radio-group label {
   padding: 6px 16px; border-radius: 5px; cursor: pointer; font-size: 13px;
@@ -115,6 +127,10 @@ header h1 span { color: var(--accent); }
 }
 .radio-group input { display: none; }
 .radio-group input:checked + label { background: var(--accent); color: #000; font-weight: 500; }
+.check-row {
+  display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer;
+  user-select: none; padding: 8px 0;
+}
 
 /* File List */
 .file-stats { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; font-size: 13px; color: var(--text2); }
@@ -260,8 +276,10 @@ header h1 span { color: var(--accent); }
       <input type="text" id="output-dir" placeholder="Leave empty = save temp folder, or set a folder path" />
       <button class="btn btn-secondary" id="output-browse-btn">Browse Folder...</button>
     </div>
-    <div class="drop-zone" id="output-drop-zone" style="padding:16px;cursor:default">
-      <div class="drop-zone-text" style="font-size:13px">Drag & drop a folder here to open folder picker</div>
+    <div class="drop-zone drop-zone-compact" id="output-drop-zone">
+      <div class="drop-zone-icon"></div>
+      <div class="drop-zone-text">Drag & drop a folder here</div>
+      <div class="drop-zone-hint">Opens the folder picker</div>
     </div>
   </div>
 
@@ -293,7 +311,37 @@ header h1 span { color: var(--accent); }
           <input type="radio" name="format" id="fmt-webp" value="webp" disabled><label for="fmt-webp" style="opacity:.4">WebP</label>
         </div>
       </div>
+      <div class="config-group">
+        <label title="Choose how compression is achieved.">Compression Mode</label>
+        <div class="radio-group" id="mode-group">
+          <input type="radio" name="mode" id="mode-standard" value="standard" checked
+            title="Best compression. Reduces the image to a smaller color palette before compressing — may cause slight color shifts on small or unique-colored details.">
+          <label for="mode-standard"
+            title="Best compression. Reduces the image to a smaller color palette before compressing — may cause slight color shifts on small or unique-colored details.">Standard</label>
+          <input type="radio" name="mode" id="mode-lossless" value="lossless"
+            title="No color changes at all. Compresses without touching pixel values — larger files than Standard, but pixel-perfect.">
+          <label for="mode-lossless"
+            title="No color changes at all. Compresses without touching pixel values — larger files than Standard, but pixel-perfect.">Lossless</label>
+          <input type="radio" name="mode" id="mode-resize" value="resize_only"
+            title="Shrinks image dimensions (requires Max Width to be set) and compresses losslessly — keeps full original color accuracy at the smaller size.">
+          <label for="mode-resize"
+            title="Shrinks image dimensions (requires Max Width to be set) and compresses losslessly — keeps full original color accuracy at the smaller size.">Resize Only</label>
+        </div>
+      </div>
+      <div class="config-group" id="protect-colors-group">
+        <label title="Colors listed here are prioritized when building the compressed palette, reducing the chance they get replaced by a similar color. Not a 100% guarantee. Only applies in Standard mode.">Protect Colors</label>
+        <input type="text" id="protect-colors" placeholder="#2ecc71, #ff0000"
+          title="Colors listed here (hex codes, comma-separated) are prioritized when building the compressed palette, reducing the chance they get replaced by a similar color. Not a 100% guarantee — pngquant may still adjust the rest of the palette. Only applies in Standard mode.">
+      </div>
+      <div class="config-group" id="dithering-group">
+        <label title="Smooths color transitions by mixing nearby palette colors in a fine pattern. Only applies in Standard mode.">Dithering</label>
+        <label class="check-row"
+          title="Smooths color transitions by mixing nearby palette colors in a fine pattern. Usually helps gradients and photos, but can make flat-color graphics (icons, UI screenshots) look slightly grainy. Turn off for cleaner flat colors. Only applies in Standard mode.">
+          <input type="checkbox" id="dithering" checked /> Enabled
+        </label>
+      </div>
     </div>
+    <div id="mode-hint" style="display:none;font-size:12px;color:var(--red);margin:-8px 0 16px"></div>
     <div class="action-bar">
       <div class="spacer"></div>
       <span style="font-size:13px;color:var(--text2)" id="file-count-info"></span>
@@ -376,7 +424,12 @@ const dirPath = $('dir-path'),
       resetBtn = $('reset-btn'),
       healthStatus = $('health-status'),
       configSection = $('config-section'),
-      filesSection = $('files-section');
+      filesSection = $('files-section'),
+      protectColorsInput = $('protect-colors'),
+      protectColorsGroup = $('protect-colors-group'),
+      ditheringInput = $('dithering'),
+      ditheringGroup = $('dithering-group'),
+      modeHint = $('mode-hint');
 
 // Utility
 function fmtSize(bytes) {
@@ -498,19 +551,33 @@ dropZone.addEventListener('drop', async (e) => {
   if (files.length) await uploadFiles(files);
 });
 
+// dropZone's original markup, so the "Uploading..." status can be restored
+// afterwards instead of permanently replacing the drag-and-drop prompt.
+const dropZoneOriginalHTML = dropZone.innerHTML;
+
+function setDropZoneUploading(count) {
+  dropZone.innerHTML = `<div class="drop-zone-text">Uploading ${count} file${count === 1 ? '' : 's'}... please wait</div>`;
+}
+function resetDropZone() {
+  dropZone.innerHTML = dropZoneOriginalHTML;
+}
+
 async function uploadFiles(files) {
   const formData = new FormData();
   for (const f of files) formData.append('files', f);
-  dropZone.textContent = 'Uploading...';
+  setDropZoneUploading(files.length);
   try {
     const r = await fetch('/api/upload', { method: 'POST', body: formData });
     const d = await r.json();
+    if (d.error) { alert(d.error); return; }
     STATE.files = d.files;
     STATE.wsName = d.files[0]?.thumbnail?.split('/')[3] || '';
     renderFiles();
     showConfigSection();
   } catch(e) {
     alert('Upload failed: ' + e.message);
+  } finally {
+    resetDropZone();
   }
 }
 
@@ -521,16 +588,19 @@ async function uploadFolder(files) {
     const path = f.webkitRelativePath || f.name;
     formData.append('files', new File([f], path, { type: f.type }));
   }
-  dropZone.textContent = 'Uploading...';
+  setDropZoneUploading(files.length);
   try {
     const r = await fetch('/api/upload', { method: 'POST', body: formData });
     const d = await r.json();
+    if (d.error) { alert(d.error); return; }
     STATE.files = d.files;
     STATE.wsName = d.files[0]?.thumbnail?.split('/')[3] || '';
     renderFiles();
     showConfigSection();
   } catch(e) {
     alert('Upload failed: ' + e.message);
+  } finally {
+    resetDropZone();
   }
 }
 
@@ -579,8 +649,39 @@ function showConfigSection() {
   configSection.classList.add('active');
   filesSection.classList.add('active');
   const files = STATE.files;
-  fileCountInfo.textContent = `${files.length} files ready`;
-  startBtn.disabled = false;
+  fileCountInfo.textContent = files.length ? `${files.length} files ready` : 'No files found';
+  updateStartButtonState();
+}
+
+// Compression Mode: Protect Colors / Dithering only make sense in Standard
+// mode (they control the pngquant step, which the other two modes skip).
+function updateModeDependentControls() {
+  const mode = document.querySelector('input[name="mode"]:checked').value;
+  const isStandard = mode === 'standard';
+  protectColorsInput.disabled = !isStandard;
+  ditheringInput.disabled = !isStandard;
+  protectColorsGroup.classList.toggle('disabled-group', !isStandard);
+  ditheringGroup.classList.toggle('disabled-group', !isStandard);
+  updateStartButtonState();
+}
+document.querySelectorAll('input[name="mode"]').forEach(r => r.addEventListener('change', updateModeDependentControls));
+$('max-width').addEventListener('change', updateStartButtonState);
+
+// Central place that decides whether Start can be clicked: needs at least
+// one file, and Resize Only mode specifically needs a Max Width > 0 (it has
+// nothing else to do otherwise).
+function updateStartButtonState() {
+  const hasFiles = STATE.files.length > 0;
+  const mode = document.querySelector('input[name="mode"]:checked').value;
+  const maxWidth = parseInt($('max-width').value);
+  const resizeOnlyNeedsWidth = mode === 'resize_only' && maxWidth <= 0;
+  if (resizeOnlyNeedsWidth) {
+    modeHint.textContent = 'Resize Only mode needs a Max Width other than "No resize".';
+    modeHint.style.display = 'block';
+  } else {
+    modeHint.style.display = 'none';
+  }
+  startBtn.disabled = STATE.isRunning || !hasFiles || resizeOnlyNeedsWidth;
 }
 
 // Start optimization
@@ -592,6 +693,9 @@ startBtn.addEventListener('click', async () => {
   const maxWidth = parseInt($('max-width').value);
   const format = 'png';
   const outputDir = $('output-dir').value.trim();
+  const compressionMode = document.querySelector('input[name="mode"]:checked').value;
+  const protectedColors = protectColorsInput.value.split(',').map(s => s.trim()).filter(Boolean);
+  const dithering = ditheringInput.checked;
 
   STATE.isRunning = true;
   STATE.results = [];
@@ -608,16 +712,25 @@ startBtn.addEventListener('click', async () => {
     const r = await fetch('/api/optimize', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ file_ids: ids, quality, max_width: maxWidth, output_format: format, output_dir: outputDir }),
+      body: JSON.stringify({
+        file_ids: ids, quality, max_width: maxWidth, output_format: format, output_dir: outputDir,
+        compression_mode: compressionMode, protected_colors: protectedColors, dithering,
+      }),
     });
     const d = await r.json();
-    if (d.error) { alert(d.error); return; }
+    if (d.error) {
+      alert(d.error);
+      STATE.isRunning = false;
+      updateStartButtonState();
+      return;
+    }
 
     // Poll progress
     STATE.pollTimer = setInterval(pollProgress, 400);
   } catch(e) {
     alert('Start failed: ' + e.message);
-    startBtn.disabled = false;
+    STATE.isRunning = false;
+    updateStartButtonState();
   }
 });
 
@@ -748,7 +861,7 @@ function showResults() {
   if (success.length > 0) {
     downloadBtn.style.display = 'inline-block';
   }
-  startBtn.disabled = false;
+  updateStartButtonState();
   progressText.textContent = 'Complete';
 }
 
@@ -784,6 +897,7 @@ resetBtn.addEventListener('click', () => {
 
 // Init
 checkHealth();
+updateModeDependentControls();
 
 // Auto-scan from URL params
 const params = new URLSearchParams(window.location.search);
