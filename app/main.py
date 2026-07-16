@@ -248,8 +248,15 @@ async def start_optimization(data: OptimizeRequest):
     if state.is_running:
         return JSONResponse({"error": "Optimization in progress, please wait"}, status_code=400)
 
+    if data.compression_mode not in ("standard", "lossless", "resize_only"):
+        return JSONResponse({"error": "Invalid compression_mode"}, status_code=400)
+    if data.compression_mode == "resize_only" and data.max_width <= 0:
+        return JSONResponse(
+            {"error": "Resize Only mode requires Max Width to be set"}, status_code=400
+        )
+
     files_to_process = state.files
-    if data.file_ids:
+    if data.file_ids is not None:
         ids = set(data.file_ids)
         files_to_process = [f for f in state.files if f["id"] in ids]
 
@@ -264,13 +271,31 @@ async def start_optimization(data: OptimizeRequest):
     state.cancelled = False
 
     asyncio.create_task(
-        _process_files(files_to_process, data.quality, data.max_width, data.output_format, data.output_dir)
+        _process_files(
+            files_to_process,
+            data.quality,
+            data.max_width,
+            data.output_format,
+            data.output_dir,
+            data.compression_mode,
+            data.protected_colors,
+            data.dithering,
+        )
     )
 
     return JSONResponse({"ok": True, "total": len(files_to_process)})
 
 
-async def _process_files(files: list, quality: str, max_width: int, output_format: str, output_dir: str = ""):
+async def _process_files(
+    files: list,
+    quality: str,
+    max_width: int,
+    output_format: str,
+    output_dir: str = "",
+    compression_mode: str = "standard",
+    protected_colors: Optional[list] = None,
+    dithering: bool = True,
+):
     global state
     if optimizer is None:
         state.logs.append("Optimizer not initialized")
@@ -312,6 +337,9 @@ async def _process_files(files: list, quality: str, max_width: int, output_forma
             output_path=out_path,
             quality=quality,
             max_width=max_width,
+            compression_mode=compression_mode,
+            protected_colors=protected_colors,
+            dithering=dithering,
             progress_callback=log,
         )
 
@@ -350,7 +378,8 @@ async def _process_files(files: list, quality: str, max_width: int, output_forma
             user_output.mkdir(parents=True, exist_ok=True)
             for f in opt_output_dir.rglob("*"):
                 if f.is_file():
-                    dest = user_output / f.name
+                    dest = user_output / f.relative_to(opt_output_dir)
+                    dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(f, dest)
             state.logs.append(f"  Output saved to: {user_output.resolve()}")
         except Exception as e:
@@ -417,6 +446,9 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 .bar{background:#fff;padding:12px 20px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #ddd;font-size:14px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
 .bar .title{font-weight:600;color:#555}
 .bar .stats{color:#888}
+.view-toggle{display:flex;gap:4px}
+.view-btn{padding:4px 10px;font-size:12px;border:1px solid #ddd;background:#fff;border-radius:4px;cursor:pointer;color:#666}
+.view-btn.active{background:#333;color:#fff;border-color:#333}
 .container{flex:1;display:flex}
 .panel{flex:1;display:flex;flex-direction:column;overflow:hidden}
 .panel:first-child{border-right:1px solid #ddd}
@@ -424,6 +456,10 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 .image-wrap{flex:1;display:flex;align-items:center;justify-content:center;overflow:auto;padding:16px;background:#f0f0eb}
 .image-wrap img{max-width:100%;max-height:100%;object-fit:contain}
 .footer{padding:10px 20px;text-align:center;font-size:13px;border-top:1px solid #ddd;color:#999}
+.overlay-view{flex:1;display:flex;flex-direction:column}
+.overlay-label{padding:8px 16px;font-size:12px;text-align:center;color:#888;background:#fafaf5;user-select:none}
+.overlay-wrap{flex:1;display:flex;align-items:center;justify-content:center;overflow:auto;padding:16px;background:#f0f0eb;cursor:pointer}
+.overlay-img{max-width:100%;max-height:100%;object-fit:contain}
 </style>
 </head><body>"""
     result = None
@@ -456,8 +492,12 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 <div class="bar">
   <span class="title">{result['name']}</span>
   <span class="stats">{_fmt_size(result['original_size'])} -> {_fmt_size(result['compressed_size'])} | saved {result.get('savings_percent', 0)}%</span>
+  <div class="view-toggle">
+    <button class="view-btn active" id="btn-side">Side by Side</button>
+    <button class="view-btn" id="btn-overlay">Overlay</button>
+  </div>
 </div>
-<div class="container">
+<div class="container" id="side-view">
   <div class="panel">
     <div class="label">Original ({_fmt_size(result['original_size'])})</div>
     <div class="image-wrap"><img src="{orig_url}" alt="original"/></div>
@@ -467,7 +507,55 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
     <div class="image-wrap"><img src="{comp_url}" alt="compressed"/></div>
   </div>
 </div>
-<div class="footer">Original (left) vs Compressed (right)</div>
+<div class="overlay-view" id="overlay-view" style="display:none">
+  <div class="overlay-label" id="overlay-label">Compressed &mdash; click image to toggle (or press space)</div>
+  <div class="overlay-wrap" id="overlay-wrap">
+    <img src="{orig_url}" class="overlay-img" id="overlay-orig" alt="original" style="display:none"/>
+    <img src="{comp_url}" class="overlay-img" id="overlay-comp" alt="compressed"/>
+  </div>
+</div>
+<div class="footer" id="footer-hint">Original (left) vs Compressed (right)</div>
+<script>
+(function(){{
+  var sideBtn = document.getElementById('btn-side');
+  var overlayBtn = document.getElementById('btn-overlay');
+  var sideView = document.getElementById('side-view');
+  var overlayView = document.getElementById('overlay-view');
+  var orig = document.getElementById('overlay-orig');
+  var comp = document.getElementById('overlay-comp');
+  var label = document.getElementById('overlay-label');
+  var wrap = document.getElementById('overlay-wrap');
+  var footer = document.getElementById('footer-hint');
+  var showingOriginal = false;
+
+  function setMode(mode){{
+    var isOverlay = mode === 'overlay';
+    sideView.style.display = isOverlay ? 'none' : 'flex';
+    overlayView.style.display = isOverlay ? 'flex' : 'none';
+    sideBtn.classList.toggle('active', !isOverlay);
+    overlayBtn.classList.toggle('active', isOverlay);
+    footer.textContent = isOverlay
+      ? 'Click the image (or press space) to flip between original and compressed'
+      : 'Original (left) vs Compressed (right)';
+  }}
+  sideBtn.addEventListener('click', function(){{ setMode('side'); }});
+  overlayBtn.addEventListener('click', function(){{ setMode('overlay'); }});
+
+  function toggleImage(){{
+    showingOriginal = !showingOriginal;
+    orig.style.display = showingOriginal ? 'block' : 'none';
+    comp.style.display = showingOriginal ? 'none' : 'block';
+    label.textContent = (showingOriginal ? 'Original' : 'Compressed') + ' \\u2014 click image to toggle (or press space)';
+  }}
+  wrap.addEventListener('click', toggleImage);
+  document.addEventListener('keydown', function(e){{
+    if (overlayView.style.display !== 'none' && e.code === 'Space') {{
+      e.preventDefault();
+      toggleImage();
+    }}
+  }});
+}})();
+</script>
 </body></html>"""
     return HTMLResponse(html)
 

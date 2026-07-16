@@ -11,11 +11,24 @@ class ScanRequest(BaseModel):
 
 
 class OptimizeRequest(BaseModel):
-    file_ids: list[str] = []
+    # None = "no filter, process everything"; [] = "process nothing" (all files
+    # were deselected). These used to be conflated because Python treats an
+    # empty list as falsy — keep them distinct.
+    file_ids: Optional[list[str]] = None
     quality: str = "medium"
     max_width: int = 0
     output_format: str = "png"
     output_dir: str = ""
+    # "standard" = pngquant + oxipng (current default behavior)
+    # "lossless" = oxipng only, no color quantization
+    # "resize_only" = no color quantization, relies on max_width for savings
+    compression_mode: str = "standard"
+    # Hex colors (e.g. "#2ecc71") to prioritize keeping in the palette when
+    # compression_mode == "standard". Best-effort, not a hard guarantee.
+    protected_colors: list[str] = []
+    # Whether pngquant should dither (Floyd-Steinberg). Only relevant when
+    # compression_mode == "standard".
+    dithering: bool = True
 
 
 class FileInfo(BaseModel):
