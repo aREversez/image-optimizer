@@ -765,15 +765,17 @@ async function pollProgress() {
     }
 
     // Check if done
-    if (!d.running && d.results && d.results.length > 0) {
+    if (!d.running) {
       clearInterval(STATE.pollTimer);
-      STATE.results = d.results;
-      STATE.wsName = STATE.files[0]?.thumbnail?.split('/')[3] || '';
-      showResults();
-    }
-
-    if (!d.running && d.current === 0) {
-      clearInterval(STATE.pollTimer);
+      if (d.results && d.results.length > 0) {
+        STATE.results = d.results;
+        STATE.wsName = STATE.files[0]?.thumbnail?.split('/')[3] || '';
+        showResults();
+      } else {
+        // e.g. cancelled before any file finished — nothing to show, but
+        // Start still needs to become clickable again.
+        updateStartButtonState();
+      }
     }
   } catch(e) {
     // ignore poll errors

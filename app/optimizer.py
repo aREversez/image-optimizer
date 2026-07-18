@@ -192,8 +192,11 @@ class Optimizer:
                     if progress_callback:
                         await progress_callback(f"pngquant: {msg} (skipped)")
                     result["warning"] = msg
-            elif compression_mode != "standard" and progress_callback:
-                await progress_callback(f"skipping color quantization ({compression_mode} mode)")
+            elif progress_callback:
+                if compression_mode != "standard":
+                    await progress_callback(f"skipping color quantization ({compression_mode} mode)")
+                else:
+                    await progress_callback("skipping color quantization (pngquant not found)")
 
             if self.oxipng_path and working_path.suffix.lower() == ".png":
                 oxipng_tmp = output_path.with_suffix(".oxipng.png")
