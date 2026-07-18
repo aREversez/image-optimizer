@@ -19,7 +19,7 @@ if __package__ is None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.models import OptimizeRequest, ScanRequest
-from app.optimizer import Optimizer
+from app.optimizer import HEX_COLOR_RE, Optimizer
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -253,6 +253,12 @@ async def start_optimization(data: OptimizeRequest):
     if data.compression_mode == "resize_only" and data.max_width <= 0:
         return JSONResponse(
             {"error": "Resize Only mode requires Max Width to be set"}, status_code=400
+        )
+    bad_colors = [c for c in data.protected_colors if not HEX_COLOR_RE.match(c.strip())]
+    if bad_colors:
+        return JSONResponse(
+            {"error": f"Invalid color(s) in Protect Colors: {', '.join(bad_colors)}. Use hex format like #2ecc71."},
+            status_code=400,
         )
 
     files_to_process = state.files
