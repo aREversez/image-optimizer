@@ -480,7 +480,7 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 .overlay-view{flex:1;display:flex;flex-direction:column}
 .overlay-label{padding:8px 16px;font-size:12px;text-align:center;color:#888;background:#fafaf5;user-select:none}
 .overlay-wrap{flex:1;display:flex;align-items:center;justify-content:center;overflow:auto;padding:16px;background:#f0f0eb;cursor:pointer}
-.overlay-img{max-width:100%;max-height:100%;object-fit:contain}
+.overlay-img{width:100%;height:100%;object-fit:contain}
 </style>
 </head><body>"""
     result = None
