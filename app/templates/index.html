@@ -416,6 +416,7 @@ const dirPath = $('dir-path'),
       progressFill = $('progress-fill'),
       progressText = $('progress-text'),
       cancelBtn = $('cancel-btn'),
+      escHtml = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'),
       logBox = $('log-box'),
       resultsSection = $('results-section'),
       resultSummary = $('result-summary'),
@@ -751,13 +752,13 @@ async function pollProgress() {
       const logs = d.logs;
       const lastLog = logs[logs.length - 1] || '';
       let cls = 'log-entry';
-      if (lastLog.startsWith('  ✓')) cls += ' ok';
-      else if (lastLog.startsWith('  ✗')) cls += ' err';
+      if (lastLog.indexOf('OK ') !== -1 || lastLog.indexOf('✓') !== -1) cls += ' ok';
+      else if (lastLog.indexOf('FAILED') !== -1 || lastLog.indexOf('✗') !== -1) cls += ' err';
       else if (lastLog.startsWith('  ')) cls += ' info';
       logBox.innerHTML = logs.map((l, i) => {
         let c = 'log-entry';
-        if (l.startsWith('  ✓')) c += ' ok';
-        else if (l.startsWith('  ✗')) c += ' err';
+        if (l.indexOf('OK ') !== -1 || l.indexOf('✓') !== -1) c += ' ok';
+        else if (l.indexOf('FAILED') !== -1 || l.indexOf('✗') !== -1) c += ' err';
         else if (l.startsWith('  ')) c += ' info';
         return `<div class="${c}">${l}</div>`;
       }).join('');
@@ -827,7 +828,7 @@ function showResults() {
     if (!r.success) {
       html += `
         <div class="result-card" style="opacity:.5">
-          <div class="rname">✗ ${r.name}</div>
+          <div class="rname">✗ ${r.name.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>
           <div class="rstats">${r.error || 'Failed'}</div>
         </div>`;
       continue;
@@ -843,7 +844,7 @@ function showResults() {
 
     html += `
       <div class="result-card">
-        <div class="rname" title="${r.name}">${r.name}</div>
+        <div class="rname" title="${escHtml(r.name)}">${escHtml(r.name)}</div>
         <div class="rstats">${fmtSize(r.original_size)} → ${fmtSize(r.compressed_size)}</div>
         <div class="rsaved">Saved ${r.savings_percent}%</div>
         <a class="compare-btn" href="${previewUrl}" target="_blank">Compare</a>
