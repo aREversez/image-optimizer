@@ -24,7 +24,7 @@ Batch PNG compression with a local web UI. Uses **pngquant** (lossy quantization
 
 ### Option 1: Standalone EXE (Windows, no Python required)
 
-Download the latest release from the [Releases page](https://github.com/your-org/image-optimizer/releases): `ImageOptimizer-v1.0.0.zip`. Unzip and run `ImageOptimizer.exe`.
+Download the latest release from the [Releases page](https://github.com/aREversez/image-optimizer/releases) and run `ImageOptimizer.exe`.
 
 > **Windows SmartScreen:** The exe is unsigned (code signing certificates cost $200+/year for open-source projects). On first run, SmartScreen may show "Windows protected your PC" — click **More info** → **Run anyway**. This is normal for unsigned open-source software.
 
