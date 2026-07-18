@@ -15,6 +15,11 @@ All notable changes to this project will be documented in this file.
 - ZIP download of all results
 - Auto-detection of pngquant and oxipng binaries
 - Cross-platform support (Windows, macOS, Linux; binaries bundled for Windows)
+- `build_exe.py` — PyInstaller script to produce a standalone Windows exe (`--onedir`)
+- Favicon, app icon, and README banner images in `assets/`
+- PyInstaller frozen-build support (`sys._MEIPASS` path resolution)
+
+### Fixed
 
 ### Fixed
 - Path traversal vulnerabilities in file-serve endpoints

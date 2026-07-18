@@ -12,3 +12,4 @@ images
 *.egg-info/
 dist/
 build/
+*.spec

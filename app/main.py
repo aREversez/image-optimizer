@@ -22,7 +22,10 @@ if __package__ is None:
 from app.models import OptimizeRequest, ScanRequest
 from app.optimizer import HEX_COLOR_RE, Optimizer
 
-BASE_DIR = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys._MEIPASS) / "app"
+else:
+    BASE_DIR = Path(__file__).resolve().parent
 
 
 def _find_free_port(host: str, start: int, max_attempts: int = 10) -> int:
@@ -575,6 +578,14 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 </script>
 </body></html>"""
     return HTMLResponse(html)
+
+
+@app.get("/favicon.ico")
+async def favicon():
+    fav = BASE_DIR / "templates" / "favicon.ico"
+    if fav.exists():
+        return FileResponse(str(fav), media_type="image/x-icon")
+    return Response(status_code=404)
 
 
 @app.get("/api/download/{ws_name}")

@@ -17,7 +17,12 @@ HEX_COLOR_RE = re.compile(r"^#?[0-9A-Fa-f]{6}$")
 
 class Optimizer:
     def __init__(self, bin_dir: Optional[Path] = None):
-        self.bin_dir = Path(bin_dir) if bin_dir else Path(__file__).resolve().parent.parent / "bin"
+        if bin_dir:
+            self.bin_dir = Path(bin_dir)
+        elif getattr(sys, "frozen", False):
+            self.bin_dir = Path(sys._MEIPASS) / "bin"
+        else:
+            self.bin_dir = Path(__file__).resolve().parent.parent / "bin"
         self.pngquant_path: Optional[Path] = None
         self.oxipng_path: Optional[Path] = None
         self._detect_binaries()

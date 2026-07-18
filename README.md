@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/banner.png">
+  <img alt="Image Optimizer" src="assets/banner.png" width="100%">
+</picture>
+
 # Image Optimizer
 
 Batch PNG compression with a local web UI. Uses **pngquant** (lossy quantization) and **oxipng** (lossless strip/optimization) behind a clean interface.
@@ -17,9 +22,19 @@ Batch PNG compression with a local web UI. Uses **pngquant** (lossy quantization
 
 ## Quick Start
 
+### Option 1: Standalone EXE (Windows, no Python required)
+
+Download the latest release from the [Releases page](https://github.com/your-org/image-optimizer/releases): `ImageOptimizer-v1.0.0.zip`. Unzip and run `ImageOptimizer.exe`.
+
+> **Windows SmartScreen:** The exe is unsigned (code signing certificates cost $200+/year for open-source projects). On first run, SmartScreen may show "Windows protected your PC" — click **More info** → **Run anyway**. This is normal for unsigned open-source software.
+
+### Option 2: From source
+
 ```bash
+git clone https://github.com/aREversez/image-optimizer.git
+cd image-optimizer
 pip install -r requirements.txt
-start.bat          # or: python -m app
+python -m app          # or: start.bat
 ```
 
 Open http://127.0.0.1:8090 in your browser.
@@ -36,9 +51,8 @@ The first run will auto-detect `pngquant` and `oxipng` in the `bin/` folder and 
 
 ## Requirements
 
-- Python 3.10+
-- Dependencies: `fastapi`, `uvicorn`, `Pillow`, `jinja2`, `python-multipart`
-- Optional system tools: `pngquant`, `oxipng` (bundled for Windows in `bin/`)
+- **Source install:** Python 3.10+ with `fastapi`, `uvicorn`, `Pillow`, `jinja2`, `python-multipart`
+- **Standalone EXE:** Windows 10/11 64-bit, no Python required
 
 ## Project Structure
 
@@ -49,8 +63,11 @@ image-optimizer/
 │   ├── optimizer.py  # pngquant/oxipng orchestration
 │   ├── models.py     # Pydantic request models
 │   └── templates/    # HTML/CSS/JS frontend
+├── assets/           # Logo, icons, banner images
 ├── bin/              # Binary dependencies (pngquant, oxipng)
 ├── images/           # Default scan directory (gitignored)
+├── build_exe.py      # PyInstaller build script
+├── pyproject.toml    # pip-installable package config
 ├── requirements.txt
 └── start.bat
 ```
