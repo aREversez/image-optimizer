@@ -13,7 +13,7 @@ Batch PNG compression with a local web UI. Uses **pngquant** (lossy quantization
 - **Color protection** — list hex colors to preserve in the palette
 - **Dithering toggle** — smoother gradients (standard mode)
 - **Output directory** — save results to any folder (or use the built-in ZIP download)
-- **Cross-platform** — Windows, macOS, Linux
+- **Cross-platform** — Windows, macOS, Linux (binaries bundled for Windows; macOS/Linux users need `pngquant`/`oxipng` on PATH)
 
 ## Quick Start
 

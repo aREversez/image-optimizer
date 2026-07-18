@@ -129,7 +129,7 @@ def _scan_images(directory: Path, recursive: bool = True) -> list:
     iter_method = directory.rglob if recursive else directory.glob
     for pat in patterns:
         images.extend(iter_method(pat))
-    return sorted(set(images), key=lambda p: p.name)
+    return sorted(set(images))
 
 
 @app.exception_handler(Exception)
@@ -243,7 +243,8 @@ async def upload_files(files: List[UploadFile] = File(...)):
 async def get_thumbnail(ws_name: str, thumb_rel: str):
     if state.workspace and state.workspace.name == ws_name:
         p = (state.workspace / thumb_rel).resolve()
-        if p.exists() and str(p).startswith(str(state.workspace.resolve())):
+        base = str(state.workspace.resolve())
+        if p.exists() and (str(p) == base or str(p).startswith(base + os.sep)):
             return FileResponse(str(p), media_type="image/jpeg")
     return Response(status_code=404)
 
@@ -395,7 +396,8 @@ async def _process_files(
                 user_output.mkdir(parents=True, exist_ok=True)
                 for f in opt_output_dir.rglob("*"):
                     if f.is_file():
-                        dest = user_output / f.name
+                        dest = user_output / f.relative_to(opt_output_dir)
+                        dest.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(f, dest)
                 state.logs.append(f"  Output saved to: {user_output.resolve()}")
             except Exception as e:
@@ -446,8 +448,8 @@ async def get_source_file(ws_name: str, file_id: str):
 async def get_result(ws_name: str, result_path: str):
     if state.workspace and state.workspace.name == ws_name:
         p = (state.workspace / "output" / result_path).resolve()
-        output_dir = (state.workspace / "output").resolve()
-        if p.exists() and str(p).startswith(str(output_dir)):
+        base = str((state.workspace / "output").resolve())
+        if p.exists() and (str(p) == base or str(p).startswith(base + os.sep)):
             return FileResponse(str(p))
     return Response(status_code=404)
 
@@ -606,12 +608,16 @@ async def browse_folder():
     except ImportError:
         return JSONResponse({"path": "", "error": "tkinter not available"})
     try:
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        root.update()
-        path = filedialog.askdirectory(title="Select Output Directory")
-        root.destroy()
+        def _open():
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            root.update()
+            path = filedialog.askdirectory(title="Select Output Directory")
+            root.destroy()
+            return path
+        loop = asyncio.get_event_loop()
+        path = await loop.run_in_executor(None, _open)
         return JSONResponse({"path": path or ""})
     except Exception as e:
         return JSONResponse({"path": "", "error": str(e)})

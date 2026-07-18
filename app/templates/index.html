@@ -618,8 +618,8 @@ function renderFiles() {
   for (const f of files) {
     html += `
       <div class="file-card selected" data-id="${f.id}" onclick="toggleFile('${f.id}')">
-        <img class="thumb" src="${f.thumbnail}" alt="${f.name}" loading="lazy" />
-        <div class="fname" title="${f.name}">${f.name}</div>
+        <img class="thumb" src="${f.thumbnail}" alt="${escHtml(f.name)}" loading="lazy" />
+        <div class="fname" title="${escHtml(f.name)}">${escHtml(f.name)}</div>
         <div class="fsize">${fmtSize(f.size)}</div>
         <div class="check">✓</div>
       </div>
