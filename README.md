@@ -1,0 +1,77 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/banner.png">
+  <img alt="Image Optimizer" src="assets/banner.png" width="100%">
+</picture>
+
+# Image Optimizer
+
+Batch PNG compression with a local web UI. Uses **pngquant** (lossy quantization) and **oxipng** (lossless strip/optimization) behind a clean interface.
+
+## Features
+
+- **Scan a folder** or **drag & drop files** to queue images
+- **Side-by-side** and **overlay** preview before/after compression
+- **Three compression modes:**
+  - `standard` — pngquant + oxipng, best size reduction
+  - `lossless` — oxipng only, no color loss
+  - `resize only` — scale down, no quantization
+- **Color protection** — list hex colors to preserve in the palette
+- **Dithering toggle** — smoother gradients (standard mode)
+- **Output directory** — save results to any folder (or use the built-in ZIP download)
+- **Cross-platform** — Windows, macOS, Linux (binaries bundled for Windows; macOS/Linux users need `pngquant`/`oxipng` on PATH)
+
+## Quick Start
+
+### Option 1: Standalone EXE (Windows, no Python required)
+
+Download the latest release from the [Releases page](https://github.com/your-org/image-optimizer/releases): `ImageOptimizer-v1.0.0.zip`. Unzip and run `ImageOptimizer.exe`.
+
+> **Windows SmartScreen:** The exe is unsigned (code signing certificates cost $200+/year for open-source projects). On first run, SmartScreen may show "Windows protected your PC" — click **More info** → **Run anyway**. This is normal for unsigned open-source software.
+
+### Option 2: From source
+
+```bash
+git clone https://github.com/aREversez/image-optimizer.git
+cd image-optimizer
+pip install -r requirements.txt
+python -m app          # or: start.bat
+```
+
+Open http://127.0.0.1:8090 in your browser.
+
+The first run will auto-detect `pngquant` and `oxipng` in the `bin/` folder and system PATH. See `bin/README.md` if a binary is missing.
+
+## Usage
+
+1. **Select input** — scan a local folder (click *Select Folder* or drag a folder onto the drop zone)
+2. **Review files** — deselect any you want to skip, adjust quality/width/mode
+3. **Protect colors** (optional) — add hex colors like `#2ecc71` to preserve
+4. **Start** — click *Optimize* and watch the live log
+5. **Compare & download** — click any result to see a before/after preview, then download individual files or a ZIP
+
+## Requirements
+
+- **Source install:** Python 3.10+ with `fastapi`, `uvicorn`, `Pillow`, `jinja2`, `python-multipart`
+- **Standalone EXE:** Windows 10/11 64-bit, no Python required
+
+## Project Structure
+
+```
+image-optimizer/
+├── app/              # Python web application
+│   ├── main.py       # FastAPI server & routes
+│   ├── optimizer.py  # pngquant/oxipng orchestration
+│   ├── models.py     # Pydantic request models
+│   └── templates/    # HTML/CSS/JS frontend
+├── assets/           # Logo, icons, banner images
+├── bin/              # Binary dependencies (pngquant, oxipng)
+├── images/           # Default scan directory (gitignored)
+├── build_exe.py      # PyInstaller build script
+├── pyproject.toml    # pip-installable package config
+├── requirements.txt
+└── start.bat
+```
+
+## License
+
+MIT

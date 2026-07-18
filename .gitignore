@@ -8,3 +8,8 @@ venv/
 .DS_Store
 Thumbs.db
 images
+
+*.egg-info/
+dist/
+build/
+*.spec

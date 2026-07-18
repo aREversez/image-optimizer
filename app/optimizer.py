@@ -17,7 +17,12 @@ HEX_COLOR_RE = re.compile(r"^#?[0-9A-Fa-f]{6}$")
 
 class Optimizer:
     def __init__(self, bin_dir: Optional[Path] = None):
-        self.bin_dir = Path(bin_dir) if bin_dir else Path(__file__).resolve().parent.parent / "bin"
+        if bin_dir:
+            self.bin_dir = Path(bin_dir)
+        elif getattr(sys, "frozen", False):
+            self.bin_dir = Path(sys._MEIPASS) / "bin"
+        else:
+            self.bin_dir = Path(__file__).resolve().parent.parent / "bin"
         self.pngquant_path: Optional[Path] = None
         self.oxipng_path: Optional[Path] = None
         self._detect_binaries()
@@ -192,8 +197,11 @@ class Optimizer:
                     if progress_callback:
                         await progress_callback(f"pngquant: {msg} (skipped)")
                     result["warning"] = msg
-            elif compression_mode != "standard" and progress_callback:
-                await progress_callback(f"skipping color quantization ({compression_mode} mode)")
+            elif progress_callback:
+                if compression_mode != "standard":
+                    await progress_callback(f"skipping color quantization ({compression_mode} mode)")
+                else:
+                    await progress_callback("skipping color quantization (pngquant not found)")
 
             if self.oxipng_path and working_path.suffix.lower() == ".png":
                 oxipng_tmp = output_path.with_suffix(".oxipng.png")

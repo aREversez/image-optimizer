@@ -6,6 +6,7 @@ import shutil
 import socket
 import sys
 import tempfile
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List, Optional
@@ -19,9 +20,12 @@ if __package__ is None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.models import OptimizeRequest, ScanRequest
-from app.optimizer import Optimizer
+from app.optimizer import HEX_COLOR_RE, Optimizer
 
-BASE_DIR = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys._MEIPASS) / "app"
+else:
+    BASE_DIR = Path(__file__).resolve().parent
 
 
 def _find_free_port(host: str, start: int, max_attempts: int = 10) -> int:
@@ -32,7 +36,7 @@ def _find_free_port(host: str, start: int, max_attempts: int = 10) -> int:
                 return port
             except OSError:
                 continue
-    return start
+    raise RuntimeError(f"No free port found in range {start}-{start + max_attempts - 1}")
 
 
 class AppState:
@@ -109,8 +113,8 @@ def _gen_thumbnail(src: Path, dst: Path, max_size: int = 200):
             img = img.convert("RGB")
         dst.parent.mkdir(parents=True, exist_ok=True)
         img.save(dst, "JPEG", quality=70)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[Warning] Thumbnail failed for {src.name}: {e}")
 
 
 def _fmt_size(b: int) -> str:
@@ -122,13 +126,13 @@ def _fmt_size(b: int) -> str:
 
 
 def _scan_images(directory: Path, recursive: bool = True) -> list:
-    exts = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif"}
+    patterns = ["*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tiff", "*.tif",
+                "*.PNG", "*.JPG", "*.JPEG", "*.BMP", "*.TIFF", "*.TIF"]
     images = []
     iter_method = directory.rglob if recursive else directory.glob
-    for f in sorted(iter_method("*")):
-        if f.suffix.lower() in exts and f.is_file():
-            images.append(f)
-    return images
+    for pat in patterns:
+        images.extend(iter_method(pat))
+    return sorted(set(images))
 
 
 @app.exception_handler(Exception)
@@ -168,6 +172,8 @@ async def health():
 
 @app.post("/api/scan")
 async def scan_directory(data: ScanRequest):
+    if state.is_running:
+        return JSONResponse({"error": "Optimization in progress, please wait"}, status_code=400)
     directory = Path(data.directory)
     if not directory.exists() or not directory.is_dir():
         return JSONResponse({"error": "Directory does not exist"}, status_code=400)
@@ -201,6 +207,8 @@ async def scan_directory(data: ScanRequest):
 
 @app.post("/api/upload")
 async def upload_files(files: List[UploadFile] = File(...)):
+    if state.is_running:
+        return JSONResponse({"error": "Optimization in progress, please wait"}, status_code=400)
     state.reset()
     ws = state.new_workspace()
     upload_dir = ws / "uploads"
@@ -210,20 +218,20 @@ async def upload_files(files: List[UploadFile] = File(...)):
     for idx, f in enumerate(files):
         if not f.filename:
             continue
-        safe_name = f.filename
-        file_path = upload_dir / safe_name
-        file_path.parent.mkdir(parents=True, exist_ok=True)
+        name = Path(f.filename).name
+        unique_name = f"{int(time.time())}_{idx}_{name}"
+        file_path = upload_dir / unique_name
         content = await f.read()
         file_path.write_bytes(content)
 
-        thumb_rel = f"thumb/upload_{idx}_{Path(safe_name).name}.jpg"
+        thumb_rel = f"thumb/upload_{idx}_{name}.jpg"
         thumb_path = ws / thumb_rel
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, _gen_thumbnail, file_path, thumb_path)
 
         result_files.append({
             "id": str(idx),
-            "name": safe_name,
+            "name": f.filename,
             "path": str(file_path),
             "size": len(content),
             "thumbnail": f"/api/thumb/{state.workspace.name}/{thumb_rel}",
@@ -237,8 +245,9 @@ async def upload_files(files: List[UploadFile] = File(...)):
 @app.get("/api/thumb/{ws_name}/{thumb_rel:path}")
 async def get_thumbnail(ws_name: str, thumb_rel: str):
     if state.workspace and state.workspace.name == ws_name:
-        p = state.workspace / thumb_rel
-        if p.exists():
+        p = (state.workspace / thumb_rel).resolve()
+        base = str(state.workspace.resolve())
+        if p.exists() and (str(p) == base or str(p).startswith(base + os.sep)):
             return FileResponse(str(p), media_type="image/jpeg")
     return Response(status_code=404)
 
@@ -253,6 +262,12 @@ async def start_optimization(data: OptimizeRequest):
     if data.compression_mode == "resize_only" and data.max_width <= 0:
         return JSONResponse(
             {"error": "Resize Only mode requires Max Width to be set"}, status_code=400
+        )
+    bad_colors = [c for c in data.protected_colors if not HEX_COLOR_RE.match(c.strip())]
+    if bad_colors:
+        return JSONResponse(
+            {"error": f"Invalid color(s) in Protect Colors: {', '.join(bad_colors)}. Use hex format like #2ecc71."},
+            status_code=400,
         )
 
     files_to_process = state.files
@@ -296,7 +311,6 @@ async def _process_files(
     protected_colors: Optional[list] = None,
     dithering: bool = True,
 ):
-    global state
     if optimizer is None:
         state.logs.append("Optimizer not initialized")
         state.is_running = False
@@ -308,90 +322,96 @@ async def _process_files(
         shutil.rmtree(opt_output_dir, ignore_errors=True)
     opt_output_dir.mkdir(parents=True, exist_ok=True)
 
-    for i, file_info in enumerate(files):
-        if state.cancelled:
-            state.logs.append("Cancelled by user")
-            break
+    async def log(msg):
+        state.logs.append(f"  {msg}")
 
-        input_path = Path(file_info["path"])
+    try:
+        for i, file_info in enumerate(files):
+            if state.cancelled:
+                state.logs.append("Cancelled by user")
+                break
 
-        if state.input_dir:
-            try:
-                rel = Path(input_path).relative_to(Path(state.input_dir))
-                out_path = opt_output_dir / rel
-            except ValueError:
-                out_path = opt_output_dir / input_path.name
-        else:
-            out_path = opt_output_dir / file_info["name"]
+            input_path = Path(file_info["path"])
 
-        out_path = out_path.with_suffix(f".{output_format}")
-        out_path.parent.mkdir(parents=True, exist_ok=True)
+            if state.input_dir:
+                try:
+                    rel = Path(input_path).relative_to(Path(state.input_dir))
+                    out_path = opt_output_dir / rel
+                except ValueError:
+                    out_path = opt_output_dir / input_path.name
+            else:
+                out_path = opt_output_dir / file_info["name"]
 
-        state.logs.append(f"[{i + 1}/{state.total}] {file_info['name']}")
+            out_path = out_path.with_suffix(f".{output_format}")
+            out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        async def log(msg):
-            state.logs.append(f"  {msg}")
+            state.logs.append(f"[{i + 1}/{state.total}] {file_info['name']}")
 
-        result = await optimizer.optimize_png(
-            input_path=input_path,
-            output_path=out_path,
-            quality=quality,
-            max_width=max_width,
-            compression_mode=compression_mode,
-            protected_colors=protected_colors,
-            dithering=dithering,
-            progress_callback=log,
+            result = await optimizer.optimize_png(
+                input_path=input_path,
+                output_path=out_path,
+                quality=quality,
+                max_width=max_width,
+                compression_mode=compression_mode,
+                protected_colors=protected_colors,
+                dithering=dithering,
+                progress_callback=log,
+            )
+
+            result["id"] = file_info["id"]
+            result["name"] = file_info["name"]
+            result["original_path"] = file_info["path"]
+
+            if result["success"]:
+                result["savings"] = result["original_size"] - result["compressed_size"]
+                result["savings_percent"] = round(
+                    result["savings"] / result["original_size"] * 100, 1
+                ) if result["original_size"] > 0 else 0
+                state.logs.append(
+                    f"  OK {_fmt_size(result['original_size'])} -> {_fmt_size(result['compressed_size'])} "
+                    f"(saved {result['savings_percent']}%)"
+                )
+            else:
+                state.logs.append(f"  FAILED: {result.get('error', 'unknown')}")
+
+            state.results.append(result)
+            state.current = i + 1
+
+    except Exception as e:
+        state.logs.append(f"  UNEXPECTED ERROR: {e}")
+        import traceback
+        state.logs.append(f"  {traceback.format_exc()}")
+
+    finally:
+        state.is_running = False
+        total_orig = sum(r["original_size"] for r in state.results if r["success"])
+        total_comp = sum(r["compressed_size"] for r in state.results if r["success"])
+        saved = total_orig - total_comp
+        pct = round(saved / total_orig * 100, 1) if total_orig > 0 else 0
+        state.logs.append(
+            f"\nDone! {state.current}/{state.total} files, "
+            f"saved {_fmt_size(saved)} ({pct}%)"
         )
 
-        result["id"] = file_info["id"]
-        result["name"] = file_info["name"]
-        result["original_path"] = file_info["path"]
+        if output_dir:
+            user_output = Path(output_dir)
+            try:
+                user_output.mkdir(parents=True, exist_ok=True)
+                for f in opt_output_dir.rglob("*"):
+                    if f.is_file():
+                        dest = user_output / f.relative_to(opt_output_dir)
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(f, dest)
+                state.logs.append(f"  Output saved to: {user_output.resolve()}")
+            except Exception as e:
+                state.logs.append(f"  Output copy failed: {e}")
 
-        if result["success"]:
-            result["savings"] = result["original_size"] - result["compressed_size"]
-            result["savings_percent"] = round(
-                result["savings"] / result["original_size"] * 100, 1
-            ) if result["original_size"] > 0 else 0
-            state.logs.append(
-                f"  OK {_fmt_size(result['original_size'])} -> {_fmt_size(result['compressed_size'])} "
-                f"(saved {result['savings_percent']}%)"
-            )
-        else:
-            state.logs.append(f"  FAILED: {result.get('error', 'unknown')}")
-
-        state.results.append(result)
-        state.current = i + 1
-
-    state.is_running = False
-    total_orig = sum(r["original_size"] for r in state.results if r["success"])
-    total_comp = sum(r["compressed_size"] for r in state.results if r["success"])
-    saved = total_orig - total_comp
-    pct = round(saved / total_orig * 100, 1) if total_orig > 0 else 0
-    state.logs.append(
-        f"\nDone! {state.current}/{state.total} files, "
-        f"saved {_fmt_size(saved)} ({pct}%)"
-    )
-
-    if output_dir:
-        user_output = Path(output_dir)
-        try:
-            user_output.mkdir(parents=True, exist_ok=True)
-            for f in opt_output_dir.rglob("*"):
-                if f.is_file():
-                    dest = user_output / f.relative_to(opt_output_dir)
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(f, dest)
-            state.logs.append(f"  Output saved to: {user_output.resolve()}")
-        except Exception as e:
-            state.logs.append(f"  Output copy failed: {e}")
-
-    # Clean up uploaded originals (large temp files no longer needed)
-    uploads_dir = ws / "uploads"
-    if uploads_dir.exists():
-        try:
-            shutil.rmtree(uploads_dir, ignore_errors=True)
-        except Exception:
-            pass
+        uploads_dir = ws / "uploads"
+        if uploads_dir.exists():
+            try:
+                shutil.rmtree(uploads_dir, ignore_errors=True)
+            except Exception:
+                pass
 
 
 @app.get("/api/progress")
@@ -430,8 +450,9 @@ async def get_source_file(ws_name: str, file_id: str):
 @app.get("/api/result/{ws_name}/{result_path:path}")
 async def get_result(ws_name: str, result_path: str):
     if state.workspace and state.workspace.name == ws_name:
-        p = state.workspace / "output" / result_path
-        if p.exists():
+        p = (state.workspace / "output" / result_path).resolve()
+        base = str((state.workspace / "output").resolve())
+        if p.exists() and (str(p) == base or str(p).startswith(base + os.sep)):
             return FileResponse(str(p))
     return Response(status_code=404)
 
@@ -473,24 +494,23 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 
     orig_url = f"/api/source-file/{ws_name}/{file_id}"
 
-    comp_rel = None
-    for r in state.results:
-        if r.get("id") == file_id:
-            if state.input_dir:
-                try:
-                    rel = Path(r["original_path"]).relative_to(Path(state.input_dir))
-                    comp_rel = str(rel.with_suffix(f".png"))
-                except ValueError:
-                    comp_rel = Path(r["original_path"]).name
-            else:
-                comp_rel = Path(r["original_path"]).name
-            break
+    if state.input_dir:
+        orig_path = Path(result["original_path"])
+        try:
+            rel = orig_path.relative_to(Path(state.input_dir))
+        except ValueError:
+            rel = Path(orig_path.name)
+        comp_rel = str(rel.with_suffix(".png"))
+    else:
+        comp_rel = Path(result["original_path"]).stem + ".png"
 
     comp_url = f"/api/result/{ws_name}/{comp_rel}" if comp_rel else ""
 
+    import html as _html
+    safe_name = _html.escape(str(result['name']))
     html += f"""
 <div class="bar">
-  <span class="title">{result['name']}</span>
+  <span class="title">{safe_name}</span>
   <span class="stats">{_fmt_size(result['original_size'])} -> {_fmt_size(result['compressed_size'])} | saved {result.get('savings_percent', 0)}%</span>
   <div class="view-toggle">
     <button class="view-btn active" id="btn-side">Side by Side</button>
@@ -560,6 +580,14 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
     return HTMLResponse(html)
 
 
+@app.get("/favicon.ico")
+async def favicon():
+    fav = BASE_DIR / "templates" / "favicon.ico"
+    if fav.exists():
+        return FileResponse(str(fav), media_type="image/x-icon")
+    return Response(status_code=404)
+
+
 @app.get("/api/download/{ws_name}")
 async def download_zip(ws_name: str):
     if not (state.workspace and state.workspace.name == ws_name):
@@ -588,16 +616,19 @@ async def browse_folder():
     try:
         import tkinter as tk
         from tkinter import filedialog
-        path = None
+    except ImportError:
+        return JSONResponse({"path": "", "error": "tkinter not available"})
+    try:
         def _open():
-            nonlocal path
             root = tk.Tk()
             root.withdraw()
             root.attributes("-topmost", True)
+            root.update()
             path = filedialog.askdirectory(title="Select Output Directory")
             root.destroy()
+            return path
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _open)
+        path = await loop.run_in_executor(None, _open)
         return JSONResponse({"path": path or ""})
     except Exception as e:
         return JSONResponse({"path": "", "error": str(e)})
