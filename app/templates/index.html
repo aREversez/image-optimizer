@@ -256,7 +256,6 @@ header h1 span { color: var(--accent); }
       </label>
     </div>
     <input type="file" id="file-input" accept="image/png,image/jpeg,image/bmp" multiple style="display:none" />
-    <input type="file" id="folder-input" webkitdirectory style="display:none" />
   </div>
 
   <!-- Output Path -->
@@ -502,19 +501,31 @@ outputBrowseBtn.addEventListener('click', async () => {
   }
 });
 
-// File input via browse button
-// Browse Folder: uses the browser's native webkitdirectory picker (Chrome
-// icon). The browser doesn't expose the real filesystem path, so dirPath
-// stays empty — the files still load and work. For path-based operations
-// (e.g. re-scanning), use "Scan Folder" with a manually typed path.
+// Opens the OS native folder picker via the server (tkinter on Windows).
+async function pickFolder() {
+  const r = await fetch('/api/browse-folder');
+  const d = await r.json();
+  return d.path || '';
+}
+
+// Browse Folder (Select Images): pick a folder path → auto-scan it.
+// This is a local tool — no uploading, just reads files by path.
 const browseFolderBtn = $('browse-folder-btn');
-const folderInput = $('folder-input');
-browseFolderBtn.addEventListener('click', () => folderInput.click());
-folderInput.addEventListener('change', async (e) => {
-  const files = e.target.files;
-  if (!files.length) return;
-  showNotice(`Loading ${files.length} file(s) from selected folder...`, 'info');
-  await uploadFiles(files);
+browseFolderBtn.addEventListener('click', async () => {
+  browseFolderBtn.disabled = true;
+  browseFolderBtn.textContent = 'Selecting...';
+  try {
+    const path = await pickFolder();
+    if (path) {
+      dirPath.value = path;
+      await scanPath(path);
+    }
+  } catch(e) {
+    showNotice('Folder picker failed: ' + e.message, 'err');
+  } finally {
+    browseFolderBtn.disabled = false;
+    browseFolderBtn.textContent = 'Browse Folder...';
+  }
 });
 
 $('browse-files-btn').addEventListener('click', () => fileInput.click());
