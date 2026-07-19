@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import secrets
 import shutil
 import socket
 import sys
@@ -13,7 +14,7 @@ from pathlib import Path
 from typing import List, Optional
 from zipfile import ZipFile
 
-from fastapi import FastAPI, File, UploadFile, Request
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from PIL import Image
 
@@ -40,6 +41,18 @@ def _find_free_port(host: str, start: int, max_attempts: int = 10) -> int:
     raise RuntimeError(f"No free port found in range {start}-{start + max_attempts - 1}")
 
 
+WORKSPACE_CLEANUP_DELAY = 10.0  # seconds
+
+
+async def _delayed_rmtree(path: Path):
+    """Give any in-flight requests reading from `path` a chance to finish
+    before actually deleting it. Not a hard guarantee (an unusually slow
+    download could still lose a race), but turns a zero-grace-period bug
+    into one that needs a multi-second coincidence to hit."""
+    await asyncio.sleep(WORKSPACE_CLEANUP_DELAY)
+    shutil.rmtree(path, ignore_errors=True)
+
+
 class AppState:
     def __init__(self):
         self.files: list = []
@@ -64,16 +77,42 @@ class AppState:
 
     def new_workspace(self):
         if self.workspace:
+            old = self.workspace
             try:
-                shutil.rmtree(self.workspace, ignore_errors=True)
-            except Exception:
-                pass
+                # Don't delete the old workspace synchronously — another
+                # request (e.g. a download or image load in a different
+                # tab) may still be reading from it. Give in-flight
+                # requests a grace period instead of yanking the directory
+                # out from under them.
+                asyncio.get_running_loop()
+                asyncio.create_task(_delayed_rmtree(old))
+            except RuntimeError:
+                # No running event loop (e.g. the --dir CLI startup path,
+                # which runs before uvicorn starts) — nothing could be
+                # reading from it yet, safe to delete immediately.
+                shutil.rmtree(old, ignore_errors=True)
         self.workspace = Path(tempfile.mkdtemp(prefix="imgopt_"))
         return self.workspace
 
 
 state = AppState()
 optimizer: Optional[Optimizer] = None
+
+# Generated fresh each time the process starts. Injected into the page on
+# load and required (as a custom header) on every state-changing API call.
+# This isn't about keeping a secret from the person using the app — it's
+# about making sure a request actually came from this app's own page:
+# adding a custom header forces the browser to send a CORS preflight for
+# cross-origin requests, and since this server sends no CORS headers at
+# all, that preflight always fails closed. A malicious page open in another
+# tab has no way to read this token (same-origin policy) and so can never
+# construct a request this server will accept.
+APP_TOKEN = secrets.token_urlsafe(32)
+
+
+async def require_token(x_app_token: str = Header(default="")):
+    if not secrets.compare_digest(x_app_token, APP_TOKEN):
+        raise HTTPException(status_code=403, detail="Missing or invalid app token")
 
 RECENT_LIMIT = 8
 
@@ -199,6 +238,8 @@ async def global_exception_handler(request: Request, exc: Exception):
 @app.get("/", response_class=HTMLResponse)
 async def index():
     html = (BASE_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    token_script = f'<script>window.APP_TOKEN = "{APP_TOKEN}";</script>'
+    html = html.replace("</head>", f"{token_script}\n</head>", 1)
     return HTMLResponse(html)
 
 
@@ -215,7 +256,7 @@ async def health():
 
 
 @app.post("/api/scan")
-async def scan_directory(data: ScanRequest):
+async def scan_directory(data: ScanRequest, _auth: None = Depends(require_token)):
     if state.is_running:
         return JSONResponse({"error": "Optimization in progress, please wait"}, status_code=400)
     directory = Path(data.directory)
@@ -251,7 +292,7 @@ async def scan_directory(data: ScanRequest):
 
 
 @app.post("/api/upload")
-async def upload_files(files: List[UploadFile] = File(...)):
+async def upload_files(files: List[UploadFile] = File(...), _auth: None = Depends(require_token)):
     if state.is_running:
         return JSONResponse({"error": "Optimization in progress, please wait"}, status_code=400)
     state.reset()
@@ -298,7 +339,7 @@ async def get_thumbnail(ws_name: str, thumb_rel: str):
 
 
 @app.post("/api/optimize")
-async def start_optimization(data: OptimizeRequest):
+async def start_optimization(data: OptimizeRequest, _auth: None = Depends(require_token)):
     if state.is_running:
         return JSONResponse({"error": "Optimization in progress, please wait"}, status_code=400)
 
@@ -475,7 +516,7 @@ async def get_progress():
 
 
 @app.post("/api/cancel")
-async def cancel():
+async def cancel(_auth: None = Depends(require_token)):
     state.cancelled = True
     return JSONResponse({"ok": True})
 
@@ -656,12 +697,12 @@ async def download_zip(ws_name: str):
 
 
 @app.get("/api/recent")
-async def get_recent():
+async def get_recent(_auth: None = Depends(require_token)):
     return JSONResponse(_load_recent())
 
 
 @app.get("/api/browse-folder")
-async def browse_folder(title: str = "Select Folder"):
+async def browse_folder(title: str = "Select Folder", _auth: None = Depends(require_token)):
     try:
         import tkinter as tk
         from tkinter import filedialog

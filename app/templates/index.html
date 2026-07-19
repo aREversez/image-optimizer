@@ -416,6 +416,19 @@ const STATE = {
 // DOM refs
 const $ = id => document.getElementById(id);
 
+// Wraps fetch() to attach the per-session app token (see APP_TOKEN in the
+// page <head>) as a custom header. Only needed for state-changing/sensitive
+// endpoints — image-serving endpoints (thumb/result/source-file/download)
+// are loaded via plain <img src>/<a href> and can't carry custom headers
+// anyway, and don't need this protection (see the backend comment on
+// require_token for why the header itself is the actual defense).
+function apiFetch(url, options) {
+  options = options || {};
+  options.headers = Object.assign({}, options.headers, { 'X-App-Token': window.APP_TOKEN || '' });
+  return fetch(url, options);
+}
+
+
 // Lightweight toast notification. type: 'err' | 'ok' | 'info'.
 // (This was called in 8 places without ever being defined — every error
 // path in the app was throwing an uncaught ReferenceError instead of
@@ -497,7 +510,7 @@ async function scanPath(path) {
   scanBtn.disabled = true;
   scanBtn.textContent = 'Scanning...';
   try {
-    const r = await fetch('/api/scan', {
+    const r = await apiFetch('/api/scan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ directory: path, recursive }),
@@ -533,7 +546,7 @@ function renderRecentChips(container, paths, onPick) {
 }
 async function loadRecentPaths() {
   try {
-    const r = await fetch('/api/recent');
+    const r = await apiFetch('/api/recent');
     const d = await r.json();
     renderRecentChips(recentScanEl, d.scan_dirs || [], (p) => { dirPath.value = p; scanPath(p); });
     renderRecentChips(recentOutputEl, d.output_dirs || [], (p) => { outputDir.value = p; });
@@ -556,7 +569,7 @@ scanBtn.addEventListener('click', () => {
 // something the browser is opening.
 async function pickFolder() {
   try {
-    const r = await fetch('/api/browse-folder');
+    const r = await apiFetch('/api/browse-folder');
     const d = await r.json();
     if (d.error) {
       showNotice(`Folder picker unavailable: ${d.error}. Type the path manually instead.`, 'err');
@@ -619,7 +632,7 @@ async function uploadFiles(files) {
   for (const f of files) formData.append('files', f);
 
   try {
-    const r = await fetch('/api/upload', { method: 'POST', body: formData });
+    const r = await apiFetch('/api/upload', { method: 'POST', body: formData });
     const d = await r.json();
     if (d.error) { showNotice(d.error, 'err'); return; }
     STATE.files = d.files;
@@ -736,7 +749,7 @@ startBtn.addEventListener('click', async () => {
   startBtn.disabled = true;
 
   try {
-    const r = await fetch('/api/optimize', {
+    const r = await apiFetch('/api/optimize', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -812,7 +825,7 @@ async function pollProgress() {
 
 // Cancel
 cancelBtn.addEventListener('click', async () => {
-  await fetch('/api/cancel', { method: 'POST' });
+  await apiFetch('/api/cancel', { method: 'POST' });
 });
 
 // Show results
