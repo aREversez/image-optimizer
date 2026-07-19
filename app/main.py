@@ -304,6 +304,15 @@ async def start_optimization(data: OptimizeRequest):
 
     if data.compression_mode not in ("standard", "lossless", "resize_only"):
         return JSONResponse({"error": "Invalid compression_mode"}, status_code=400)
+    if data.output_format not in ("png",):
+        # The pipeline only ever produces real PNG bytes right now (pngquant/
+        # oxipng are both PNG-only, and non-PNG sources are normalized to PNG
+        # before processing) — accepting anything else here would silently
+        # produce a file whose extension lies about its actual content.
+        return JSONResponse(
+            {"error": f"Unsupported output_format: {data.output_format!r}. Only 'png' is currently supported."},
+            status_code=400,
+        )
     if data.compression_mode == "resize_only" and data.max_width <= 0:
         return JSONResponse(
             {"error": "Resize Only mode requires Max Width to be set"}, status_code=400
@@ -699,7 +708,12 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="Image Optimizer Web UI")
-    parser.add_argument("--host", default="127.0.0.1", help="Listen address (default 127.0.0.1)")
+    parser.add_argument(
+        "--host", default="127.0.0.1",
+        help="Listen address (default 127.0.0.1 / localhost-only). WARNING: this app has no "
+             "authentication — binding to 0.0.0.0 or a LAN address exposes local file read "
+             "(scan any directory) and write (output_dir) to anyone on the network.",
+    )
     parser.add_argument("--port", type=int, default=8090, help="Listen port (default 8090)")
     parser.add_argument("--dir", help="Directory to auto-scan on startup")
     args = parser.parse_args()
@@ -731,6 +745,14 @@ def main():
     port = _find_free_port(args.host, args.port)
     if port != args.port:
         print(f"[Startup] Port {args.port} in use, using port {port} instead")
+
+    if args.host not in ("127.0.0.1", "localhost", "::1"):
+        print(
+            f"[Warning] Binding to {args.host} — this server has NO authentication. "
+            f"Anyone who can reach this address can read any directory on this machine "
+            f"(/api/scan) and write to any writable path (output_dir). Only do this on a "
+            f"network you fully trust."
+        )
 
     import uvicorn
     uvicorn.run(app, host=args.host, port=port, reload=False)

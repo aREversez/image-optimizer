@@ -49,9 +49,20 @@ The first run will auto-detect `pngquant` and `oxipng` in the `bin/` folder and 
 4. **Start** — click *Optimize* and watch the live log
 5. **Compare & download** — click any result to see a before/after preview, then download individual files or a ZIP
 
+## Security
+
+This app has no authentication and is meant to run on `127.0.0.1` only (the
+default). It can read any directory you point it at and write to any path
+you specify as the output folder — fine for local, single-user use, but
+**don't** start it with `--host 0.0.0.0` or a LAN address unless you fully
+trust everyone on that network, since there's nothing stopping them from
+reading or writing files on your machine through it.
+
 ## Requirements
 
 - **Source install:** Python 3.10+ with `fastapi`, `uvicorn`, `Pillow`, `jinja2`, `python-multipart`
+  (`pip install -r requirements.txt`, or `pip install -r requirements.lock` for the exact
+  versions this was tested against)
 - **Standalone EXE:** Windows 10/11 64-bit, no Python required
 
 ## Project Structure
