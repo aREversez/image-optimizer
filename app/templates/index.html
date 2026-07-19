@@ -94,16 +94,10 @@ header h1 span { color: var(--accent); }
   padding: 40px; text-align: center; color: var(--text2); cursor: pointer;
   transition: all .2s;
 }
-.drop-zone:hover, .drop-zone.drag-over { border-color: var(--accent); background: rgba(79,195,247,.05); }
+.drop-zone:hover { border-color: var(--accent); background: rgba(79,195,247,.05); }
 .drop-zone-icon { font-size: 36px; margin-bottom: 8px; }
 .drop-zone-text { font-size: 15px; }
 .drop-zone-hint { font-size: 12px; margin-top: 4px; }
-/* Output Path drop-zone: same visual language as the main drop-zone, just a
-   little more compact since it's an optional/secondary action. */
-.drop-zone-compact { padding: 24px; }
-.drop-zone-compact .drop-zone-icon { font-size: 26px; margin-bottom: 6px; }
-.drop-zone-compact .drop-zone-text { font-size: 13px; }
-.drop-zone-compact .drop-zone-hint { font-size: 11px; }
 
 /* Config */
 .config-grid { display: flex; gap: 24px; flex-wrap: wrap; }
@@ -251,7 +245,7 @@ header h1 span { color: var(--accent); }
   <div class="card" id="input-section">
     <div class="card-title">Select Images</div>
     <div class="input-row">
-      <input type="text" id="dir-path" placeholder="Screenshots folder path, e.g. D:\screenshots" />
+      <input type="text" id="dir-path" placeholder="Folder path to scan, e.g. D:\screenshots" />
       <button class="btn btn-primary" id="scan-btn">Scan Folder</button>
       <button class="btn btn-secondary" id="browse-folder-btn">Browse Folder...</button>
       <button class="btn btn-secondary" id="browse-files-btn">Browse Files...</button>
@@ -261,25 +255,16 @@ header h1 span { color: var(--accent); }
         <input type="checkbox" id="recursive-scan" checked /> Include subfolders
       </label>
     </div>
-    <div class="drop-zone" id="drop-zone">
-      <div class="drop-zone-icon"></div>
-      <div class="drop-zone-text">Drag & drop images here, or click to browse</div>
-      <div class="drop-zone-hint">To scan a folder, use "Browse Folder" or "Scan Folder" above</div>
-    </div>
     <input type="file" id="file-input" accept="image/png,image/jpeg,image/bmp" multiple style="display:none" />
+    <input type="file" id="folder-input" webkitdirectory style="display:none" />
   </div>
 
   <!-- Output Path -->
   <div class="card" id="output-section">
     <div class="card-title">Output Path (optional)</div>
     <div class="input-row">
-      <input type="text" id="output-dir" placeholder="Leave empty = save temp folder, or set a folder path" />
+      <input type="text" id="output-dir" placeholder="Type or paste the output folder path, or leave empty for temp folder" />
       <button class="btn btn-secondary" id="output-browse-btn">Browse Folder...</button>
-    </div>
-    <div class="drop-zone drop-zone-compact" id="output-drop-zone">
-      <div class="drop-zone-icon"></div>
-      <div class="drop-zone-text">Click or drag & drop a folder here to set output path</div>
-      <div class="drop-zone-hint">Opens the folder picker</div>
     </div>
   </div>
 
@@ -401,11 +386,9 @@ const STATE = {
 const $ = id => document.getElementById(id);
 const dirPath = $('dir-path'),
       scanBtn = $('scan-btn'),
-      dropZone = $('drop-zone'),
       fileInput = $('file-input'),
       outputDir = $('output-dir'),
       outputBrowseBtn = $('output-browse-btn'),
-      outputDropZone = $('output-drop-zone'),
       fileGrid = $('file-grid'),
       fileStatsText = $('file-stats-text'),
       selectAll = $('select-all'),
@@ -438,16 +421,6 @@ function fmtSize(bytes) {
   return (bytes / 1048576).toFixed(2) + ' MB';
 }
 
-function showNotice(msg, type) {
-  const el = document.createElement('div');
-  el.style.cssText = 'position:fixed;bottom:24px;left:50%;transform:translateX(-50%);padding:10px 20px;border-radius:8px;font-size:14px;z-index:9999;box-shadow:0 4px 20px rgba(0,0,0,.15);transition:opacity .3s;max-width:90%';
-  el.style.background = type === 'info' ? '#588b8b' : type === 'err' ? '#c96b6b' : '#3d3833';
-  el.style.color = '#fff';
-  el.textContent = msg;
-  document.body.appendChild(el);
-  setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, 4000);
-}
-
 // Health check
 async function checkHealth() {
   try {
@@ -470,9 +443,7 @@ async function checkHealth() {
 }
 
 // Scan directory
-scanBtn.addEventListener('click', async () => {
-  const path = dirPath.value.trim();
-  if (!path) { showNotice('Please enter a folder path', 'err'); return; }
+async function scanPath(path) {
   const recursive = $('recursive-scan').checked;
   scanBtn.disabled = true;
   scanBtn.textContent = 'Scanning...';
@@ -494,9 +465,58 @@ scanBtn.addEventListener('click', async () => {
     scanBtn.disabled = false;
     scanBtn.textContent = 'Scan Folder';
   }
+}
+
+scanBtn.addEventListener('click', () => {
+  const path = dirPath.value.trim();
+  if (!path) { showNotice('Please enter a folder path', 'err'); return; }
+  scanPath(path);
+});
+
+// Opens the OS native folder picker via the server (tkinter on Windows).
+// The browser doesn't expose real filesystem paths for security, so we
+// can't use webkitdirectory for output path — the server-side dialog is
+// the only reliable way to get a real writable path. The dialog shows
+// Python's icon (not Chrome's) because it's a server-side window.
+async function pickFolder() {
+  const r = await fetch('/api/browse-folder');
+  const d = await r.json();
+  return d.path || '';
+}
+
+// Output path: text field is the source of truth; the server-side picker
+// fills it in. No webkitdirectory here — the browser can't give us the
+// real path we need to write files to.
+outputBrowseBtn.addEventListener('click', async () => {
+  outputBrowseBtn.disabled = true;
+  outputBrowseBtn.textContent = 'Selecting...';
+  try {
+    const path = await pickFolder();
+    if (path) outputDir.value = path;
+    // No path = user cancelled; do nothing.
+  } catch(e) {
+    // ignore — user can still type a path manually
+  } finally {
+    outputBrowseBtn.disabled = false;
+    outputBrowseBtn.textContent = 'Browse Folder...';
+  }
 });
 
 // File input via browse button
+// Browse Folder: uses the browser's native webkitdirectory picker (Chrome
+// icon). The browser doesn't expose the real filesystem path, so dirPath
+// stays empty — the files still load and work. For path-based operations
+// (e.g. re-scanning), use "Scan Folder" with a manually typed path.
+const browseFolderBtn = $('browse-folder-btn');
+const folderInput = $('folder-input');
+browseFolderBtn.addEventListener('click', () => folderInput.click());
+folderInput.addEventListener('change', async (e) => {
+  const files = e.target.files;
+  if (!files.length) return;
+  showNotice(`Loading ${files.length} file(s) from selected folder...`, 'info');
+  await uploadFiles(files);
+});
+
 $('browse-files-btn').addEventListener('click', () => fileInput.click());
 fileInput.addEventListener('change', async (e) => {
   const files = e.target.files;
@@ -504,89 +524,10 @@ fileInput.addEventListener('change', async (e) => {
   await uploadFiles(files);
 });
 
-// Folder browser — uses server-side tkinter dialog to avoid browser warning
-$('browse-folder-btn').addEventListener('click', async () => {
-  try {
-    $('browse-folder-btn').disabled = true;
-    $('browse-folder-btn').textContent = 'Selecting...';
-    const r = await fetch('/api/browse-folder');
-    const d = await r.json();
-    if (d.path) {
-      dirPath.value = d.path;
-      scanBtn.click();
-    }
-  } catch(e) {
-    showNotice('Browse failed: ' + e.message, 'err');
-  } finally {
-    $('browse-folder-btn').disabled = false;
-    $('browse-folder-btn').textContent = 'Browse Folder...';
-  }
-});
-
-// Output path browse button
-outputBrowseBtn.addEventListener('click', async () => {
-  try {
-    outputBrowseBtn.disabled = true;
-    outputBrowseBtn.textContent = 'Selecting...';
-    const r = await fetch('/api/browse-folder');
-    const d = await r.json();
-    if (d.path) outputDir.value = d.path;
-  } catch(e) {
-    // fallback: ignore
-  } finally {
-    outputBrowseBtn.disabled = false;
-    outputBrowseBtn.textContent = 'Browse Folder...';
-  }
-});
-
-// Output path click & drag & drop
-outputDropZone.addEventListener('click', () => outputBrowseBtn.click());
-outputDropZone.addEventListener('dragover', (e) => {
-  e.preventDefault();
-  e.stopPropagation();
-  outputDropZone.classList.add('drag-over');
-});
-outputDropZone.addEventListener('dragleave', () => {
-  outputDropZone.classList.remove('drag-over');
-});
-outputDropZone.addEventListener('drop', (e) => {
-  e.preventDefault();
-  e.stopPropagation();
-  outputDropZone.classList.remove('drag-over');
-  const dt = e.dataTransfer;
-  if (dt.items && Array.from(dt.items).some(i => i.webkitGetAsEntry && i.webkitGetAsEntry().isDirectory)) {
-    showNotice('Opening folder picker...', 'info');
-  }
-  outputBrowseBtn.click();
-});
-
-// Drag & drop
-dropZone.addEventListener('click', () => fileInput.click());
-dropZone.addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); dropZone.classList.add('drag-over'); });
-dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
-dropZone.addEventListener('drop', async (e) => {
-  e.preventDefault();
-  e.stopPropagation();
-  dropZone.classList.remove('drag-over');
-  const files = e.dataTransfer.files;
-  if (files.length) await uploadFiles(files);
-});
-
-// dropZone's original markup, so the "Uploading..." status can be restored
-// afterwards instead of permanently replacing the drag-and-drop prompt.
-const dropZoneOriginalHTML = dropZone.innerHTML;
-
-function setDropZoneUploading(count) {
-  dropZone.innerHTML = `<div class="drop-zone-text">Uploading ${count} file${count === 1 ? '' : 's'}... please wait</div>`;
-}
-function resetDropZone() {
-  dropZone.innerHTML = dropZoneOriginalHTML;
-}
-
 async function uploadFiles(files) {
   const formData = new FormData();
   for (const f of files) formData.append('files', f);
-  setDropZoneUploading(files.length);
+
   try {
     const r = await fetch('/api/upload', { method: 'POST', body: formData });
     const d = await r.json();
@@ -596,14 +537,7 @@ async function uploadFiles(files) {
     renderFiles();
     showConfigSection();
   } catch(e) {
-    const isFolder = files.length > 0 && files[0].webkitRelativePath;
-    if (isFolder) {
-      showNotice('Folder upload not supported in your browser. Use "Browse Folder" button instead.', 'info');
-    } else {
-      showNotice('Upload failed: ' + e.message, 'err');
-    }
-  } finally {
-    resetDropZone();
+    showNotice('Upload failed: ' + e.message, 'err');
   }
 }
 

@@ -213,6 +213,7 @@ async def upload_files(files: List[UploadFile] = File(...)):
     ws = state.new_workspace()
     upload_dir = ws / "uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
+    state.input_dir = str(upload_dir.resolve())
 
     result_files = []
     for idx, f in enumerate(files):
