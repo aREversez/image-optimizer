@@ -54,6 +54,34 @@ header h1 span { color: var(--accent); }
 .status-dot.warn { background: var(--yellow); }
 .status-dot.err { background: var(--red); }
 
+#notice-container {
+  position: fixed; top: 16px; right: 16px; z-index: 1000;
+  display: flex; flex-direction: column; gap: 8px; max-width: 380px;
+}
+.notice {
+  background: var(--surface); border: 1px solid var(--border); border-left: 4px solid var(--text2);
+  border-radius: var(--radius); padding: 12px 16px; box-shadow: var(--shadow);
+  font-size: 13px; color: var(--text); display: flex; align-items: flex-start; gap: 10px;
+  animation: notice-in .2s ease-out;
+}
+.notice.err { border-left-color: var(--red); }
+.notice.ok { border-left-color: var(--green); }
+.notice.info { border-left-color: var(--accent); }
+.notice-msg { flex: 1; }
+.notice-close { cursor: pointer; color: var(--text2); font-size: 16px; line-height: 1; background: none; border: none; padding: 0; }
+.notice-close:hover { color: var(--text); }
+@keyframes notice-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }
+
+.recent-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: -6px 0 12px; }
+.recent-chips:empty { margin: 0; }
+.recent-chip {
+  font-size: 12px; padding: 4px 10px; border-radius: 999px; cursor: pointer;
+  background: var(--bg); border: 1px solid var(--border); color: var(--text2);
+  max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  transition: all .15s;
+}
+.recent-chip:hover { border-color: var(--accent); color: var(--text); background: var(--surface); }
+
 /* Main Layout */
 .container { max-width: 1200px; margin: 0 auto; padding: 20px 24px; display: flex; flex-direction: column; gap: 20px; }
 
@@ -239,6 +267,8 @@ header h1 span { color: var(--accent); }
   </div>
 </header>
 
+<div id="notice-container"></div>
+
 <div class="container">
 
   <!-- Input Section -->
@@ -250,6 +280,7 @@ header h1 span { color: var(--accent); }
       <button class="btn btn-secondary" id="browse-folder-btn">Browse Folder...</button>
       <button class="btn btn-secondary" id="browse-files-btn">Browse Files...</button>
     </div>
+    <div class="recent-chips" id="recent-scan-dirs"></div>
     <div style="margin-bottom:12px;display:flex;align-items:center;gap:8px;font-size:13px">
       <label style="cursor:pointer;user-select:none;display:flex;align-items:center;gap:4px">
         <input type="checkbox" id="recursive-scan" checked /> Include subfolders
@@ -265,6 +296,7 @@ header h1 span { color: var(--accent); }
       <input type="text" id="output-dir" placeholder="Type or paste the output folder path, or leave empty for temp folder" />
       <button class="btn btn-secondary" id="output-browse-btn">Browse Folder...</button>
     </div>
+    <div class="recent-chips" id="recent-output-dirs"></div>
   </div>
 
   <!-- Config + Action -->
@@ -383,6 +415,24 @@ const STATE = {
 
 // DOM refs
 const $ = id => document.getElementById(id);
+
+// Lightweight toast notification. type: 'err' | 'ok' | 'info'.
+// (This was called in 8 places without ever being defined — every error
+// path in the app was throwing an uncaught ReferenceError instead of
+// telling the user anything went wrong.)
+const noticeContainer = $('notice-container');
+function showNotice(message, type) {
+  type = type || 'info';
+  const el = document.createElement('div');
+  el.className = `notice ${type}`;
+  el.innerHTML = `<span class="notice-msg"></span><button class="notice-close" aria-label="Dismiss">&times;</button>`;
+  el.querySelector('.notice-msg').textContent = message;
+  const remove = () => el.remove();
+  el.querySelector('.notice-close').addEventListener('click', remove);
+  noticeContainer.appendChild(el);
+  if (type !== 'err') setTimeout(remove, 5000);
+}
+
 const dirPath = $('dir-path'),
       scanBtn = $('scan-btn'),
       fileInput = $('file-input'),
@@ -458,11 +508,37 @@ async function scanPath(path) {
     STATE.wsName = d.files[0]?.thumbnail?.split('/')[3] || '';
     renderFiles();
     showConfigSection();
+    loadRecentPaths();
   } catch(e) {
     showNotice('Scan failed: ' + e.message, 'err');
   } finally {
     scanBtn.disabled = false;
     scanBtn.textContent = 'Scan Folder';
+  }
+}
+
+// Recently used folders (like FocusOCR) — click a chip to reuse it instead
+// of browsing again. Persisted server-side so it survives restarts.
+const recentScanEl = $('recent-scan-dirs'), recentOutputEl = $('recent-output-dirs');
+function renderRecentChips(container, paths, onPick) {
+  container.innerHTML = '';
+  for (const p of paths) {
+    const chip = document.createElement('span');
+    chip.className = 'recent-chip';
+    chip.textContent = p;
+    chip.title = p;
+    chip.addEventListener('click', () => onPick(p));
+    container.appendChild(chip);
+  }
+}
+async function loadRecentPaths() {
+  try {
+    const r = await fetch('/api/recent');
+    const d = await r.json();
+    renderRecentChips(recentScanEl, d.scan_dirs || [], (p) => { dirPath.value = p; scanPath(p); });
+    renderRecentChips(recentOutputEl, d.output_dirs || [], (p) => { outputDir.value = p; });
+  } catch(e) {
+    // Non-critical — just skip showing the recent-folder chips.
   }
 }
 
@@ -476,11 +552,21 @@ scanBtn.addEventListener('click', () => {
 // The browser doesn't expose real filesystem paths for security, so we
 // can't use webkitdirectory for output path — the server-side dialog is
 // the only reliable way to get a real writable path. The dialog shows
-// Python's icon (not Chrome's) because it's a server-side window.
+// Python's icon (not Chrome's) because it's a server-side window, not
+// something the browser is opening.
 async function pickFolder() {
-  const r = await fetch('/api/browse-folder');
-  const d = await r.json();
-  return d.path || '';
+  try {
+    const r = await fetch('/api/browse-folder');
+    const d = await r.json();
+    if (d.error) {
+      showNotice(`Folder picker unavailable: ${d.error}. Type the path manually instead.`, 'err');
+      return '';
+    }
+    return d.path || ''; // '' also covers the user simply cancelling the dialog
+  } catch(e) {
+    showNotice('Folder picker failed: ' + e.message, 'err');
+    return '';
+  }
 }
 
 // Output path: text field is the source of truth; the server-side picker
@@ -500,13 +586,6 @@ outputBrowseBtn.addEventListener('click', async () => {
     outputBrowseBtn.textContent = 'Browse Folder...';
   }
 });
-
-// Opens the OS native folder picker via the server (tkinter on Windows).
-async function pickFolder() {
-  const r = await fetch('/api/browse-folder');
-  const d = await r.json();
-  return d.path || '';
-}
 
 // Browse Folder (Select Images): pick a folder path → auto-scan it.
 // This is a local tool — no uploading, just reads files by path.
@@ -675,6 +754,7 @@ startBtn.addEventListener('click', async () => {
 
     // Poll progress
     STATE.pollTimer = setInterval(pollProgress, 400);
+    loadRecentPaths();
   } catch(e) {
     showNotice('Start failed: ' + e.message, 'err');
     STATE.isRunning = false;
@@ -847,6 +927,7 @@ resetBtn.addEventListener('click', () => {
 
 // Init
 checkHealth();
+loadRecentPaths();
 updateModeDependentControls();
 
 // Auto-scan from URL params

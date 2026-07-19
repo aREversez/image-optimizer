@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import socket
@@ -73,6 +74,49 @@ class AppState:
 
 state = AppState()
 optimizer: Optional[Optimizer] = None
+
+RECENT_LIMIT = 8
+
+
+def _config_dir() -> Path:
+    base = os.environ.get("APPDATA") or os.environ.get("XDG_CONFIG_HOME") or str(Path.home())
+    d = Path(base) / "image-optimizer"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
+def _recent_file() -> Path:
+    return _config_dir() / "recent.json"
+
+
+def _load_recent() -> dict:
+    try:
+        data = json.loads(_recent_file().read_text(encoding="utf-8"))
+        data.setdefault("scan_dirs", [])
+        data.setdefault("output_dirs", [])
+        return data
+    except Exception:
+        return {"scan_dirs": [], "output_dirs": []}
+
+
+def _save_recent(data: dict):
+    try:
+        _recent_file().write_text(json.dumps(data), encoding="utf-8")
+    except Exception:
+        pass  # best-effort — a read-only config dir shouldn't break the app
+
+
+def _push_recent(key: str, path: str):
+    if not path:
+        return
+    data = _load_recent()
+    lst = [p for p in data.get(key, []) if p != path]
+    lst.insert(0, path)
+    data[key] = lst[:RECENT_LIMIT]
+    _save_recent(data)
 
 
 def _ensure_workspace() -> Path:
@@ -202,6 +246,7 @@ async def scan_directory(data: ScanRequest):
 
     state.files = files
     state.total = len(files)
+    _push_recent("scan_dirs", str(directory.resolve()))
     return JSONResponse({"files": files, "count": len(files)})
 
 
@@ -213,7 +258,6 @@ async def upload_files(files: List[UploadFile] = File(...)):
     ws = state.new_workspace()
     upload_dir = ws / "uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
-    state.input_dir = str(upload_dir.resolve())
 
     result_files = []
     for idx, f in enumerate(files):
@@ -279,6 +323,9 @@ async def start_optimization(data: OptimizeRequest):
     if not files_to_process:
         return JSONResponse({"error": "No files to process"}, status_code=400)
 
+    if data.output_dir:
+        _push_recent("output_dirs", str(Path(data.output_dir).resolve()))
+
     state.is_running = True
     state.current = 0
     state.total = len(files_to_process)
@@ -334,14 +381,13 @@ async def _process_files(
 
             input_path = Path(file_info["path"])
 
-            if state.input_dir:
-                try:
-                    rel = Path(input_path).relative_to(Path(state.input_dir))
-                    out_path = opt_output_dir / rel
-                except ValueError:
-                    out_path = opt_output_dir / input_path.name
-            else:
-                out_path = opt_output_dir / file_info["name"]
+            # file_info["name"] is always the clean, structure-preserving
+            # relative name (e.g. "2023/vacation/IMG_0001.png") for both the
+            # scan and upload flows — use it directly rather than trying to
+            # re-derive it from the physical storage path, which for uploads
+            # is intentionally flattened/deduplicated and does NOT mirror
+            # the original folder structure.
+            out_path = opt_output_dir / file_info["name"]
 
             out_path = out_path.with_suffix(f".{output_format}")
             out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -406,13 +452,6 @@ async def _process_files(
                 state.logs.append(f"  Output saved to: {user_output.resolve()}")
             except Exception as e:
                 state.logs.append(f"  Output copy failed: {e}")
-
-        uploads_dir = ws / "uploads"
-        if uploads_dir.exists():
-            try:
-                shutil.rmtree(uploads_dir, ignore_errors=True)
-            except Exception:
-                pass
 
 
 @app.get("/api/progress")
@@ -495,15 +534,10 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 
     orig_url = f"/api/source-file/{ws_name}/{file_id}"
 
-    if state.input_dir:
-        orig_path = Path(result["original_path"])
-        try:
-            rel = orig_path.relative_to(Path(state.input_dir))
-        except ValueError:
-            rel = Path(orig_path.name)
-        comp_rel = str(rel.with_suffix(".png"))
-    else:
-        comp_rel = Path(result["original_path"]).stem + ".png"
+    # Same reasoning as _process_files: result["name"] is the clean,
+    # structure-preserving relative name for both scan and upload flows —
+    # use it directly instead of re-deriving from the physical storage path.
+    comp_rel = str(Path(result["name"]).with_suffix(".png"))
 
     comp_url = f"/api/result/{ws_name}/{comp_rel}" if comp_rel else ""
 
@@ -612,8 +646,13 @@ async def download_zip(ws_name: str):
     )
 
 
+@app.get("/api/recent")
+async def get_recent():
+    return JSONResponse(_load_recent())
+
+
 @app.get("/api/browse-folder")
-async def browse_folder():
+async def browse_folder(title: str = "Select Folder"):
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -624,8 +663,17 @@ async def browse_folder():
             root = tk.Tk()
             root.withdraw()
             root.attributes("-topmost", True)
+            # Can't make this window use Chrome's icon — it's a native Tk
+            # window, not something the browser renders — but we can at
+            # least use our own icon instead of the generic Tk feather.
+            icon = BASE_DIR / "templates" / "favicon.ico"
+            if icon.exists():
+                try:
+                    root.iconbitmap(str(icon))
+                except Exception:
+                    pass  # e.g. .ico unsupported on non-Windows Tk builds
             root.update()
-            path = filedialog.askdirectory(title="Select Output Directory")
+            path = filedialog.askdirectory(title=title)
             root.destroy()
             return path
         loop = asyncio.get_event_loop()
