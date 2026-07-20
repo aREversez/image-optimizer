@@ -304,16 +304,20 @@ header h1 span { color: var(--accent); }
     <div class="card-title">Settings</div>
     <div class="config-grid" style="margin-bottom:16px">
       <div class="config-group">
-        <label>Quality</label>
+        <label title="Controls how much color detail Standard mode is allowed to sacrifice for size. For UI screenshots with text, High usually costs little extra size since screenshots rarely use many colors to begin with.">Quality</label>
         <div class="radio-group" id="quality-group">
-          <input type="radio" name="quality" id="q-high" value="high"><label for="q-high">High</label>
+          <input type="radio" name="quality" id="q-high" value="high"
+            title="Controls how much color detail Standard mode is allowed to sacrifice for size. For UI screenshots with text, High usually costs little extra size since screenshots rarely use many colors to begin with.">
+          <label for="q-high"
+            title="Controls how much color detail Standard mode is allowed to sacrifice for size. For UI screenshots with text, High usually costs little extra size since screenshots rarely use many colors to begin with.">High</label>
           <input type="radio" name="quality" id="q-med" value="medium" checked><label for="q-med">Medium</label>
           <input type="radio" name="quality" id="q-low" value="low"><label for="q-low">Low</label>
         </div>
       </div>
       <div class="config-group">
-        <label>Max Width</label>
-        <select id="max-width">
+        <label title="Shrinking dimensions is the one setting that can genuinely blur small text — screenshots with UI text often look best left at 'No resize' or scaled down only slightly.">Max Width</label>
+        <select id="max-width"
+          title="Shrinking dimensions is the one setting that can genuinely blur small text — screenshots with UI text often look best left at 'No resize' or scaled down only slightly.">
           <option value="0">No resize</option>
           <option value="1920">1920px</option>
           <option value="1500">1500px</option>
@@ -350,9 +354,9 @@ header h1 span { color: var(--accent); }
           title="Colors listed here (hex codes, comma-separated) are prioritized when building the compressed palette, reducing the chance they get replaced by a similar color. Not a 100% guarantee — pngquant may still adjust the rest of the palette. Only applies in Standard mode.">
       </div>
       <div class="config-group" id="dithering-group">
-        <label title="Smooths color transitions by mixing nearby palette colors in a fine pattern. Only applies in Standard mode.">Dithering</label>
+        <label title="Smooths color transitions by mixing nearby palette colors in a fine pattern. For screenshots with UI text, turning this off usually keeps text edges cleaner. Only applies in Standard mode.">Dithering</label>
         <label class="check-row"
-          title="Smooths color transitions by mixing nearby palette colors in a fine pattern. Usually helps gradients and photos, but can make flat-color graphics (icons, UI screenshots) look slightly grainy. Turn off for cleaner flat colors. Only applies in Standard mode.">
+          title="Smooths color transitions by mixing nearby palette colors in a fine pattern. Usually helps gradients and photos, but can make flat-color graphics and text edges (icons, UI screenshots) look slightly grainy. Turn off for cleaner text and flat colors. Only applies in Standard mode.">
           <input type="checkbox" id="dithering" checked /> Enabled
         </label>
       </div>
