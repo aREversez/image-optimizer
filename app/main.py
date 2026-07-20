@@ -21,7 +21,7 @@ from PIL import Image
 if __package__ is None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.models import OptimizeRequest, ScanRequest
+from app.models import OptimizeRequest, RecentClearRequest, RecentRemoveRequest, ScanRequest
 from app.optimizer import HEX_COLOR_RE, Optimizer
 
 if getattr(sys, "frozen", False):
@@ -660,15 +660,15 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
   <span class="title">{safe_name}</span>
   <span class="stats">{_fmt_size(result['original_size'])} -> {_fmt_size(result['compressed_size'])} | saved {result.get('savings_percent', 0)}%</span>
   <div class="view-toggle">
-    <button class="view-btn active" id="btn-side">Side by Side</button>
-    <button class="view-btn" id="btn-overlay">Overlay</button>
+    <button class="view-btn" id="btn-side">Side by Side</button>
+    <button class="view-btn active" id="btn-overlay">Overlay</button>
   </div>
   <div class="zoom-toggle">
     <button class="view-btn active" id="btn-fit" title="Scale images to fit the window">Fit</button>
     <button class="view-btn" id="btn-zoom100" title="Show actual pixels — the real test for whether text stays sharp">100%</button>
   </div>
 </div>
-<div class="container" id="side-view">
+<div class="container" id="side-view" style="display:none">
   <div class="panel">
     <div class="label">Original ({_fmt_size(result['original_size'])})</div>
     <div class="image-wrap" id="orig-wrap"><img src="{orig_url}" id="orig-img" alt="original"/></div>
@@ -678,14 +678,14 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
     <div class="image-wrap" id="comp-wrap"><img src="{comp_url}" id="comp-img" alt="compressed"/></div>
   </div>
 </div>
-<div class="overlay-view" id="overlay-view" style="display:none">
+<div class="overlay-view" id="overlay-view">
   <div class="overlay-label" id="overlay-label">Compressed &mdash; click image to toggle (or press space)</div>
   <div class="overlay-wrap" id="overlay-wrap">
     <img src="{orig_url}" class="overlay-img" id="overlay-orig" alt="original" style="display:none"/>
     <img src="{comp_url}" class="overlay-img" id="overlay-comp" alt="compressed"/>
   </div>
 </div>
-<div class="footer" id="footer-hint">Original (left) vs Compressed (right)</div>
+<div class="footer" id="footer-hint">Overlay — click the image (or press space) to flip between original and compressed</div>
 <script>
 (function(){{
   var sideBtn = document.getElementById('btn-side');
@@ -790,6 +790,24 @@ async def download_zip(ws_name: str, state: AppState = Depends(get_session)):
 @app.get("/api/recent")
 async def get_recent(_auth: None = Depends(require_token)):
     return JSONResponse(_load_recent())
+
+
+@app.post("/api/recent/remove")
+async def recent_remove(data: RecentRemoveRequest, _auth: None = Depends(require_token)):
+    recent = _load_recent()
+    if data.key in recent and data.value in recent[data.key]:
+        recent[data.key] = [p for p in recent[data.key] if p != data.value]
+        _save_recent(recent)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/recent/clear")
+async def recent_clear(data: RecentClearRequest, _auth: None = Depends(require_token)):
+    recent = _load_recent()
+    if data.key in recent:
+        recent[data.key] = []
+        _save_recent(recent)
+    return JSONResponse({"ok": True})
 
 
 @app.get("/api/browse-folder")

@@ -142,7 +142,7 @@ header h1 span { color: var(--accent); }
   border-radius: var(--radius); color: var(--text); font-size: 14px; outline: none;
   min-width: 180px;
 }
-.config-group.disabled-group { opacity: .45; }
+.config-group.disabled-group { opacity: .45; pointer-events: none; }
 .radio-group { display: flex; gap: 4px; background: var(--bg); border-radius: var(--radius); padding: 3px; }
 .radio-group label {
   padding: 6px 16px; border-radius: 5px; cursor: pointer; font-size: 13px;
@@ -283,7 +283,7 @@ header h1 span { color: var(--accent); }
     <div class="recent-chips" id="recent-scan-dirs"></div>
     <div style="margin-bottom:12px;display:flex;align-items:center;gap:8px;font-size:13px">
       <label style="cursor:pointer;user-select:none;display:flex;align-items:center;gap:4px">
-        <input type="checkbox" id="recursive-scan" checked /> Include subfolders
+        <input type="checkbox" id="recursive-scan" /> Include subfolders
       </label>
     </div>
     <input type="file" id="file-input" accept="image/png,image/jpeg,image/bmp" multiple style="display:none" />
@@ -438,6 +438,8 @@ function apiFetch(url, options) {
 // path in the app was throwing an uncaught ReferenceError instead of
 // telling the user anything went wrong.)
 const noticeContainer = $('notice-container');
+let persistentNoticeEl = null;
+
 function showNotice(message, type) {
   type = type || 'info';
   const el = document.createElement('div');
@@ -448,6 +450,24 @@ function showNotice(message, type) {
   el.querySelector('.notice-close').addEventListener('click', remove);
   noticeContainer.appendChild(el);
   if (type !== 'err') setTimeout(remove, 5000);
+}
+
+function showPersistentNotice(message, type) {
+  dismissPersistentNotice();
+  const el = document.createElement('div');
+  el.className = `notice ${type || 'info'}`;
+  el.innerHTML = `<span class="notice-msg"></span><button class="notice-close" aria-label="Dismiss">&times;</button>`;
+  el.querySelector('.notice-msg').textContent = message;
+  el.querySelector('.notice-close').addEventListener('click', () => dismissPersistentNotice());
+  noticeContainer.appendChild(el);
+  persistentNoticeEl = el;
+}
+
+function dismissPersistentNotice() {
+  if (persistentNoticeEl) {
+    persistentNoticeEl.remove();
+    persistentNoticeEl = null;
+  }
 }
 
 const dirPath = $('dir-path'),
@@ -510,6 +530,7 @@ async function checkHealth() {
 
 // Scan directory
 async function scanPath(path) {
+  dismissPersistentNotice();
   const recursive = $('recursive-scan').checked;
   scanBtn.disabled = true;
   scanBtn.textContent = 'Scanning...';
@@ -537,23 +558,47 @@ async function scanPath(path) {
 // Recently used folders (like FocusOCR) — click a chip to reuse it instead
 // of browsing again. Persisted server-side so it survives restarts.
 const recentScanEl = $('recent-scan-dirs'), recentOutputEl = $('recent-output-dirs');
-function renderRecentChips(container, paths, onPick) {
+function renderRecentChips(container, paths, onPick, onRemove, onClearAll) {
   container.innerHTML = '';
   for (const p of paths) {
     const chip = document.createElement('span');
     chip.className = 'recent-chip';
-    chip.textContent = p;
     chip.title = p;
-    chip.addEventListener('click', () => onPick(p));
+    const text = document.createElement('span');
+    text.textContent = p;
+    text.style.cursor = 'pointer';
+    text.addEventListener('click', () => onPick(p));
+    chip.appendChild(text);
+    const del = document.createElement('span');
+    del.textContent = '×';
+    del.style.cssText = 'margin-left:4px;cursor:pointer;font-size:14px;line-height:1;color:var(--text2);opacity:.5';
+    del.addEventListener('click', (e) => { e.stopPropagation(); onRemove(p); });
+    chip.appendChild(del);
     container.appendChild(chip);
+  }
+  if (paths.length > 1) {
+    const clearAll = document.createElement('span');
+    clearAll.className = 'recent-chip';
+    clearAll.textContent = 'Clear all';
+    clearAll.style.cssText = 'font-size:12px;color:var(--text2);cursor:pointer';
+    clearAll.addEventListener('click', onClearAll);
+    container.appendChild(clearAll);
   }
 }
 async function loadRecentPaths() {
   try {
     const r = await apiFetch('/api/recent');
     const d = await r.json();
-    renderRecentChips(recentScanEl, d.scan_dirs || [], (p) => { dirPath.value = p; scanPath(p); });
-    renderRecentChips(recentOutputEl, d.output_dirs || [], (p) => { outputDir.value = p; });
+    renderRecentChips(recentScanEl, d.scan_dirs || [],
+      (p) => { dirPath.value = p; scanPath(p); },
+      async (p) => { await apiFetch('/api/recent/remove', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: 'scan_dirs', value: p }) }); loadRecentPaths(); },
+      async () => { await apiFetch('/api/recent/clear', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: 'scan_dirs' }) }); loadRecentPaths(); },
+    );
+    renderRecentChips(recentOutputEl, d.output_dirs || [],
+      (p) => { outputDir.value = p; },
+      async (p) => { await apiFetch('/api/recent/remove', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: 'output_dirs', value: p }) }); loadRecentPaths(); },
+      async () => { await apiFetch('/api/recent/clear', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: 'output_dirs' }) }); loadRecentPaths(); },
+    );
   } catch(e) {
     // Non-critical — just skip showing the recent-folder chips.
   }
@@ -697,15 +742,27 @@ function showConfigSection() {
   updateStartButtonState();
 }
 
-// Compression Mode: Protect Colors / Dithering only make sense in Standard
-// mode (they control the pngquant step, which the other two modes skip).
+// Compression Mode: controls which settings are relevant.
 function updateModeDependentControls() {
   const mode = document.querySelector('input[name="mode"]:checked').value;
   const isStandard = mode === 'standard';
+  const isResizeOnly = mode === 'resize_only';
+  const isLossless = mode === 'lossless';
+
+  // Protect Colors / Dithering: only relevant in Standard mode
   protectColorsInput.disabled = !isStandard;
   ditheringInput.disabled = !isStandard;
   protectColorsGroup.classList.toggle('disabled-group', !isStandard);
   ditheringGroup.classList.toggle('disabled-group', !isStandard);
+
+  // Quality: only relevant when pngquant is involved (Standard mode)
+  document.querySelectorAll('input[name="quality"]').forEach(r => r.disabled = !isStandard);
+  document.getElementById('quality-group').classList.toggle('disabled-group', !isStandard);
+
+  // Max Width: disabled in Standard mode (resize only makes sense with Lossless or Resize Only)
+  $('max-width').disabled = isStandard;
+  $('max-width').closest('.config-group').classList.toggle('disabled-group', isStandard);
+
   updateStartButtonState();
 }
 document.querySelectorAll('input[name="mode"]').forEach(r => r.addEventListener('change', updateModeDependentControls));
@@ -743,6 +800,8 @@ startBtn.addEventListener('click', async () => {
 
   STATE.isRunning = true;
   STATE.results = [];
+
+  dismissPersistentNotice();
 
   // Show progress section
   progressSection.classList.add('active');
@@ -816,6 +875,7 @@ async function pollProgress() {
         STATE.results = d.results;
         STATE.wsName = STATE.files[0]?.thumbnail?.split('/')[3] || '';
         showResults();
+        showPersistentNotice(`Compression complete! ${d.results.filter(r => r.success).length}/${d.results.length} files optimized.`, 'ok');
       } else {
         // e.g. cancelled before any file finished — nothing to show, but
         // Start still needs to become clickable again.
