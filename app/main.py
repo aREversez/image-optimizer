@@ -64,6 +64,7 @@ class AppState:
         self.total = 0
         self.logs: list = []
         self.cancelled = False
+        self.last_seen = time.time()
 
     def reset(self):
         self.files = []
@@ -95,7 +96,53 @@ class AppState:
         return self.workspace
 
 
-state = AppState()
+# Each browser session (identified by a cookie) gets its own AppState, so
+# two tabs — or two people on the same LAN if this were ever pointed at
+# 0.0.0.0 — no longer share scan results, progress, or a workspace and
+# can't clobber each other's in-flight work.
+SESSIONS: dict[str, AppState] = {}
+SESSION_COOKIE = "imgopt_session"
+SESSION_IDLE_TIMEOUT = 4 * 3600  # sweep sessions untouched for this long
+SESSION_SWEEP_INTERVAL = 600
+
+# Populated once by `--dir` at CLI startup (before any HTTP request exists,
+# so there's no session yet to attach it to) and handed to whichever
+# session is created first, so the browser that opens still sees the
+# pre-scanned folder. Cleared after being consumed once.
+_cli_prescan_state: Optional[AppState] = None
+
+
+def get_session(request: Request) -> AppState:
+    global _cli_prescan_state
+    sid = request.cookies.get(SESSION_COOKIE)
+    st = SESSIONS.get(sid) if sid else None
+    if st is None:
+        sid = secrets.token_urlsafe(24)
+        st = _cli_prescan_state if _cli_prescan_state is not None else AppState()
+        _cli_prescan_state = None
+        SESSIONS[sid] = st
+        # Stashed for session_cookie_middleware below to pick up — a
+        # dependency mutating an injected Response object only takes effect
+        # if the route handler lets FastAPI build the response itself, but
+        # nearly every route here returns its own JSONResponse/HTMLResponse
+        # explicitly, which would silently discard that. Middleware runs on
+        # the actual outgoing response regardless, so it's reliable here.
+        request.state.new_session_id = sid
+    st.last_seen = time.time()
+    return st
+
+
+async def _sweep_stale_sessions():
+    while True:
+        await asyncio.sleep(SESSION_SWEEP_INTERVAL)
+        now = time.time()
+        stale = [sid for sid, st in SESSIONS.items() if now - st.last_seen > SESSION_IDLE_TIMEOUT]
+        for sid in stale:
+            st = SESSIONS.pop(sid, None)
+            if st and st.workspace:
+                shutil.rmtree(st.workspace, ignore_errors=True)
+
+
 optimizer: Optional[Optimizer] = None
 
 # Generated fresh each time the process starts. Injected into the page on
@@ -158,15 +205,9 @@ def _push_recent(key: str, path: str):
     _save_recent(data)
 
 
-def _ensure_workspace() -> Path:
-    if state.workspace is None:
-        state.new_workspace()
-    return state.workspace
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global optimizer, state
+    global optimizer
     optimizer = Optimizer()
     tools = []
     if optimizer.pngquant_path:
@@ -177,15 +218,29 @@ async def lifespan(app: FastAPI):
         print(f"[Startup] Detected: {', '.join(tools)}")
     else:
         print("[Startup] pngquant/oxipng not found — place binaries in the bin/ directory")
+    sweep_task = asyncio.create_task(_sweep_stale_sessions())
     yield
-    if state.workspace:
-        try:
-            shutil.rmtree(state.workspace, ignore_errors=True)
-        except Exception:
-            pass
+    sweep_task.cancel()
+    for st in SESSIONS.values():
+        if st.workspace:
+            try:
+                shutil.rmtree(st.workspace, ignore_errors=True)
+            except Exception:
+                pass
 
 
 app = FastAPI(title="Image Optimizer", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def session_cookie_middleware(request: Request, call_next):
+    response = await call_next(request)
+    new_sid = getattr(request.state, "new_session_id", None)
+    if new_sid:
+        response.set_cookie(
+            SESSION_COOKIE, new_sid, httponly=True, samesite="lax", max_age=SESSION_IDLE_TIMEOUT
+        )
+    return response
 
 
 def _gen_thumbnail(src: Path, dst: Path, max_size: int = 200):
@@ -236,7 +291,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index():
+async def index(state: AppState = Depends(get_session)):
     html = (BASE_DIR / "templates" / "index.html").read_text(encoding="utf-8")
     token_script = f'<script>window.APP_TOKEN = "{APP_TOKEN}";</script>'
     html = html.replace("</head>", f"{token_script}\n</head>", 1)
@@ -256,7 +311,7 @@ async def health():
 
 
 @app.post("/api/scan")
-async def scan_directory(data: ScanRequest, _auth: None = Depends(require_token)):
+async def scan_directory(data: ScanRequest, state: AppState = Depends(get_session), _auth: None = Depends(require_token)):
     if state.is_running:
         return JSONResponse({"error": "Optimization in progress, please wait"}, status_code=400)
     directory = Path(data.directory)
@@ -292,7 +347,7 @@ async def scan_directory(data: ScanRequest, _auth: None = Depends(require_token)
 
 
 @app.post("/api/upload")
-async def upload_files(files: List[UploadFile] = File(...), _auth: None = Depends(require_token)):
+async def upload_files(files: List[UploadFile] = File(...), state: AppState = Depends(get_session), _auth: None = Depends(require_token)):
     if state.is_running:
         return JSONResponse({"error": "Optimization in progress, please wait"}, status_code=400)
     state.reset()
@@ -329,7 +384,7 @@ async def upload_files(files: List[UploadFile] = File(...), _auth: None = Depend
 
 
 @app.get("/api/thumb/{ws_name}/{thumb_rel:path}")
-async def get_thumbnail(ws_name: str, thumb_rel: str):
+async def get_thumbnail(ws_name: str, thumb_rel: str, state: AppState = Depends(get_session)):
     if state.workspace and state.workspace.name == ws_name:
         p = (state.workspace / thumb_rel).resolve()
         base = str(state.workspace.resolve())
@@ -339,7 +394,7 @@ async def get_thumbnail(ws_name: str, thumb_rel: str):
 
 
 @app.post("/api/optimize")
-async def start_optimization(data: OptimizeRequest, _auth: None = Depends(require_token)):
+async def start_optimization(data: OptimizeRequest, state: AppState = Depends(get_session), _auth: None = Depends(require_token)):
     if state.is_running:
         return JSONResponse({"error": "Optimization in progress, please wait"}, status_code=400)
 
@@ -385,6 +440,7 @@ async def start_optimization(data: OptimizeRequest, _auth: None = Depends(requir
 
     asyncio.create_task(
         _process_files(
+            state,
             files_to_process,
             data.quality,
             data.max_width,
@@ -400,6 +456,7 @@ async def start_optimization(data: OptimizeRequest, _auth: None = Depends(requir
 
 
 async def _process_files(
+    state: AppState,
     files: list,
     quality: str,
     max_width: int,
@@ -505,7 +562,7 @@ async def _process_files(
 
 
 @app.get("/api/progress")
-async def get_progress():
+async def get_progress(state: AppState = Depends(get_session)):
     return JSONResponse({
         "running": state.is_running,
         "current": state.current,
@@ -516,13 +573,13 @@ async def get_progress():
 
 
 @app.post("/api/cancel")
-async def cancel(_auth: None = Depends(require_token)):
+async def cancel(state: AppState = Depends(get_session), _auth: None = Depends(require_token)):
     state.cancelled = True
     return JSONResponse({"ok": True})
 
 
 @app.get("/api/source-file/{ws_name}/{file_id}")
-async def get_source_file(ws_name: str, file_id: str):
+async def get_source_file(ws_name: str, file_id: str, state: AppState = Depends(get_session)):
     if state.workspace and state.workspace.name == ws_name:
         for f in state.files:
             if f["id"] == file_id:
@@ -538,7 +595,7 @@ async def get_source_file(ws_name: str, file_id: str):
 
 
 @app.get("/api/result/{ws_name}/{result_path:path}")
-async def get_result(ws_name: str, result_path: str):
+async def get_result(ws_name: str, result_path: str, state: AppState = Depends(get_session)):
     if state.workspace and state.workspace.name == ws_name:
         p = (state.workspace / "output" / result_path).resolve()
         base = str((state.workspace / "output").resolve())
@@ -548,7 +605,7 @@ async def get_result(ws_name: str, result_path: str):
 
 
 @app.get("/api/preview/{ws_name}/{file_id}")
-async def preview(ws_name: str, file_id: str):
+async def preview(ws_name: str, file_id: str, state: AppState = Depends(get_session)):
     html = """<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <style>
@@ -566,11 +623,16 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 .label{padding:8px 16px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#888;background:#fafaf5}
 .image-wrap{flex:1;display:flex;align-items:center;justify-content:center;overflow:auto;padding:16px;background:#f0f0eb}
 .image-wrap img{max-width:100%;max-height:100%;object-fit:contain}
+.image-wrap.zoom-100{align-items:flex-start;justify-content:flex-start}
+.image-wrap img.zoom-100{max-width:none;max-height:none;width:auto;height:auto}
 .footer{padding:10px 20px;text-align:center;font-size:13px;border-top:1px solid #ddd;color:#999}
 .overlay-view{flex:1;display:flex;flex-direction:column}
 .overlay-label{padding:8px 16px;font-size:12px;text-align:center;color:#888;background:#fafaf5;user-select:none}
 .overlay-wrap{flex:1;display:flex;align-items:center;justify-content:center;overflow:auto;padding:16px;background:#f0f0eb;cursor:pointer}
 .overlay-img{width:100%;height:100%;object-fit:contain}
+.overlay-wrap.zoom-100{align-items:flex-start;justify-content:flex-start}
+.overlay-img.zoom-100{width:auto;height:auto;max-width:none;max-height:none}
+.zoom-toggle{display:flex;gap:4px}
 </style>
 </head><body>"""
     result = None
@@ -601,15 +663,19 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
     <button class="view-btn active" id="btn-side">Side by Side</button>
     <button class="view-btn" id="btn-overlay">Overlay</button>
   </div>
+  <div class="zoom-toggle">
+    <button class="view-btn active" id="btn-fit" title="Scale images to fit the window">Fit</button>
+    <button class="view-btn" id="btn-zoom100" title="Show actual pixels — the real test for whether text stays sharp">100%</button>
+  </div>
 </div>
 <div class="container" id="side-view">
   <div class="panel">
     <div class="label">Original ({_fmt_size(result['original_size'])})</div>
-    <div class="image-wrap"><img src="{orig_url}" alt="original"/></div>
+    <div class="image-wrap" id="orig-wrap"><img src="{orig_url}" id="orig-img" alt="original"/></div>
   </div>
   <div class="panel">
     <div class="label">Compressed ({_fmt_size(result['compressed_size'])})</div>
-    <div class="image-wrap"><img src="{comp_url}" alt="compressed"/></div>
+    <div class="image-wrap" id="comp-wrap"><img src="{comp_url}" id="comp-img" alt="compressed"/></div>
   </div>
 </div>
 <div class="overlay-view" id="overlay-view" style="display:none">
@@ -624,14 +690,21 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 (function(){{
   var sideBtn = document.getElementById('btn-side');
   var overlayBtn = document.getElementById('btn-overlay');
+  var fitBtn = document.getElementById('btn-fit');
+  var zoomBtn = document.getElementById('btn-zoom100');
   var sideView = document.getElementById('side-view');
   var overlayView = document.getElementById('overlay-view');
+  var origWrap = document.getElementById('orig-wrap');
+  var compWrap = document.getElementById('comp-wrap');
+  var origImg = document.getElementById('orig-img');
+  var compImg = document.getElementById('comp-img');
   var orig = document.getElementById('overlay-orig');
   var comp = document.getElementById('overlay-comp');
   var label = document.getElementById('overlay-label');
   var wrap = document.getElementById('overlay-wrap');
   var footer = document.getElementById('footer-hint');
   var showingOriginal = false;
+  var zoomedIn = false;
 
   function setMode(mode){{
     var isOverlay = mode === 'overlay';
@@ -639,14 +712,32 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
     overlayView.style.display = isOverlay ? 'flex' : 'none';
     sideBtn.classList.toggle('active', !isOverlay);
     overlayBtn.classList.toggle('active', isOverlay);
-    footer.textContent = isOverlay
-      ? 'Click the image (or press space) to flip between original and compressed'
-      : 'Original (left) vs Compressed (right)';
+    updateFooter();
   }}
   sideBtn.addEventListener('click', function(){{ setMode('side'); }});
   overlayBtn.addEventListener('click', function(){{ setMode('overlay'); }});
 
+  function setZoom(mode){{
+    zoomedIn = mode === '100';
+    [origWrap, compWrap, wrap].forEach(function(w){{ w.classList.toggle('zoom-100', zoomedIn); }});
+    [origImg, compImg, orig, comp].forEach(function(img){{ img.classList.toggle('zoom-100', zoomedIn); }});
+    fitBtn.classList.toggle('active', !zoomedIn);
+    zoomBtn.classList.toggle('active', zoomedIn);
+    updateFooter();
+  }}
+  fitBtn.addEventListener('click', function(){{ setZoom('fit'); }});
+  zoomBtn.addEventListener('click', function(){{ setZoom('100'); }});
+
+  function updateFooter(){{
+    var isOverlay = overlayView.style.display !== 'none';
+    var zoomHint = zoomedIn ? ' (scroll to pan around at actual size)' : '';
+    footer.textContent = isOverlay
+      ? 'Click the image (or press space) to flip between original and compressed' + zoomHint
+      : 'Original (left) vs Compressed (right)' + zoomHint;
+  }}
+
   function toggleImage(){{
+    if (zoomedIn) return; // clicking while panning a zoomed image shouldn't also flip it
     showingOriginal = !showingOriginal;
     orig.style.display = showingOriginal ? 'block' : 'none';
     comp.style.display = showingOriginal ? 'none' : 'block';
@@ -674,7 +765,7 @@ async def favicon():
 
 
 @app.get("/api/download/{ws_name}")
-async def download_zip(ws_name: str):
+async def download_zip(ws_name: str, state: AppState = Depends(get_session)):
     if not (state.workspace and state.workspace.name == ws_name):
         return JSONResponse({"error": "Invalid workspace"}, status_code=404)
 
@@ -734,7 +825,7 @@ async def browse_folder(title: str = "Select Folder", _auth: None = Depends(requ
 
 
 @app.get("/api/state")
-async def get_state():
+async def get_state(state: AppState = Depends(get_session)):
     return JSONResponse({
         "files": state.files,
         "results": state.results,
@@ -762,8 +853,10 @@ def main():
     if args.dir:
         d = Path(args.dir).resolve()
         if d.exists() and d.is_dir():
-            state.input_dir = str(d)
-            ws = state.new_workspace()
+            global _cli_prescan_state
+            prescan = AppState()
+            prescan.input_dir = str(d)
+            ws = prescan.new_workspace()
             images = _scan_images(d)
             for idx, img_path in enumerate(images):
                 rel = str(img_path.relative_to(d))
@@ -771,15 +864,16 @@ def main():
                 thumb_path = ws / thumb_rel
                 if not thumb_path.exists():
                     _gen_thumbnail(img_path, thumb_path)
-                state.files.append({
+                prescan.files.append({
                     "id": str(idx),
                     "name": rel,
                     "path": str(img_path),
                     "size": img_path.stat().st_size,
-                    "thumbnail": f"/api/thumb/{state.workspace.name}/{thumb_rel}",
+                    "thumbnail": f"/api/thumb/{prescan.workspace.name}/{thumb_rel}",
                 })
-            state.total = len(state.files)
-            print(f"[Startup] Scanned {len(state.files)} images: {d}")
+            prescan.total = len(prescan.files)
+            _cli_prescan_state = prescan
+            print(f"[Startup] Scanned {len(prescan.files)} images: {d}")
         else:
             print(f"[Warning] Directory does not exist: {args.dir}")
 
