@@ -400,13 +400,12 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
 
     if data.compression_mode not in ("standard", "lossless", "resize_only"):
         return JSONResponse({"error": "Invalid compression_mode"}, status_code=400)
-    if data.output_format not in ("png",):
-        # The pipeline only ever produces real PNG bytes right now (pngquant/
-        # oxipng are both PNG-only, and non-PNG sources are normalized to PNG
-        # before processing) — accepting anything else here would silently
-        # produce a file whose extension lies about its actual content.
+    if data.output_format not in ("png", "webp"):
+        # The pipeline only ever produces real PNG or WebP bytes — accepting
+        # anything else here would silently produce a file whose extension
+        # lies about its actual content.
         return JSONResponse(
-            {"error": f"Unsupported output_format: {data.output_format!r}. Only 'png' is currently supported."},
+            {"error": f"Unsupported output_format: {data.output_format!r}. Supported: 'png', 'webp'."},
             status_code=400,
         )
     if data.compression_mode == "resize_only" and data.max_width <= 0:
@@ -455,6 +454,9 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
     return JSONResponse({"ok": True, "total": len(files_to_process)})
 
 
+CONCURRENT_WORKERS = 4  # matches Optimizer's internal subprocess semaphore
+
+
 async def _process_files(
     state: AppState,
     files: list,
@@ -480,56 +482,96 @@ async def _process_files(
     async def log(msg):
         state.logs.append(f"  {msg}")
 
-    try:
-        for i, file_info in enumerate(files):
-            if state.cancelled:
-                state.logs.append("Cancelled by user")
-                break
+    queue: asyncio.Queue = asyncio.Queue()
+    for file_info in files:
+        queue.put_nowait(file_info)
 
-            input_path = Path(file_info["path"])
+    async def process_one(file_info: dict):
+        input_path = Path(file_info["path"])
 
-            # file_info["name"] is always the clean, structure-preserving
-            # relative name (e.g. "2023/vacation/IMG_0001.png") for both the
-            # scan and upload flows — use it directly rather than trying to
-            # re-derive it from the physical storage path, which for uploads
-            # is intentionally flattened/deduplicated and does NOT mirror
-            # the original folder structure.
-            out_path = opt_output_dir / file_info["name"]
+        # file_info["name"] is always the clean, structure-preserving
+        # relative name (e.g. "2023/vacation/IMG_0001.png") for both the
+        # scan and upload flows — use it directly rather than trying to
+        # re-derive it from the physical storage path, which for uploads
+        # is intentionally flattened/deduplicated and does NOT mirror
+        # the original folder structure.
+        out_path = opt_output_dir / file_info["name"]
+        out_path = out_path.with_suffix(f".{output_format}")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
 
-            out_path = out_path.with_suffix(f".{output_format}")
-            out_path.parent.mkdir(parents=True, exist_ok=True)
+        state.logs.append(f"Processing: {file_info['name']}")
 
-            state.logs.append(f"[{i + 1}/{state.total}] {file_info['name']}")
+        result = await optimizer.optimize_png(
+            input_path=input_path,
+            output_path=out_path,
+            quality=quality,
+            max_width=max_width,
+            compression_mode=compression_mode,
+            protected_colors=protected_colors,
+            dithering=dithering,
+            output_format=output_format,
+            progress_callback=log,
+        )
 
-            result = await optimizer.optimize_png(
-                input_path=input_path,
-                output_path=out_path,
-                quality=quality,
-                max_width=max_width,
-                compression_mode=compression_mode,
-                protected_colors=protected_colors,
-                dithering=dithering,
-                progress_callback=log,
+        result["id"] = file_info["id"]
+        result["name"] = file_info["name"]
+        result["original_path"] = file_info["path"]
+        result["output_format"] = output_format
+
+        if result["success"]:
+            result["savings"] = result["original_size"] - result["compressed_size"]
+            result["savings_percent"] = round(
+                result["savings"] / result["original_size"] * 100, 1
+            ) if result["original_size"] > 0 else 0
+            state.logs.append(
+                f"  OK {file_info['name']}: {_fmt_size(result['original_size'])} -> "
+                f"{_fmt_size(result['compressed_size'])} (saved {result['savings_percent']}%)"
             )
+            # Copy this file to the user's chosen output folder right away,
+            # rather than waiting for the whole batch to finish — otherwise
+            # the folder stays empty for the entire run, which looks like
+            # the wrong folder was picked.
+            if output_dir:
+                try:
+                    user_output = Path(output_dir)
+                    rel = out_path.relative_to(opt_output_dir)
+                    dest = user_output / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(out_path, dest)
+                except Exception as e:
+                    state.logs.append(f"  Output copy failed: {e}")
+        else:
+            state.logs.append(f"  FAILED {file_info['name']}: {result.get('error', 'unknown')}")
 
-            result["id"] = file_info["id"]
-            result["name"] = file_info["name"]
-            result["original_path"] = file_info["path"]
+        # No lock needed: asyncio is single-threaded/cooperative and there's
+        # no `await` between these two statements, so no other worker can
+        # interleave in between.
+        state.results.append(result)
+        state.current += 1
 
-            if result["success"]:
-                result["savings"] = result["original_size"] - result["compressed_size"]
-                result["savings_percent"] = round(
-                    result["savings"] / result["original_size"] * 100, 1
-                ) if result["original_size"] > 0 else 0
-                state.logs.append(
-                    f"  OK {_fmt_size(result['original_size'])} -> {_fmt_size(result['compressed_size'])} "
-                    f"(saved {result['savings_percent']}%)"
-                )
-            else:
-                state.logs.append(f"  FAILED: {result.get('error', 'unknown')}")
+    async def worker():
+        while True:
+            try:
+                file_info = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                if state.cancelled:
+                    # Drain the queue without processing once cancelled,
+                    # rather than stopping this one worker while others
+                    # keep pulling — matches the old behavior of not
+                    # starting new files after Cancel, while files already
+                    # in flight are left to finish naturally.
+                    continue
+                await process_one(file_info)
+            finally:
+                queue.task_done()
 
-            state.results.append(result)
-            state.current = i + 1
+    try:
+        workers = [asyncio.create_task(worker()) for _ in range(CONCURRENT_WORKERS)]
+        await asyncio.gather(*workers)
+        if state.cancelled:
+            state.logs.append("Cancelled by user")
 
     except Exception as e:
         state.logs.append(f"  UNEXPECTED ERROR: {e}")
@@ -546,19 +588,11 @@ async def _process_files(
             f"\nDone! {state.current}/{state.total} files, "
             f"saved {_fmt_size(saved)} ({pct}%)"
         )
+        if output_dir:
+            state.logs.append(f"  Output saved to: {Path(output_dir).resolve()}")
 
         if output_dir:
-            user_output = Path(output_dir)
-            try:
-                user_output.mkdir(parents=True, exist_ok=True)
-                for f in opt_output_dir.rglob("*"):
-                    if f.is_file():
-                        dest = user_output / f.relative_to(opt_output_dir)
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(f, dest)
-                state.logs.append(f"  Output saved to: {user_output.resolve()}")
-            except Exception as e:
-                state.logs.append(f"  Output copy failed: {e}")
+            state.logs.append(f"  Output saved to: {Path(output_dir).resolve()}")
 
 
 @app.get("/api/progress")
@@ -649,12 +683,19 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
     # Same reasoning as _process_files: result["name"] is the clean,
     # structure-preserving relative name for both scan and upload flows —
     # use it directly instead of re-deriving from the physical storage path.
-    comp_rel = str(Path(result["name"]).with_suffix(".png"))
+    out_fmt = result.get("output_format", "png")
+    comp_rel = str(Path(result["name"]).with_suffix(f".{out_fmt}"))
 
     comp_url = f"/api/result/{ws_name}/{comp_rel}" if comp_rel else ""
 
     import html as _html
     safe_name = _html.escape(str(result['name']))
+    safe_basename = _html.escape(Path(result['name']).name)
+    html = html.replace(
+        '<head><meta charset="utf-8">',
+        f'<head><meta charset="utf-8"><title>Compare - {safe_basename}</title>',
+        1,
+    )
     html += f"""
 <div class="bar">
   <span class="title">{safe_name}</span>

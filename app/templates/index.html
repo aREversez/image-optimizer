@@ -83,7 +83,19 @@ header h1 span { color: var(--accent); }
 .recent-chip:hover { border-color: var(--accent); color: var(--text); background: var(--surface); }
 
 /* Main Layout */
-.container { max-width: 1200px; margin: 0 auto; padding: 20px 24px; display: flex; flex-direction: column; gap: 20px; }
+.container {
+  max-width: 1400px; margin: 0 auto; padding: 20px 24px;
+  display: grid; grid-template-columns: 380px 1fr; gap: 20px; align-items: start;
+}
+.app-sidebar {
+  display: flex; flex-direction: column; gap: 20px; position: sticky; top: 20px;
+  max-height: calc(100vh - 40px); overflow-y: auto;
+}
+.app-main { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
+@media (max-width: 1000px) {
+  .container { display: flex; flex-direction: column; }
+  .app-sidebar { position: static; }
+}
 
 .card {
   background: var(--surface);
@@ -98,9 +110,9 @@ header h1 span { color: var(--accent); }
 }
 
 /* Input Section */
-.input-row { display: flex; gap: 8px; margin-bottom: 14px; }
+.input-row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
 .input-row input[type="text"] {
-  flex: 1; padding: 10px 14px; background: var(--bg); border: 1px solid var(--border);
+  flex: 1 1 100%; padding: 10px 14px; background: var(--bg); border: 1px solid var(--border);
   border-radius: var(--radius); color: var(--text); font-size: 14px; outline: none;
   transition: border-color .2s;
 }
@@ -142,7 +154,7 @@ header h1 span { color: var(--accent); }
   border-radius: var(--radius); color: var(--text); font-size: 14px; outline: none;
   min-width: 180px;
 }
-.config-group.disabled-group { opacity: .45; pointer-events: none; }
+.config-group.disabled-group { opacity: .45; }
 .radio-group { display: flex; gap: 4px; background: var(--bg); border-radius: var(--radius); padding: 3px; }
 .radio-group label {
   padding: 6px 16px; border-radius: 5px; cursor: pointer; font-size: 13px;
@@ -271,6 +283,8 @@ header h1 span { color: var(--accent); }
 
 <div class="container">
 
+  <div class="app-sidebar">
+
   <!-- Input Section -->
   <div class="card" id="input-section">
     <div class="card-title">Select Images</div>
@@ -300,7 +314,7 @@ header h1 span { color: var(--accent); }
   </div>
 
   <!-- Config + Action -->
-  <div class="card section" id="config-section">
+  <div class="card" id="config-section">
     <div class="card-title">Settings</div>
     <div class="config-grid" style="margin-bottom:16px">
       <div class="config-group">
@@ -328,7 +342,10 @@ header h1 span { color: var(--accent); }
         <label>Output Format</label>
         <div class="radio-group" id="format-group">
           <input type="radio" name="format" id="fmt-png" value="png" checked><label for="fmt-png">PNG</label>
-          <input type="radio" name="format" id="fmt-webp" value="webp" disabled><label for="fmt-webp" style="opacity:.4">WebP</label>
+          <input type="radio" name="format" id="fmt-webp" value="webp"
+            title="WebP typically produces smaller files than PNG at similar visual quality. Uses its own encoder (not pngquant/oxipng) — Quality/Protect Colors/Dithering don't apply, only Compression Mode's lossy-vs-lossless choice does.">
+          <label for="fmt-webp"
+            title="WebP typically produces smaller files than PNG at similar visual quality. Uses its own encoder (not pngquant/oxipng) — Quality/Protect Colors/Dithering don't apply, only Compression Mode's lossy-vs-lossless choice does.">WebP</label>
         </div>
       </div>
       <div class="config-group">
@@ -369,8 +386,12 @@ header h1 span { color: var(--accent); }
     </div>
   </div>
 
+  </div>
+
+  <div class="app-main">
+
   <!-- File List -->
-  <div class="card section" id="files-section">
+  <div class="card" id="files-section">
     <div class="file-stats">
       <span id="file-stats-text"></span>
       <label style="font-size:13px;cursor:pointer;user-select:none">
@@ -383,7 +404,7 @@ header h1 span { color: var(--accent); }
   </div>
 
   <!-- Progress -->
-  <div class="card section" id="progress-section">
+  <div class="card" id="progress-section">
     <div class="card-title">Progress</div>
     <div class="progress-bar"><div class="progress-bar-fill" id="progress-fill"></div></div>
     <div class="progress-info">
@@ -394,7 +415,7 @@ header h1 span { color: var(--accent); }
   </div>
 
   <!-- Results -->
-  <div class="card section" id="results-section">
+  <div class="card" id="results-section">
     <div class="card-title">Results</div>
     <div class="result-summary" id="result-summary"></div>
     <div class="action-bar" style="margin-bottom:12px">
@@ -403,7 +424,9 @@ header h1 span { color: var(--accent); }
       <button class="btn btn-primary" id="download-btn" style="display:none">Download All (ZIP)</button>
       <button class="btn btn-secondary" id="reset-btn">Reset</button>
     </div>
-    <div class="result-grid" id="result-grid"></div>
+    <div class="result-grid" id="result-grid"><div class="file-list-empty">No results yet — run Start to see compressed files here</div></div>
+  </div>
+
   </div>
 
 </div>
@@ -677,6 +700,7 @@ fileInput.addEventListener('change', async (e) => {
 });
 
 async function uploadFiles(files) {
+  dismissPersistentNotice();
   const formData = new FormData();
   for (const f of files) formData.append('files', f);
 
@@ -745,26 +769,35 @@ function showConfigSection() {
 // Compression Mode: controls which settings are relevant.
 function updateModeDependentControls() {
   const mode = document.querySelector('input[name="mode"]:checked').value;
+  const format = document.querySelector('input[name="format"]:checked').value;
   const isStandard = mode === 'standard';
-  const isResizeOnly = mode === 'resize_only';
-  const isLossless = mode === 'lossless';
+  const isPng = format === 'png';
 
-  // Protect Colors / Dithering: only relevant in Standard mode
-  protectColorsInput.disabled = !isStandard;
-  ditheringInput.disabled = !isStandard;
-  protectColorsGroup.classList.toggle('disabled-group', !isStandard);
-  ditheringGroup.classList.toggle('disabled-group', !isStandard);
+  // Protect Colors / Dithering: pngquant-specific — only apply in Standard
+  // mode AND when the output format is PNG (WebP uses its own encoder and
+  // never touches pngquant, regardless of compression mode).
+  const pngquantApplies = isStandard && isPng;
+  protectColorsInput.disabled = !pngquantApplies;
+  ditheringInput.disabled = !pngquantApplies;
+  protectColorsGroup.classList.toggle('disabled-group', !pngquantApplies);
+  ditheringGroup.classList.toggle('disabled-group', !pngquantApplies);
 
-  // Quality: only relevant when pngquant is involved (Standard mode)
+  // Quality: relevant for Standard-mode PNG (pngquant target) and for
+  // Standard-mode WebP (Pillow's own quality parameter) — only meaningless
+  // when compression mode isn't Standard (Lossless/Resize Only skip
+  // quality entirely for both formats).
   document.querySelectorAll('input[name="quality"]').forEach(r => r.disabled = !isStandard);
   document.getElementById('quality-group').classList.toggle('disabled-group', !isStandard);
 
-  // Max Width: disabled in Standard mode (resize only makes sense with Lossless or Resize Only)
-  $('max-width').disabled = isStandard;
-  $('max-width').closest('.config-group').classList.toggle('disabled-group', isStandard);
+  // Max Width is intentionally NOT tied to compression mode or format —
+  // resizing is orthogonal to how colors/encoding are handled. You can
+  // shrink dimensions in Standard mode just as validly as in Lossless/
+  // Resize Only (in fact combining resize with quantization is one of the
+  // strongest ways to cut file size), so it stays enabled in all cases.
 
   updateStartButtonState();
 }
+document.querySelectorAll('input[name="format"]').forEach(r => r.addEventListener('change', updateModeDependentControls));
 document.querySelectorAll('input[name="mode"]').forEach(r => r.addEventListener('change', updateModeDependentControls));
 $('max-width').addEventListener('change', updateStartButtonState);
 
@@ -792,7 +825,7 @@ startBtn.addEventListener('click', async () => {
 
   const quality = document.querySelector('input[name="quality"]:checked').value;
   const maxWidth = parseInt($('max-width').value);
-  const format = 'png';
+  const format = document.querySelector('input[name="format"]:checked').value;
   const outputDir = $('output-dir').value.trim();
   const compressionMode = document.querySelector('input[name="mode"]:checked').value;
   const protectedColors = protectColorsInput.value.split(',').map(s => s.trim()).filter(Boolean);
@@ -984,14 +1017,13 @@ downloadBtn.addEventListener('click', async () => {
 
 // Reset
 resetBtn.addEventListener('click', () => {
+  dismissPersistentNotice();
   STATE.files = [];
   STATE.results = [];
   STATE.wsName = '';
-  progressSection.classList.remove('active');
-  resultsSection.classList.remove('active');
-  configSection.classList.remove('active');
-  filesSection.classList.remove('active');
   fileGrid.innerHTML = '<div class="file-list-empty">Select a folder or drop images here</div>';
+  resultGrid.innerHTML = '<div class="file-list-empty">No results yet — run Start to see compressed files here</div>';
+  resultSummary.innerHTML = '';
   fileStatsText.textContent = '';
   startBtn.disabled = true;
   fileCountInfo.textContent = '';
