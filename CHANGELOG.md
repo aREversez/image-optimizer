@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.1] - 2026-07-22
+
+### Changed
+- Two-column layout: left panel (paths + settings) sticky, right panel (files + progress + results)
+- Overlay compare view is now the default
+- "Include subfolders" unchecked by default
+- Recent folders show per-item × button and "Clear all" button
+- Quality controls disabled in lossless/resize-only modes
+- Max Width disabled in standard mode
+- All notifications auto-dismiss after 5 seconds
+- Cancel button hidden until compression starts
+- Placeholder text no longer wraps; improved spacing
+
+### Added
+- `POST /api/recent/remove` and `POST /api/recent/clear` endpoints
+- Persistent completion toast with dismiss
+
+### Fixed
+- Duplicate "### Fixed" heading in changelog
+
 ## [1.0.0] - 2026-07-18
 
 ### Added
@@ -18,8 +38,6 @@ All notable changes to this project will be documented in this file.
 - `build_exe.py` — PyInstaller script to produce a standalone Windows exe (`--onedir`)
 - Favicon, app icon, and README banner images in `assets/`
 - PyInstaller frozen-build support (`sys._MEIPASS` path resolution)
-
-### Fixed
 
 ### Fixed
 - Path traversal vulnerabilities in file-serve endpoints
