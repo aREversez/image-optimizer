@@ -196,7 +196,7 @@ header h1 span { color: var(--accent); }
 }
 .file-card.selected .check { background: var(--accent); border-color: var(--accent); color: #000; }
 .file-list-empty {
-  text-align: center; padding: 30px; color: var(--text2);
+  text-align: center; padding: 30px; color: var(--text2); white-space: nowrap;
 }
 
 /* Progress */
@@ -396,15 +396,14 @@ header h1 span { color: var(--accent); }
 
   <!-- File List -->
   <div class="card" id="files-section">
+    <div class="card-title">Files</div>
     <div class="file-stats">
       <span id="file-stats-text"></span>
       <label style="font-size:13px;cursor:pointer;user-select:none">
         <input type="checkbox" id="select-all" checked /> Select all
       </label>
     </div>
-    <div class="file-grid" id="file-grid">
-      <div class="file-list-empty">Select a folder or drop images here</div>
-    </div>
+    <div class="file-grid" id="file-grid"></div>
   </div>
 
   <!-- Progress -->
@@ -413,7 +412,7 @@ header h1 span { color: var(--accent); }
     <div class="progress-bar"><div class="progress-bar-fill" id="progress-fill"></div></div>
     <div class="progress-info">
       <span id="progress-text">Waiting...</span>
-      <span><button class="btn btn-danger btn-sm" id="cancel-btn" style="padding:4px 12px;font-size:12px">Cancel</button></span>
+      <span><button class="btn btn-danger btn-sm" id="cancel-btn" style="display:none;padding:4px 12px;font-size:12px">Cancel</button></span>
     </div>
     <div class="log-box" id="log-box"></div>
   </div>
@@ -421,6 +420,7 @@ header h1 span { color: var(--accent); }
   <!-- Results -->
   <div class="card" id="results-section">
     <div class="card-title">Results</div>
+    <div id="results-empty" style="font-size:13px;color:var(--text2);padding:0 0 16px">No results yet, run Start to see compressed files</div>
     <div class="result-summary" id="result-summary"></div>
     <div class="action-bar" style="margin-bottom:12px">
       <span id="output-path-info" style="font-size:12px;color:var(--text2)"></span>
@@ -428,7 +428,7 @@ header h1 span { color: var(--accent); }
       <button class="btn btn-primary" id="download-btn" style="display:none">Download All (ZIP)</button>
       <button class="btn btn-secondary" id="reset-btn">Reset</button>
     </div>
-    <div class="result-grid" id="result-grid"><div class="file-list-empty">No results yet — run Start to see compressed files here</div></div>
+    <div class="result-grid" id="result-grid"></div>
   </div>
 
   </div>
@@ -476,7 +476,7 @@ function showNotice(message, type) {
   const remove = () => el.remove();
   el.querySelector('.notice-close').addEventListener('click', remove);
   noticeContainer.appendChild(el);
-  if (type !== 'err') setTimeout(remove, 5000);
+  setTimeout(remove, 5000);
 }
 
 function showPersistentNotice(message, type) {
@@ -488,6 +488,7 @@ function showPersistentNotice(message, type) {
   el.querySelector('.notice-close').addEventListener('click', () => dismissPersistentNotice());
   noticeContainer.appendChild(el);
   persistentNoticeEl = el;
+  setTimeout(dismissPersistentNotice, 5000);
 }
 
 function dismissPersistentNotice() {
@@ -514,6 +515,7 @@ const dirPath = $('dir-path'),
       escHtml = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'),
       logBox = $('log-box'),
       resultsSection = $('results-section'),
+      resultsEmpty = $('results-empty'),
       resultSummary = $('result-summary'),
       resultGrid = $('result-grid'),
       downloadBtn = $('download-btn'),
@@ -878,6 +880,7 @@ startBtn.addEventListener('click', async () => {
   // Show progress section
   progressSection.classList.add('active');
   resultsSection.classList.remove('active');
+  cancelBtn.style.display = '';
   logBox.innerHTML = '';
   progressFill.style.width = '0%';
   progressText.textContent = 'Starting...';
@@ -896,6 +899,7 @@ startBtn.addEventListener('click', async () => {
     if (d.error) {
       showNotice(d.error, 'err');
       STATE.isRunning = false;
+      cancelBtn.style.display = 'none';
       updateStartButtonState();
       return;
     }
@@ -906,6 +910,7 @@ startBtn.addEventListener('click', async () => {
   } catch(e) {
     showNotice('Start failed: ' + e.message, 'err');
     STATE.isRunning = false;
+    cancelBtn.style.display = 'none';
     updateStartButtonState();
   }
 });
@@ -943,6 +948,7 @@ async function pollProgress() {
     // Check if done
     if (!d.running) {
       clearInterval(STATE.pollTimer);
+      cancelBtn.style.display = 'none';
       if (d.results && d.results.length > 0) {
         STATE.results = d.results;
         STATE.wsName = STATE.files[0]?.thumbnail?.split('/')[3] || '';
@@ -967,6 +973,7 @@ cancelBtn.addEventListener('click', async () => {
 // Show results
 function showResults() {
   resultsSection.classList.add('active');
+  resultsEmpty.style.display = 'none';
   const results = STATE.results;
   const success = results.filter(r => r.success);
 
@@ -1061,9 +1068,10 @@ resetBtn.addEventListener('click', () => {
   STATE.files = [];
   STATE.results = [];
   STATE.wsName = '';
-  fileGrid.innerHTML = '<div class="file-list-empty">Select a folder or drop images here</div>';
-  resultGrid.innerHTML = '<div class="file-list-empty">No results yet — run Start to see compressed files here</div>';
+  fileGrid.innerHTML = '';
+  resultGrid.innerHTML = '';
   resultSummary.innerHTML = '';
+  resultsEmpty.style.display = '';
   fileStatsText.textContent = '';
   startBtn.disabled = true;
   fileCountInfo.textContent = '';
