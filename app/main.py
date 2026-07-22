@@ -65,6 +65,10 @@ class AppState:
         self.logs: list = []
         self.cancelled = False
         self.last_seen = time.time()
+        self.scan_running = False
+        self.scan_current = 0
+        self.scan_total = 0
+        self.scan_error: Optional[str] = None
 
     def reset(self):
         self.files = []
@@ -75,6 +79,10 @@ class AppState:
         self.total = 0
         self.logs = []
         self.cancelled = False
+        self.scan_running = False
+        self.scan_current = 0
+        self.scan_total = 0
+        self.scan_error = None
 
     def new_workspace(self):
         if self.workspace:
@@ -310,40 +318,101 @@ async def health():
     })
 
 
+async def _scan_and_thumbnail(state: AppState, directory: Path, recursive: bool):
+    ws = state.workspace
+    try:
+        images = await asyncio.get_event_loop().run_in_executor(
+            None, _scan_images, directory, recursive
+        )
+    except Exception as e:
+        state.scan_error = str(e)
+        state.scan_running = False
+        return
+
+    state.scan_total = len(images)
+    files: list = [None] * len(images)  # preallocated so results land in a
+    # stable, deterministic order (matching the sorted scan order) even
+    # though workers finish in whatever order thumbnailing completes.
+
+    queue: asyncio.Queue = asyncio.Queue()
+    for idx, img_path in enumerate(images):
+        queue.put_nowait((idx, img_path))
+
+    loop = asyncio.get_event_loop()
+
+    async def worker():
+        while True:
+            try:
+                idx, img_path = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                rel = str(img_path.relative_to(directory))
+                thumb_rel = f"thumb/{idx}_{img_path.stem}.jpg"
+                thumb_path = ws / thumb_rel
+                if not thumb_path.exists():
+                    await loop.run_in_executor(None, _gen_thumbnail, img_path, thumb_path)
+                files[idx] = {
+                    "id": str(idx),
+                    "name": rel,
+                    "path": str(img_path),
+                    "size": img_path.stat().st_size,
+                    "thumbnail": f"/api/thumb/{ws.name}/{thumb_rel}",
+                }
+            except Exception as e:
+                # One unreadable/corrupt file shouldn't stop the rest of
+                # the scan — same reasoning as the optimize worker pool.
+                files[idx] = {
+                    "id": str(idx),
+                    "name": str(img_path),
+                    "path": str(img_path),
+                    "size": 0,
+                    "thumbnail": "",
+                    "error": str(e),
+                }
+            finally:
+                state.scan_current += 1
+                queue.task_done()
+
+    workers = [asyncio.create_task(worker()) for _ in range(CONCURRENT_WORKERS)]
+    await asyncio.gather(*workers)
+
+    state.files = [f for f in files if f is not None]
+    state.total = len(state.files)
+    state.scan_running = False
+    _push_recent("scan_dirs", str(directory.resolve()))
+
+
 @app.post("/api/scan")
 async def scan_directory(data: ScanRequest, state: AppState = Depends(get_session), _auth: None = Depends(require_token)):
     if state.is_running:
         return JSONResponse({"error": "Optimization in progress, please wait"}, status_code=400)
+    if state.scan_running:
+        return JSONResponse({"error": "A scan is already in progress, please wait"}, status_code=400)
     directory = Path(data.directory)
     if not directory.exists() or not directory.is_dir():
         return JSONResponse({"error": "Directory does not exist"}, status_code=400)
 
     state.reset()
     state.input_dir = str(directory.resolve())
-    ws = state.new_workspace()
-    images = _scan_images(directory, data.recursive)
+    state.new_workspace()
+    state.scan_running = True
+    state.scan_current = 0
+    state.scan_total = 0
 
-    files = []
-    for idx, img_path in enumerate(images):
-        rel = str(img_path.relative_to(directory))
-        thumb_rel = f"thumb/{idx}_{img_path.stem}.jpg"
-        thumb_path = ws / thumb_rel
-        if not thumb_path.exists():
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, _gen_thumbnail, img_path, thumb_path)
+    asyncio.create_task(_scan_and_thumbnail(state, directory, data.recursive))
+    return JSONResponse({"scanning": True})
 
-        files.append({
-            "id": str(idx),
-            "name": rel,
-            "path": str(img_path),
-            "size": img_path.stat().st_size,
-            "thumbnail": f"/api/thumb/{state.workspace.name}/{thumb_rel}",
-        })
 
-    state.files = files
-    state.total = len(files)
-    _push_recent("scan_dirs", str(directory.resolve()))
-    return JSONResponse({"files": files, "count": len(files)})
+@app.get("/api/scan-progress")
+async def get_scan_progress(state: AppState = Depends(get_session)):
+    return JSONResponse({
+        "running": state.scan_running,
+        "current": state.scan_current,
+        "total": state.scan_total,
+        "error": state.scan_error,
+        "files": state.files if not state.scan_running else [],
+    })
 
 
 @app.post("/api/upload")
@@ -563,7 +632,31 @@ async def _process_files(
                     # starting new files after Cancel, while files already
                     # in flight are left to finish naturally.
                     continue
-                await process_one(file_info)
+                try:
+                    await process_one(file_info)
+                except Exception as e:
+                    # Anything process_one doesn't already catch internally
+                    # (optimize_png has its own try/except, but e.g. mkdir
+                    # permission errors or a malformed file_info wouldn't be)
+                    # must be caught HERE, per-file, rather than left to
+                    # propagate out of the worker. An uncaught exception
+                    # would make asyncio.gather() below return immediately
+                    # without waiting for the other 3 workers — they'd keep
+                    # running as orphaned background tasks whose results
+                    # never get recorded, while the batch already reports
+                    # itself done. Degrading to a normal failed-file result
+                    # keeps one bad file from taking down the whole batch.
+                    state.logs.append(f"  FAILED {file_info.get('name', '?')}: {e}")
+                    state.results.append({
+                        "id": file_info.get("id"),
+                        "name": file_info.get("name"),
+                        "original_path": file_info.get("path"),
+                        "success": False,
+                        "error": str(e),
+                        "original_size": 0,
+                        "compressed_size": 0,
+                    })
+                    state.current += 1
             finally:
                 queue.task_done()
 
