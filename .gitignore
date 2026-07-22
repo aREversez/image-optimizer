@@ -13,3 +13,8 @@ images
 dist/
 build/
 *.spec
+
+# Third-party binaries — download per bin/README.md, never commit these.
+bin/*.exe
+bin/pngquant
+bin/oxipng

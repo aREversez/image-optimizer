@@ -112,10 +112,16 @@ class Optimizer:
         compression_mode: str = "standard",
         protected_colors: Optional[list[str]] = None,
         dithering: bool = True,
+        output_format: str = "png",
         progress_callback: Optional[Callable] = None,
     ) -> dict:
         if compression_mode not in ("standard", "lossless", "resize_only"):
             compression_mode = "standard"
+
+        if output_format == "webp":
+            return await self._optimize_webp(
+                input_path, output_path, quality, max_width, compression_mode, progress_callback
+            )
 
         original_size = os.path.getsize(input_path)
         result = {
@@ -245,6 +251,65 @@ class Optimizer:
                 result["success"] = False
                 result["error"] = "output file not generated"
 
+        except Exception as e:
+            result["success"] = False
+            result["error"] = str(e)
+
+        return result
+
+    async def _optimize_webp(
+        self,
+        input_path: Path,
+        output_path: Path,
+        quality: str,
+        max_width: int,
+        compression_mode: str,
+        progress_callback: Optional[Callable],
+    ) -> dict:
+        """WebP goes through Pillow's own encoder rather than pngquant/oxipng
+        (which only understand PNG) — there's no external binary dependency
+        for this format, so it works even without pngquant/oxipng installed."""
+        original_size = os.path.getsize(input_path)
+        result = {
+            "success": False,
+            "original_size": original_size,
+            "compressed_size": original_size,
+            "error": None,
+            "warning": None,
+        }
+        try:
+            loop = asyncio.get_event_loop()
+
+            def _encode():
+                img = Image.open(input_path)
+                if img.mode == "CMYK":
+                    img = img.convert("RGB")
+
+                if max_width > 0:
+                    w, h = img.size
+                    if w > max_width:
+                        ratio = max_width / w
+                        img = img.resize((max_width, int(h * ratio)), Image.Resampling.LANCZOS)
+
+                if compression_mode == "lossless" or compression_mode == "resize_only":
+                    img.save(output_path, format="WEBP", lossless=True, method=6)
+                else:
+                    quality_map = {"high": 90, "medium": 75, "low": 55}
+                    q = quality_map.get(quality, 75)
+                    img.save(output_path, format="WEBP", quality=q, method=6)
+
+            if progress_callback:
+                mode_desc = "lossless" if compression_mode in ("lossless", "resize_only") else f"quality={quality}"
+                await progress_callback(f"encoding WebP ({mode_desc})...")
+
+            async with self._semaphore:
+                await loop.run_in_executor(None, _encode)
+
+            if output_path.exists():
+                result["compressed_size"] = os.path.getsize(output_path)
+                result["success"] = True
+            else:
+                result["error"] = "output file not generated"
         except Exception as e:
             result["success"] = False
             result["error"] = str(e)

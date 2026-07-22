@@ -51,3 +51,12 @@ class ResultInfo(BaseModel):
     error: Optional[str] = None
     warning: Optional[str] = None
     result_url: Optional[str] = None
+
+
+class RecentRemoveRequest(BaseModel):
+    key: str
+    value: str
+
+
+class RecentClearRequest(BaseModel):
+    key: str
