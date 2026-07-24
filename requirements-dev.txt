@@ -1,0 +1,5 @@
+# Dependencies for running the test suite (tests/) — not needed to run
+# the app itself. Install with: pip install -r requirements-dev.txt
+-r requirements.txt
+pytest>=7.4.0
+httpx>=0.24.0

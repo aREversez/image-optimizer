@@ -1,0 +1,35 @@
+name: Tests
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+jobs:
+  test:
+    # Windows is included deliberately, not just Ubuntu: this app has
+    # Windows-specific code paths (tkinter folder-picker icon handling,
+    # sys.frozen / PyInstaller path resolution, the standalone .exe build)
+    # that a Linux-only CI would never exercise. A platform-specific bug
+    # in exactly this kind of app has bitten this project's sibling
+    # (FocusOCR) before.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest tests/ -v
