@@ -59,3 +59,28 @@ class TestPreviewPage:
         rc = client.get(comp_match.group(1))
         assert rc.status_code == 200
         assert rc.headers["content-type"] == "image/webp"
+
+    def test_source_file_content_types_are_explicit_not_os_guessed(self, client, auth_headers, test_images):
+        """Bug (found via Windows CI, not visible on Linux): FileResponse
+        without an explicit media_type falls back to Python's `mimetypes`
+        module, which on Windows reads from the registry rather than a
+        built-in table. .webp (and potentially others) often isn't
+        registered there, silently serving as application/octet-stream
+        instead of the real image type. /api/source-file and /api/result
+        must set media_type explicitly rather than relying on this
+        OS-dependent guess — this test asserts the exact content-type for
+        every format this app actually serves, so it fails identically on
+        every platform instead of only on whichever OS's registry happens
+        to be missing an entry."""
+        scanned = scan_and_wait(client, auth_headers, test_images)
+        expected = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}
+        checked_extensions = set()
+        for f in scanned["files"]:
+            ext = "." + f["name"].rsplit(".", 1)[-1].lower()
+            if ext not in expected:
+                continue
+            r = client.get(f"/api/source-file/{scanned['files'][0]['thumbnail'].split('/')[3]}/{f['id']}")
+            assert r.status_code == 200
+            assert r.headers["content-type"] == expected[ext], f["name"]
+            checked_extensions.add(ext)
+        assert checked_extensions == {".png", ".jpg"}, "test_images fixture should cover both — update this test if it changes"

@@ -263,6 +263,28 @@ def _gen_thumbnail(src: Path, dst: Path, max_size: int = 200):
         print(f"[Warning] Thumbnail failed for {src.name}: {e}")
 
 
+# Starlette's FileResponse falls back to Python's `mimetypes` module when
+# no media_type is given, which on Windows reads from the registry rather
+# than a built-in table — .webp (and sometimes others) frequently isn't
+# registered there, silently serving image/webp files as
+# application/octet-stream instead. Serving these explicitly sidesteps
+# that OS-dependent guesswork entirely. Caught by Windows CI, not visible
+# on Linux where Python's built-in mimetypes table already has .webp.
+_MEDIA_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".bmp": "image/bmp",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+    ".webp": "image/webp",
+}
+
+
+def _media_type_for(path: Path) -> Optional[str]:
+    return _MEDIA_TYPES.get(path.suffix.lower())
+
+
 def _fmt_size(b: int) -> str:
     if b < 1024:
         return f"{b} B"
@@ -712,12 +734,12 @@ async def get_source_file(ws_name: str, file_id: str, state: AppState = Depends(
             if f["id"] == file_id:
                 p = Path(f["path"])
                 if p.exists():
-                    return FileResponse(str(p))
+                    return FileResponse(str(p), media_type=_media_type_for(p))
         for r in state.results:
             if r.get("id") == file_id:
                 p = Path(r["original_path"])
                 if p.exists():
-                    return FileResponse(str(p))
+                    return FileResponse(str(p), media_type=_media_type_for(p))
     return Response(status_code=404)
 
 
@@ -727,7 +749,7 @@ async def get_result(ws_name: str, result_path: str, state: AppState = Depends(g
         p = (state.workspace / "output" / result_path).resolve()
         base = str((state.workspace / "output").resolve())
         if p.exists() and (str(p) == base or str(p).startswith(base + os.sep)):
-            return FileResponse(str(p))
+            return FileResponse(str(p), media_type=_media_type_for(p))
     return Response(status_code=404)
 
 
