@@ -129,16 +129,6 @@ header h1 span { color: var(--accent); }
 .btn-danger { background: var(--red); color: #fff; }
 .btn-danger:hover { opacity: .8; }
 
-.drop-zone {
-  border: 2px dashed var(--border); border-radius: var(--radius);
-  padding: 40px; text-align: center; color: var(--text2); cursor: pointer;
-  transition: all .2s;
-}
-.drop-zone:hover { border-color: var(--accent); background: rgba(79,195,247,.05); }
-.drop-zone-icon { font-size: 36px; margin-bottom: 8px; }
-.drop-zone-text { font-size: 15px; }
-.drop-zone-hint { font-size: 12px; margin-top: 4px; }
-
 /* Config */
 .config-grid { display: flex; gap: 24px; flex-wrap: wrap; }
 .config-group { display: flex; flex-direction: column; gap: 6px; }
@@ -403,6 +393,7 @@ header h1 span { color: var(--accent); }
         <input type="checkbox" id="select-all" checked /> Select all
       </label>
     </div>
+    <div id="files-empty" style="font-size:13px;color:var(--text2);padding:0 0 16px">Images will appear here after you scan a folder or add files</div>
     <div class="file-grid" id="file-grid"></div>
   </div>
 
@@ -488,7 +479,6 @@ function showPersistentNotice(message, type) {
   el.querySelector('.notice-close').addEventListener('click', () => dismissPersistentNotice());
   noticeContainer.appendChild(el);
   persistentNoticeEl = el;
-  setTimeout(dismissPersistentNotice, 5000);
 }
 
 function dismissPersistentNotice() {
@@ -516,6 +506,7 @@ const dirPath = $('dir-path'),
       logBox = $('log-box'),
       resultsSection = $('results-section'),
       resultsEmpty = $('results-empty'),
+      filesEmpty = $('files-empty'),
       resultSummary = $('result-summary'),
       resultGrid = $('result-grid'),
       downloadBtn = $('download-btn'),
@@ -762,11 +753,14 @@ async function uploadFiles(files) {
 function renderFiles() {
   const files = STATE.files;
   if (!files.length) {
-    fileGrid.innerHTML = '<div class="file-list-empty">No images found</div>';
+    fileGrid.innerHTML = '';
+    filesEmpty.textContent = 'No images found';
+    filesEmpty.style.display = '';
     fileStatsText.textContent = '';
     selectAll.checked = true;
     return;
   }
+  filesEmpty.style.display = 'none';
   let html = '';
   for (const f of files) {
     html += `
@@ -1069,6 +1063,8 @@ resetBtn.addEventListener('click', () => {
   STATE.results = [];
   STATE.wsName = '';
   fileGrid.innerHTML = '';
+  filesEmpty.textContent = 'Images will appear here after you scan a folder or add files';
+  filesEmpty.style.display = '';
   resultGrid.innerHTML = '';
   resultSummary.innerHTML = '';
   resultsEmpty.style.display = '';

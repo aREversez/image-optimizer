@@ -173,8 +173,11 @@ RECENT_LIMIT = 8
 
 
 def _config_dir() -> Path:
-    base = os.environ.get("APPDATA") or os.environ.get("XDG_CONFIG_HOME") or str(Path.home())
-    d = Path(base) / "image-optimizer"
+    # A single, predictable location on every OS (like ~/.ssh, ~/.npm,
+    # ~/.docker) rather than following each platform's own convention
+    # (APPDATA on Windows, XDG_CONFIG_HOME on Linux/macOS) — easier to
+    # find and document with one path instead of three.
+    d = Path.home() / ".image-optimizer"
     try:
         d.mkdir(parents=True, exist_ok=True)
     except Exception:
@@ -184,6 +187,71 @@ def _config_dir() -> Path:
 
 def _recent_file() -> Path:
     return _config_dir() / "recent.json"
+
+
+# Defaults for everything a config.json can override. CLI flags (where they
+# exist) take priority over the config file, which takes priority over
+# these. Keep this in sync with README's config.json documentation.
+DEFAULT_CONFIG = {
+    "host": "127.0.0.1",
+    "port": 8090,
+    "concurrent_workers": 4,   # how many images to compress/thumbnail at once
+    "workspace_cleanup_delay": 10.0,  # seconds to wait before deleting a replaced workspace
+    "session_idle_timeout_hours": 4,  # how long an inactive browser session is kept
+}
+
+
+def _config_file() -> Path:
+    return _config_dir() / "config.json"
+
+
+def _load_app_config() -> dict:
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        raw = json.loads(_config_file().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return cfg
+    except Exception as e:
+        print(f"[Warning] Ignoring unreadable config.json ({_config_file()}): {e}")
+        return cfg
+
+    for key, value in raw.items():
+        if key not in cfg:
+            print(f"[Warning] Ignoring unknown config.json key: {key!r}")
+            continue
+        cfg[key] = value
+
+    # Validate rather than trust blindly — a hand-edited config file with a
+    # typo'd value shouldn't crash startup or silently misbehave (e.g. a
+    # negative/zero worker count would make the scan/optimize queues never
+    # drain).
+    try:
+        cfg["port"] = int(cfg["port"])
+        assert 1 <= cfg["port"] <= 65535
+    except Exception:
+        print(f"[Warning] Invalid config.json 'port' ({cfg['port']!r}), using default {DEFAULT_CONFIG['port']}")
+        cfg["port"] = DEFAULT_CONFIG["port"]
+    try:
+        cfg["concurrent_workers"] = int(cfg["concurrent_workers"])
+        assert cfg["concurrent_workers"] >= 1
+    except Exception:
+        print(
+            f"[Warning] Invalid config.json 'concurrent_workers' ({cfg['concurrent_workers']!r}), "
+            f"using default {DEFAULT_CONFIG['concurrent_workers']}"
+        )
+        cfg["concurrent_workers"] = DEFAULT_CONFIG["concurrent_workers"]
+    try:
+        cfg["workspace_cleanup_delay"] = float(cfg["workspace_cleanup_delay"])
+        assert cfg["workspace_cleanup_delay"] >= 0
+    except Exception:
+        cfg["workspace_cleanup_delay"] = DEFAULT_CONFIG["workspace_cleanup_delay"]
+    try:
+        cfg["session_idle_timeout_hours"] = float(cfg["session_idle_timeout_hours"])
+        assert cfg["session_idle_timeout_hours"] > 0
+    except Exception:
+        cfg["session_idle_timeout_hours"] = DEFAULT_CONFIG["session_idle_timeout_hours"]
+
+    return cfg
 
 
 def _load_recent() -> dict:
@@ -216,7 +284,7 @@ def _push_recent(key: str, path: str):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global optimizer
-    optimizer = Optimizer()
+    optimizer = Optimizer(max_concurrency=CONCURRENT_WORKERS)
     tools = []
     if optimizer.pngquant_path:
         tools.append(f"pngquant: {optimizer.pngquant_path}")
@@ -261,6 +329,28 @@ def _gen_thumbnail(src: Path, dst: Path, max_size: int = 200):
         img.save(dst, "JPEG", quality=70)
     except Exception as e:
         print(f"[Warning] Thumbnail failed for {src.name}: {e}")
+
+
+# Starlette's FileResponse falls back to Python's `mimetypes` module when
+# no media_type is given, which on Windows reads from the registry rather
+# than a built-in table — .webp (and sometimes others) frequently isn't
+# registered there, silently serving image/webp files as
+# application/octet-stream instead. Serving these explicitly sidesteps
+# that OS-dependent guesswork entirely. Caught by Windows CI, not visible
+# on Linux where Python's built-in mimetypes table already has .webp.
+_MEDIA_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".bmp": "image/bmp",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+    ".webp": "image/webp",
+}
+
+
+def _media_type_for(path: Path) -> Optional[str]:
+    return _MEDIA_TYPES.get(path.suffix.lower())
 
 
 def _fmt_size(b: int) -> str:
@@ -523,7 +613,7 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
     return JSONResponse({"ok": True, "total": len(files_to_process)})
 
 
-CONCURRENT_WORKERS = 4  # matches Optimizer's internal subprocess semaphore
+CONCURRENT_WORKERS = 4  # default; overridden by main() from config.json / --workers
 
 
 async def _process_files(
@@ -712,12 +802,12 @@ async def get_source_file(ws_name: str, file_id: str, state: AppState = Depends(
             if f["id"] == file_id:
                 p = Path(f["path"])
                 if p.exists():
-                    return FileResponse(str(p))
+                    return FileResponse(str(p), media_type=_media_type_for(p))
         for r in state.results:
             if r.get("id") == file_id:
                 p = Path(r["original_path"])
                 if p.exists():
-                    return FileResponse(str(p))
+                    return FileResponse(str(p), media_type=_media_type_for(p))
     return Response(status_code=404)
 
 
@@ -727,7 +817,7 @@ async def get_result(ws_name: str, result_path: str, state: AppState = Depends(g
         p = (state.workspace / "output" / result_path).resolve()
         base = str((state.workspace / "output").resolve())
         if p.exists() and (str(p) == base or str(p).startswith(base + os.sep)):
-            return FileResponse(str(p))
+            return FileResponse(str(p), media_type=_media_type_for(p))
     return Response(status_code=404)
 
 
@@ -991,16 +1081,33 @@ async def get_state(state: AppState = Depends(get_session)):
 def main():
     import argparse
 
+    config = _load_app_config()
+
     parser = argparse.ArgumentParser(description="Image Optimizer Web UI")
     parser.add_argument(
-        "--host", default="127.0.0.1",
-        help="Listen address (default 127.0.0.1 / localhost-only). WARNING: this app has no "
-             "authentication — binding to 0.0.0.0 or a LAN address exposes local file read "
-             "(scan any directory) and write (output_dir) to anyone on the network.",
+        "--host", default=config["host"],
+        help=f"Listen address (default {config['host']!r} / localhost-only, or set 'host' in "
+             f"{_config_file()}). WARNING: this app has no authentication — binding to 0.0.0.0 "
+             f"or a LAN address exposes local file read (scan any directory) and write "
+             f"(output_dir) to anyone on the network.",
     )
-    parser.add_argument("--port", type=int, default=8090, help="Listen port (default 8090)")
+    parser.add_argument(
+        "--port", type=int, default=config["port"],
+        help=f"Listen port (default {config['port']}, or set 'port' in {_config_file()})",
+    )
+    parser.add_argument(
+        "--workers", type=int, default=config["concurrent_workers"],
+        help=f"How many images to process concurrently (default {config['concurrent_workers']}, "
+             f"or set 'concurrent_workers' in {_config_file()}). Lower this if pngquant/oxipng "
+             f"are already maxing out your CPU; raise it on a many-core machine.",
+    )
     parser.add_argument("--dir", help="Directory to auto-scan on startup")
     args = parser.parse_args()
+
+    global CONCURRENT_WORKERS, WORKSPACE_CLEANUP_DELAY, SESSION_IDLE_TIMEOUT
+    CONCURRENT_WORKERS = max(1, args.workers)
+    WORKSPACE_CLEANUP_DELAY = config["workspace_cleanup_delay"]
+    SESSION_IDLE_TIMEOUT = config["session_idle_timeout_hours"] * 3600
 
     if args.dir:
         d = Path(args.dir).resolve()

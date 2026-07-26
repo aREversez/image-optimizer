@@ -1,0 +1,133 @@
+"""Regression tests for /api/scan and /api/scan-progress."""
+from __future__ import annotations
+
+from PIL import Image
+
+from .conftest import wait_for
+
+
+def scan_and_wait(client, headers, directory, recursive=True):
+    r = client.post("/api/scan", json={"directory": str(directory), "recursive": recursive}, headers=headers)
+    d = wait_for(lambda: (lambda p: not p["running"] and p)(
+        client.get("/api/scan-progress", headers=headers).json()
+    ))
+    return r, d
+
+
+class TestScanReturnsQuickly:
+    """Bug: scanning used to block the HTTP request until every thumbnail
+    was generated, so a large folder made the UI look frozen with zero
+    feedback for the entire scan duration."""
+
+    def test_scan_post_returns_before_thumbnails_finish(self, client, auth_headers, tmp_path):
+        big_dir = tmp_path / "many_images"
+        big_dir.mkdir()
+        for i in range(15):
+            Image.new("RGB", (100, 100), (i, 0, 0)).save(big_dir / f"img{i:03d}.png")
+
+        import time
+        t0 = time.time()
+        r = client.post("/api/scan", json={"directory": str(big_dir), "recursive": False}, headers=auth_headers)
+        elapsed = time.time() - t0
+        assert r.status_code == 200
+        assert elapsed < 1.0, "scan should return almost immediately, not block until done"
+
+        d = wait_for(lambda: (lambda p: not p["running"] and p)(
+            client.get("/api/scan-progress", headers=auth_headers).json()
+        ))
+        assert len(d["files"]) == 15
+
+    def test_progress_reports_intermediate_state(self, client, auth_headers, tmp_path, app_module, monkeypatch):
+        big_dir = tmp_path / "many_images2"
+        big_dir.mkdir()
+        for i in range(20):
+            Image.new("RGB", (150, 150), (i, 50, 100)).save(big_dir / f"img{i:03d}.png")
+
+        # Deterministically slow down thumbnailing so an intermediate
+        # progress state is reliably observable — without this, whether a
+        # poll happens to land mid-scan is a genuine race on a fast
+        # enough machine (see the identical reasoning in
+        # TestScanGuards.test_second_scan_while_first_in_flight_is_rejected).
+        import time as time_module
+        real_gen_thumbnail = app_module._gen_thumbnail
+
+        def slow_gen_thumbnail(src, dst, *a, **kw):
+            time_module.sleep(0.03)
+            return real_gen_thumbnail(src, dst, *a, **kw)
+
+        monkeypatch.setattr(app_module, "_gen_thumbnail", slow_gen_thumbnail)
+
+        client.post("/api/scan", json={"directory": str(big_dir), "recursive": False}, headers=auth_headers)
+        seen_partial = False
+        for _ in range(300):
+            d = client.get("/api/scan-progress", headers=auth_headers).json()
+            if d["total"] > 0 and 0 < d["current"] < d["total"]:
+                seen_partial = True
+            if not d["running"]:
+                break
+        assert seen_partial, "never observed an intermediate progress state — scan may have regressed to blocking"
+        assert d["total"] == 20 and len(d["files"]) == 20
+
+
+class TestScanDeterministicOrder:
+    """Concurrent thumbnail generation must not make file order/IDs
+    non-deterministic — results are pre-allocated by index specifically to
+    guarantee this."""
+
+    def test_files_are_in_sorted_order_despite_concurrency(self, client, auth_headers, tmp_path):
+        d = tmp_path / "ordered"
+        d.mkdir()
+        for i in range(12):
+            Image.new("RGB", (50, 50)).save(d / f"img{i:03d}.png")
+        r, result = scan_and_wait(client, auth_headers, d, recursive=False)
+        names = [f["name"] for f in result["files"]]
+        assert names == sorted(names)
+        assert [f["id"] for f in result["files"]] == [str(i) for i in range(12)]
+
+
+class TestScanTolerance:
+    """A single unreadable/corrupt image must not abort the whole scan —
+    matches the same per-item error isolation used in the optimize
+    worker pool."""
+
+    def test_corrupt_image_does_not_abort_scan(self, client, auth_headers, tmp_path):
+        d = tmp_path / "mixed"
+        d.mkdir()
+        Image.new("RGB", (50, 50)).save(d / "good.png")
+        (d / "corrupt.png").write_bytes(b"not a real png")
+        r, result = scan_and_wait(client, auth_headers, d, recursive=False)
+        assert r.status_code == 200
+        assert len(result["files"]) == 2
+
+
+class TestScanGuards:
+    def test_second_scan_while_first_in_flight_is_rejected(self, client, auth_headers, tmp_path, app_module, monkeypatch):
+        d = tmp_path / "busy"
+        d.mkdir()
+        for i in range(10):
+            Image.new("RGB", (80, 80)).save(d / f"img{i}.png")
+
+        # Deterministically slow down thumbnailing so the first scan is
+        # still in flight when the second request arrives — without this,
+        # whether the first scan happens to finish before the second POST
+        # lands is a genuine race (and on a fast machine with few/tiny
+        # images, it can go either way).
+        import time as time_module
+        real_gen_thumbnail = app_module._gen_thumbnail
+
+        def slow_gen_thumbnail(src, dst, *a, **kw):
+            time_module.sleep(0.05)
+            return real_gen_thumbnail(src, dst, *a, **kw)
+
+        monkeypatch.setattr(app_module, "_gen_thumbnail", slow_gen_thumbnail)
+
+        client.post("/api/scan", json={"directory": str(d), "recursive": False}, headers=auth_headers)
+        r2 = client.post("/api/scan", json={"directory": str(d)}, headers=auth_headers)
+        assert r2.status_code == 400
+        wait_for(lambda: not client.get("/api/scan-progress", headers=auth_headers).json()["running"])
+
+    def test_nonexistent_directory_rejected(self, client, auth_headers, tmp_path):
+        r = client.post(
+            "/api/scan", json={"directory": str(tmp_path / "does_not_exist")}, headers=auth_headers
+        )
+        assert r.status_code == 400

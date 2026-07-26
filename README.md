@@ -52,6 +52,61 @@ The first run will auto-detect `pngquant` and `oxipng` in the `bin/` folder and 
 4. **Start** — click *Start* and watch the live progress log
 5. **Compare & download** — click any result's *Compare* button for before/after preview, then download individual files or the full ZIP
 
+## Configuration
+
+Command-line flags:
+
+```
+python -m app --host 127.0.0.1 --port 8090 --workers 4 --dir "D:\screenshots"
+```
+
+- `--host` — listen address (default `127.0.0.1`, see Security below)
+- `--port` — listen port (default `8090`; if taken, the next free port is used automatically)
+- `--workers` — how many images to process/thumbnail concurrently (default `4`).
+  Lower this if pngquant/oxipng are already maxing out your CPU; raise it on a
+  many-core machine for faster batches.
+- `--dir` — auto-scan this folder on startup
+
+For settings you don't want to type every time, create a `config.json` in
+`~/.image-optimizer/` (that's `%USERPROFILE%\.image-optimizer\config.json`
+on Windows, or `~/.image-optimizer/config.json` on macOS/Linux — the same
+folder on every OS, and the same one `recent.json` already lives in). This
+file isn't created automatically and there's no in-app settings screen yet
+— copy [`config.example.json`](config.example.json) there and edit it, or
+start from scratch with:
+
+```json
+{
+  "host": "127.0.0.1",
+  "port": 8090,
+  "concurrent_workers": 4,
+  "workspace_cleanup_delay": 10.0,
+  "session_idle_timeout_hours": 4
+}
+```
+
+Other flags:
+
+- `workspace_cleanup_delay` — seconds to wait before deleting a workspace after
+  it's replaced by a new scan/upload (default `10.0`). Files aren't deleted
+  immediately so an in-flight request — e.g. a ZIP download or an image still
+  loading in another tab — has time to finish before they disappear out from
+  under it. Raise this if you routinely have slow downloads running when you
+  start a new scan; lower it to free disk space sooner.
+- `session_idle_timeout_hours` — how long a browser session (and its scan
+  results, in-progress state, and temp workspace) is kept after you stop
+  using it before being cleaned up automatically (default `4`). Each browser
+  tab/session is tracked separately so multiple tabs don't interfere with
+  each other; this controls how long an abandoned one hangs around before
+  its temp files are freed. Also sets how long the session cookie itself is
+  valid for.
+
+All keys are optional — only include the ones you want to change from the
+default (an empty `{}` or a missing file both just mean "use every
+default"). Command-line flags always override `config.json`, which
+overrides the built-in defaults. Invalid values (e.g. a negative worker
+count) are ignored with a startup warning rather than crashing.
+
 ## Security
 
 This app has no authentication and is meant to run on `127.0.0.1` only (the
