@@ -191,3 +191,53 @@ class TestWebP:
         assert opt.oxipng_path is None
         result = asyncio.run(opt.optimize_png(src, out, output_format="webp"))
         assert result["success"] is True
+
+
+class TestAvailableModes:
+    """`ready` predates WebP / lossless / resize_only and only described the
+    Standard-mode PNG path — so it returns False on a build that can still
+    produce lossless/resize-only PNG *and* every WebP flavor successfully.
+    `available_modes()` is the new interface that returns the exact set of
+    (format, compression_mode) combinations this instance can actually
+    process, given which binaries it auto-detected."""
+
+    def test_both_binaries_all_modes_available(self, fake_bin_dir, optimizer):
+        # `optimizer` fixture already points pngquant_path/oxipng_path at
+        # the .bat wrappers in fake_bin_dir — auto-detection deliberately
+        # bypassed (see conftest.py: same reason every other test here does
+        # the same, instead of relying on Optimizer's OS-specific path
+        # search).
+        opt = optimizer
+        assert opt.pngquant_path is not None
+        assert opt.oxipng_path is not None
+        modes = opt.available_modes()
+        assert {("png", "standard"), ("png", "lossless"), ("png", "resize_only"),
+                ("webp", "standard"), ("webp", "lossless"), ("webp", "resize_only")} == modes
+
+    def test_no_pngquant_drops_only_standard_png(self, tmp_path):
+        from app.optimizer import Optimizer
+        # No binaries found in bin_dir → both paths None.
+        opt = Optimizer(bin_dir=tmp_path / "nonexistent_bin_dir")
+        assert opt.pngquant_path is None
+        assert opt.oxipng_path is None
+
+        modes = opt.available_modes()
+        # PNG standard — the one mode that actually needs pngquant for its
+        # lossy color quantization step — is dropped.
+        assert ("png", "standard") not in modes
+        # Everything else still works: lossless/resize_only PNG just uses
+        # Pillow's PNG encoder (oxipng only shrinks further), and WebP is
+        # Pillow-encoder-only.
+        assert {("png", "lossless"), ("png", "resize_only"),
+                ("webp", "standard"), ("webp", "lossless"), ("webp", "resize_only")} == modes
+        # `ready` returns False here, even though most of the format×mode
+        # matrix is actually usable — that's exactly what `ready` doesn't
+        # capture, and why available_modes exists.
+        assert opt.ready is False
+
+    def test_ready_true_iff_pngquant_present(self, optimizer):
+        opt = optimizer
+        assert opt.ready is True
+        # Drop pngquant only; oxipng is irrelevant for `ready`.
+        opt.pngquant_path = None
+        assert opt.ready is False
