@@ -145,6 +145,22 @@ def auth_headers(token) -> dict:
     return {"X-App-Token": token}
 
 
+@pytest.fixture(autouse=True)
+def isolate_user_config_dir(monkeypatch, tmp_path_factory):
+    """Every test gets its own fake home directory for
+    app.main._config_dir() (~/.image-optimizer — recent.json and
+    config.json both live there). Without this, running the test suite
+    silently writes real recent.json entries (full of throwaway pytest
+    tmp paths) into the actual developer's home directory on every run,
+    since most tests trigger a scan and _scan_and_thumbnail() always
+    calls _push_recent() at the end. autouse=True so no test has to
+    remember to opt in — forgetting isn't just untidy here, it pollutes
+    a real user directory outside the test sandbox entirely."""
+    from pathlib import Path
+    fake_home = tmp_path_factory.mktemp("home")
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+
 def wait_for(predicate, timeout=10.0, interval=0.02):
     """Poll `predicate()` until it returns a truthy value or timeout."""
     import time

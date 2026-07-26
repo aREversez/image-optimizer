@@ -16,7 +16,7 @@ HEX_COLOR_RE = re.compile(r"^#?[0-9A-Fa-f]{6}$")
 
 
 class Optimizer:
-    def __init__(self, bin_dir: Optional[Path] = None):
+    def __init__(self, bin_dir: Optional[Path] = None, max_concurrency: int = 4):
         if bin_dir:
             self.bin_dir = Path(bin_dir)
         elif getattr(sys, "frozen", False):
@@ -26,7 +26,7 @@ class Optimizer:
         self.pngquant_path: Optional[Path] = None
         self.oxipng_path: Optional[Path] = None
         self._detect_binaries()
-        self._semaphore = asyncio.Semaphore(4)
+        self._semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
     @property
     def ready(self) -> bool:
