@@ -524,6 +524,11 @@ async def index(state: AppState = Depends(get_session)):
 async def health():
     if optimizer is None:
         return JSONResponse({"error": "Optimizer not initialized"}, status_code=503)
+    # Re-detect every health check so that placing pngquant/oxipng in the
+    # bin/ directory (or PATH) after startup is reflected on the next page
+    # refresh — no restart needed. The detection is purely a filesystem
+    # check and trivially cheap; no running subprocess is affected.
+    optimizer._detect_binaries()
     return JSONResponse({
         "pngquant": optimizer.pngquant_path is not None,
         "oxipng": optimizer.oxipng_path is not None,
@@ -1165,6 +1170,18 @@ async def browse_folder(title: str = "Select Folder", _auth: None = Depends(requ
         return JSONResponse({"path": "", "error": "tkinter not available"})
     try:
         def _open():
+            # Without DPI awareness, Windows upscales the native dialog using
+            # bitmap stretching on high-DPI displays — the whole window looks
+            # noticeably blurry. Declare per-monitor awareness before creating
+            # any Tk widgets so the dialog renders at the native resolution.
+            try:
+                import ctypes
+                ctypes.windll.shcore.SetProcessDpiAwareness(1)
+            except Exception:
+                try:
+                    ctypes.windll.user32.SetProcessDPIAware()
+                except Exception:
+                    pass
             root = tk.Tk()
             root.withdraw()
             root.attributes("-topmost", True)
