@@ -66,6 +66,9 @@ python -m app --host 127.0.0.1 --port 8090 --workers 4 --dir "D:\screenshots"
   Lower this if pngquant/oxipng are already maxing out your CPU; raise it on a
   many-core machine for faster batches.
 - `--dir` — auto-scan this folder on startup
+- `--recursive` / `--no-recursive` — when used with `--dir`, whether to
+  scan subfolders too (default `--recursive`, the historical behavior).
+  Pass `--no-recursive` to scan only the top level.
 
 For settings you don't want to type every time, create a `config.json` in
 `~/.image-optimizer/` (that's `%USERPROFILE%\.image-optimizer\config.json`

@@ -72,6 +72,19 @@ class TestOutputDirStructure:
         assert Path("2023/vacation/IMG_0001.png") in files
         assert Path("2024/vacation/IMG_0001.png") in files
 
+    def test_output_saved_log_line_appears_exactly_once(self, client, auth_headers, test_images, tmp_path):
+        """Bug: the summary log line was appended twice at the end of
+        _process_files (two back-to-back identical `if output_dir:`
+        blocks — almost certainly a copy-paste slip), so every run with a
+        custom output_dir showed the same "Output saved to: ..." line
+        duplicated in the live log."""
+        scan_and_wait(client, auth_headers, test_images)
+        out_dir = tmp_path / "log_dedup_output"
+        r, d = optimize_and_wait(client, auth_headers, output_dir=str(out_dir))
+        assert r.status_code == 200
+        matching = [line for line in d["logs"] if "Output saved to" in line]
+        assert len(matching) == 1, f"expected exactly one 'Output saved to' line, got {matching}"
+
     def test_output_appears_incrementally_not_only_at_the_end(self, client, auth_headers, tmp_path, fake_bin_dir):
         """Bug: output_dir was only populated once in a batch copy at the
         very end of the run, so the folder looked empty (and wrong) for

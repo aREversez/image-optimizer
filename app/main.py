@@ -11,7 +11,7 @@ import tempfile
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Awaitable, Callable, List, Optional
 from zipfile import ZipFile
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, Request
@@ -44,13 +44,30 @@ def _find_free_port(host: str, start: int, max_attempts: int = 10) -> int:
 WORKSPACE_CLEANUP_DELAY = 10.0  # seconds
 
 
+async def _async_rmtree(path: Path):
+    """shutil.rmtree off the event loop. Recursive directory delete is a
+    synchronous syscall that scales with the number of files in the tree —
+    a workspace with thousands of thumbnails can take long enough to stall
+    every other async co-routine in the process (progress polls, thumbnail
+    workers, other sessions' scans). Anything the server itself triggers
+    in an async context should go through here rather than calling
+    shutil.rmtree directly.
+
+    The AppState.new_workspace no-event-loop fallback (synchronous path
+    during CLI startup) deliberately does NOT use this — there's no
+    running loop to `to_thread` onto, and nothing else is concurrent to
+    be stalled by it anyway.
+    """
+    await asyncio.to_thread(shutil.rmtree, path, ignore_errors=True)
+
+
 async def _delayed_rmtree(path: Path):
     """Give any in-flight requests reading from `path` a chance to finish
     before actually deleting it. Not a hard guarantee (an unusually slow
     download could still lose a race), but turns a zero-grace-period bug
     into one that needs a multi-second coincidence to hit."""
     await asyncio.sleep(WORKSPACE_CLEANUP_DELAY)
-    shutil.rmtree(path, ignore_errors=True)
+    await _async_rmtree(path)
 
 
 class AppState:
@@ -148,7 +165,12 @@ async def _sweep_stale_sessions():
         for sid in stale:
             st = SESSIONS.pop(sid, None)
             if st and st.workspace:
-                shutil.rmtree(st.workspace, ignore_errors=True)
+                # Each stale workspace gets deleted off the event loop — a
+                # sweep that grabs several oversized sessions in one pass
+                # could otherwise freeze the server for the combined delete
+                # duration, right when a still-active session's progress poll
+                # is exactly the request we'd want not to stall.
+                await _async_rmtree(st.workspace)
 
 
 optimizer: Optional[Optimizer] = None
@@ -224,16 +246,22 @@ def _load_app_config() -> dict:
     # Validate rather than trust blindly — a hand-edited config file with a
     # typo'd value shouldn't crash startup or silently misbehave (e.g. a
     # negative/zero worker count would make the scan/optimize queues never
-    # drain).
+    # drain). Uses an explicit ValueError, NOT `assert`, because `python -O`
+    # strips assertions out entirely — running the app with `-O` would then
+    # silently accept e.g. ..."port": 99999} (out of valid port range) and
+    # bind to a garbage port, or accept a negative cleanup delay, defeating
+    # the whole point of the guard.
     try:
         cfg["port"] = int(cfg["port"])
-        assert 1 <= cfg["port"] <= 65535
+        if not (1 <= cfg["port"] <= 65535):
+            raise ValueError("port out of range 1-65535")
     except Exception:
         print(f"[Warning] Invalid config.json 'port' ({cfg['port']!r}), using default {DEFAULT_CONFIG['port']}")
         cfg["port"] = DEFAULT_CONFIG["port"]
     try:
         cfg["concurrent_workers"] = int(cfg["concurrent_workers"])
-        assert cfg["concurrent_workers"] >= 1
+        if cfg["concurrent_workers"] < 1:
+            raise ValueError("concurrent_workers must be >= 1")
     except Exception:
         print(
             f"[Warning] Invalid config.json 'concurrent_workers' ({cfg['concurrent_workers']!r}), "
@@ -242,12 +270,14 @@ def _load_app_config() -> dict:
         cfg["concurrent_workers"] = DEFAULT_CONFIG["concurrent_workers"]
     try:
         cfg["workspace_cleanup_delay"] = float(cfg["workspace_cleanup_delay"])
-        assert cfg["workspace_cleanup_delay"] >= 0
+        if cfg["workspace_cleanup_delay"] < 0:
+            raise ValueError("workspace_cleanup_delay must be >= 0")
     except Exception:
         cfg["workspace_cleanup_delay"] = DEFAULT_CONFIG["workspace_cleanup_delay"]
     try:
         cfg["session_idle_timeout_hours"] = float(cfg["session_idle_timeout_hours"])
-        assert cfg["session_idle_timeout_hours"] > 0
+        if cfg["session_idle_timeout_hours"] <= 0:
+            raise ValueError("session_idle_timeout_hours must be > 0")
     except Exception:
         cfg["session_idle_timeout_hours"] = DEFAULT_CONFIG["session_idle_timeout_hours"]
 
@@ -300,7 +330,7 @@ async def lifespan(app: FastAPI):
     for st in SESSIONS.values():
         if st.workspace:
             try:
-                shutil.rmtree(st.workspace, ignore_errors=True)
+                await _async_rmtree(st.workspace)
             except Exception:
                 pass
 
@@ -361,6 +391,100 @@ def _fmt_size(b: int) -> str:
     return f"{b / (1024 * 1024):.2f} MB"
 
 
+async def _run_worker_pool(
+    items: list,
+    process_item: Callable[[Any], Awaitable[None]],
+    *,
+    n_workers: Optional[int] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    on_item_error: Optional[Callable[[Any, Exception], None]] = None,
+    on_item_done: Optional[Callable[[Any], None]] = None,
+):
+    """Shared queue + worker pool used by both the scan flow
+    (`_scan_and_thumbnail`) and the compression flow (`_process_files`).
+
+    What's shared here is exactly the part that was duplicated:
+      - pre-fill an asyncio.Queue with the work items
+      - spin up N workers, each draining the queue with get_nowait()
+      - await asyncio.gather() on the pool
+      - call `on_item_done(item)` once per processed item (success or
+        per-item exception) so a progress counter is bumped exactly once
+        — both scan and optimize had the same `finally: state.X += 1`
+        line before, so promoting it here. Cancelled-but-not-started
+        items do NOT call it (see the cancel note below).
+      - make sure an unhandled exception raised by `process_item` degrades
+        to `on_item_error(item, e)` and never propagates out of the worker
+        (an uncaught exception makes gather() return immediately while the
+        other workers keep running orphaned — see CHANGELOG "[Unreleased]"
+        and test_concurrency.test_one_file_raising_does_not_orphan_the_others
+        for the bug this guard prevents).
+
+    What is NOT shared, on purpose:
+      - how a result is stored: scan assigns into a preallocated list by
+        index (deterministic sorted order, regression-tested by
+        test_files_are_in_sorted_order_despite_concurrency); optimize
+        appends to state.results. Each side keeps its own storage logic
+        inside its `process_item` closure.
+      - cancel behavior: optimize drains the queue without starting new
+        work once cancelled; scan has no cancel path. Kept in `cancel_check`
+        so it's only checked when the caller opts in. A cancelled item is
+        drained without calling `on_item_done` — that matches the old
+        optimize behavior, where cancelled-but-not-started files did NOT
+        bump the progress counter, so `state.current < state.total`
+        after a cancel is the signal that the run was partial (see
+        test_cancel_stops_new_work_but_finishes_in_flight).
+
+    `n_workers` reads the module global `CONCURRENT_WORKERS` lazily at call
+    time rather than as a default argument: `main()` rebinds that global
+    from config.json/`--workers` after the module body has finished running,
+    so capturing it as a default would freeze it at the startup default of 4
+    and ignore the configured value.
+    """
+    if n_workers is None:
+        n_workers = CONCURRENT_WORKERS
+
+    queue: asyncio.Queue = asyncio.Queue()
+    for item in items:
+        queue.put_nowait(item)
+
+    async def worker():
+        while True:
+            try:
+                item = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            cancelled = cancel_check and cancel_check()
+            try:
+                if cancelled:
+                    # Drain without processing, rather than stopping this one
+                    # worker while others keep pulling — matches the old
+                    # behavior of "never start a new file after Cancel, but
+                    # let everything already in flight finish naturally".
+                    #
+                    # NOTE: a cancelled item intentionally does NOT call
+                    # on_item_done() below — the original optimize flow
+                    # didn't bump the progress counter for cancelled items
+                    # (only files that actually started processing counted
+                    # toward state.current), and that distinction is how
+                    # /api/progress reports "current < total" after a
+                    # cancel. Bumping the counter here would erase that
+                    # signal. See test_cancel_stops_new_work_but_finishes_in_flight.
+                    continue
+                await process_item(item)
+            except Exception as e:
+                # Any exception process_item doesn't already catch must be
+                # caught here, per-item — see the comment block above.
+                if on_item_error is not None:
+                    on_item_error(item, e)
+            finally:
+                if on_item_done is not None and not cancelled:
+                    on_item_done(item)
+                queue.task_done()
+
+    workers = [asyncio.create_task(worker()) for _ in range(max(1, n_workers))]
+    await asyncio.gather(*workers)
+
+
 def _scan_images(directory: Path, recursive: bool = True) -> list:
     patterns = ["*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tiff", "*.tif",
                 "*.PNG", "*.JPG", "*.JPEG", "*.BMP", "*.TIFF", "*.TIF"]
@@ -400,6 +524,11 @@ async def index(state: AppState = Depends(get_session)):
 async def health():
     if optimizer is None:
         return JSONResponse({"error": "Optimizer not initialized"}, status_code=503)
+    # Re-detect every health check so that placing pngquant/oxipng in the
+    # bin/ directory (or PATH) after startup is reflected on the next page
+    # refresh — no restart needed. The detection is purely a filesystem
+    # check and trivially cheap; no running subprocess is affected.
+    optimizer._detect_binaries()
     return JSONResponse({
         "pngquant": optimizer.pngquant_path is not None,
         "oxipng": optimizer.oxipng_path is not None,
@@ -411,9 +540,14 @@ async def health():
 async def _scan_and_thumbnail(state: AppState, directory: Path, recursive: bool):
     ws = state.workspace
     try:
-        images = await asyncio.get_event_loop().run_in_executor(
-            None, _scan_images, directory, recursive
-        )
+        # `asyncio.get_event_loop()` inside a coroutine is the deprecated way
+        # of grabbing the loop — on Python 3.10+ `get_running_loop()` is
+        # the explicit counterpart, and is always safe here because we're in
+        # an async context. (See also upload_files/browse_folder below,
+        # where `asyncio.to_thread()` is the natural fit instead of going
+        # through an explicit loop reference.)
+        loop = asyncio.get_running_loop()
+        images = await loop.run_in_executor(None, _scan_images, directory, recursive)
     except Exception as e:
         state.scan_error = str(e)
         state.scan_running = False
@@ -424,48 +558,43 @@ async def _scan_and_thumbnail(state: AppState, directory: Path, recursive: bool)
     # stable, deterministic order (matching the sorted scan order) even
     # though workers finish in whatever order thumbnailing completes.
 
-    queue: asyncio.Queue = asyncio.Queue()
-    for idx, img_path in enumerate(images):
-        queue.put_nowait((idx, img_path))
+    async def process_item(item):
+        idx, img_path = item
+        rel = str(img_path.relative_to(directory))
+        thumb_rel = f"thumb/{idx}_{img_path.stem}.jpg"
+        thumb_path = ws / thumb_rel
+        if not thumb_path.exists():
+            await asyncio.to_thread(_gen_thumbnail, img_path, thumb_path)
+        files[idx] = {
+            "id": str(idx),
+            "name": rel,
+            "path": str(img_path),
+            "size": img_path.stat().st_size,
+            "thumbnail": f"/api/thumb/{ws.name}/{thumb_rel}",
+        }
 
-    loop = asyncio.get_event_loop()
+    def on_item_error(item, e):
+        # One unreadable/corrupt file shouldn't stop the rest of the scan —
+        # same reasoning as the optimize worker pool.
+        idx, img_path = item
+        files[idx] = {
+            "id": str(idx),
+            "name": str(img_path),
+            "path": str(img_path),
+            "size": 0,
+            "thumbnail": "",
+            "error": str(e),
+        }
 
-    async def worker():
-        while True:
-            try:
-                idx, img_path = queue.get_nowait()
-            except asyncio.QueueEmpty:
-                return
-            try:
-                rel = str(img_path.relative_to(directory))
-                thumb_rel = f"thumb/{idx}_{img_path.stem}.jpg"
-                thumb_path = ws / thumb_rel
-                if not thumb_path.exists():
-                    await loop.run_in_executor(None, _gen_thumbnail, img_path, thumb_path)
-                files[idx] = {
-                    "id": str(idx),
-                    "name": rel,
-                    "path": str(img_path),
-                    "size": img_path.stat().st_size,
-                    "thumbnail": f"/api/thumb/{ws.name}/{thumb_rel}",
-                }
-            except Exception as e:
-                # One unreadable/corrupt file shouldn't stop the rest of
-                # the scan — same reasoning as the optimize worker pool.
-                files[idx] = {
-                    "id": str(idx),
-                    "name": str(img_path),
-                    "path": str(img_path),
-                    "size": 0,
-                    "thumbnail": "",
-                    "error": str(e),
-                }
-            finally:
-                state.scan_current += 1
-                queue.task_done()
+    def on_item_done(_item):
+        state.scan_current += 1
 
-    workers = [asyncio.create_task(worker()) for _ in range(CONCURRENT_WORKERS)]
-    await asyncio.gather(*workers)
+    await _run_worker_pool(
+        [(idx, img_path) for idx, img_path in enumerate(images)],
+        process_item,
+        on_item_error=on_item_error,
+        on_item_done=on_item_done,
+    )
 
     state.files = [f for f in files if f is not None]
     state.total = len(state.files)
@@ -509,6 +638,15 @@ async def get_scan_progress(state: AppState = Depends(get_session)):
 async def upload_files(files: List[UploadFile] = File(...), state: AppState = Depends(get_session), _auth: None = Depends(require_token)):
     if state.is_running:
         return JSONResponse({"error": "Optimization in progress, please wait"}, status_code=400)
+    # Mirror the /api/scan guard: scanning runs in a fire-and-forget
+    # background task writing thumbnails into state.workspace. Replacing
+    # the workspace now would queue a _delayed_rmtree on it while those
+    # workers are still writing — picture a worker finishing its
+    # thumbnail write to a path in a directory the OS is about to nuke,
+    # or a mid-scan tab being silently replaced because the user dropped
+    # new files in another. Reject and let the in-flight scan finish.
+    if state.scan_running:
+        return JSONResponse({"error": "A scan is already in progress, please wait"}, status_code=400)
     state.reset()
     ws = state.new_workspace()
     upload_dir = ws / "uploads"
@@ -526,8 +664,7 @@ async def upload_files(files: List[UploadFile] = File(...), state: AppState = De
 
         thumb_rel = f"thumb/upload_{idx}_{name}.jpg"
         thumb_path = ws / thumb_rel
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _gen_thumbnail, file_path, thumb_path)
+        await asyncio.to_thread(_gen_thumbnail, file_path, thumb_path)
 
         result_files.append({
             "id": str(idx),
@@ -635,15 +772,15 @@ async def _process_files(
     ws = state.workspace
     opt_output_dir = ws / "output"
     if opt_output_dir.exists():
-        shutil.rmtree(opt_output_dir, ignore_errors=True)
+        # Off the event loop: a leftover output dir from a previous run could
+        # hold thousands of files; deleting them synchronously here would
+        # block the worker spawn below (and any other concurrent async work
+        # in this process) for the duration of the unlink.
+        await _async_rmtree(opt_output_dir)
     opt_output_dir.mkdir(parents=True, exist_ok=True)
 
     async def log(msg):
         state.logs.append(f"  {msg}")
-
-    queue: asyncio.Queue = asyncio.Queue()
-    for file_info in files:
-        queue.put_nowait(file_info)
 
     async def process_one(file_info: dict):
         input_path = Path(file_info["path"])
@@ -702,57 +839,40 @@ async def _process_files(
         else:
             state.logs.append(f"  FAILED {file_info['name']}: {result.get('error', 'unknown')}")
 
-        # No lock needed: asyncio is single-threaded/cooperative and there's
-        # no `await` between these two statements, so no other worker can
-        # interleave in between.
+        # The progress bump moved to _run_worker_pool's on_item_done — see
+        # the No-lock-note there (same single-threaded-cooperative reasoning
+        # applies: state.results.append + on_item_done's state.current += 1
+        # have no `await` between them, so no other worker interleaves).
         state.results.append(result)
+
+    def on_item_error(file_info, e):
+        # Anything process_one doesn't already catch internally (optimize_png
+        # has its own try/except, but e.g. mkdir permission errors or a
+        # malformed file_info wouldn't be) lands here. Degrading to a
+        # normal failed-file result keeps one bad file from taking down the
+        # whole batch — see test_concurrency.test_one_file_raising_does_not_orphan_the_others.
+        state.logs.append(f"  FAILED {file_info.get('name', '?')}: {e}")
+        state.results.append({
+            "id": file_info.get("id"),
+            "name": file_info.get("name"),
+            "original_path": file_info.get("path"),
+            "success": False,
+            "error": str(e),
+            "original_size": 0,
+            "compressed_size": 0,
+        })
+
+    def on_item_done(_file_info):
         state.current += 1
 
-    async def worker():
-        while True:
-            try:
-                file_info = queue.get_nowait()
-            except asyncio.QueueEmpty:
-                return
-            try:
-                if state.cancelled:
-                    # Drain the queue without processing once cancelled,
-                    # rather than stopping this one worker while others
-                    # keep pulling — matches the old behavior of not
-                    # starting new files after Cancel, while files already
-                    # in flight are left to finish naturally.
-                    continue
-                try:
-                    await process_one(file_info)
-                except Exception as e:
-                    # Anything process_one doesn't already catch internally
-                    # (optimize_png has its own try/except, but e.g. mkdir
-                    # permission errors or a malformed file_info wouldn't be)
-                    # must be caught HERE, per-file, rather than left to
-                    # propagate out of the worker. An uncaught exception
-                    # would make asyncio.gather() below return immediately
-                    # without waiting for the other 3 workers — they'd keep
-                    # running as orphaned background tasks whose results
-                    # never get recorded, while the batch already reports
-                    # itself done. Degrading to a normal failed-file result
-                    # keeps one bad file from taking down the whole batch.
-                    state.logs.append(f"  FAILED {file_info.get('name', '?')}: {e}")
-                    state.results.append({
-                        "id": file_info.get("id"),
-                        "name": file_info.get("name"),
-                        "original_path": file_info.get("path"),
-                        "success": False,
-                        "error": str(e),
-                        "original_size": 0,
-                        "compressed_size": 0,
-                    })
-                    state.current += 1
-            finally:
-                queue.task_done()
-
     try:
-        workers = [asyncio.create_task(worker()) for _ in range(CONCURRENT_WORKERS)]
-        await asyncio.gather(*workers)
+        await _run_worker_pool(
+            files,
+            process_one,
+            cancel_check=lambda: state.cancelled,
+            on_item_error=on_item_error,
+            on_item_done=on_item_done,
+        )
         if state.cancelled:
             state.logs.append("Cancelled by user")
 
@@ -771,9 +891,6 @@ async def _process_files(
             f"\nDone! {state.current}/{state.total} files, "
             f"saved {_fmt_size(saved)} ({pct}%)"
         )
-        if output_dir:
-            state.logs.append(f"  Output saved to: {Path(output_dir).resolve()}")
-
         if output_dir:
             state.logs.append(f"  Output saved to: {Path(output_dir).resolve()}")
 
@@ -998,11 +1115,21 @@ async def download_zip(ws_name: str, state: AppState = Depends(get_session)):
         return JSONResponse({"error": "No files to download"}, status_code=404)
 
     zip_path = state.workspace / "optimized.zip"
-    with ZipFile(zip_path, "w") as zf:
-        for f in output_dir.rglob("*"):
-            if f.is_file():
-                arcname = str(f.relative_to(output_dir))
-                zf.write(f, arcname)
+
+    def _build_zip():
+        # ZipFile + glob + write are all synchronous blocking I/O — running
+        # them inline in an async endpoint would freeze the whole event
+        # loop for the duration of the archive build (progress polls for
+        # this same session, plus every other session's image thumbnails
+        # and concurrent scans, all stall out). Hand the synchronous work
+        # to a thread executor and await the result.
+        with ZipFile(zip_path, "w") as zf:
+            for f in output_dir.rglob("*"):
+                if f.is_file():
+                    arcname = str(f.relative_to(output_dir))
+                    zf.write(f, arcname)
+
+    await asyncio.to_thread(_build_zip)
 
     return FileResponse(
         str(zip_path),
@@ -1043,6 +1170,18 @@ async def browse_folder(title: str = "Select Folder", _auth: None = Depends(requ
         return JSONResponse({"path": "", "error": "tkinter not available"})
     try:
         def _open():
+            # Without DPI awareness, Windows upscales the native dialog using
+            # bitmap stretching on high-DPI displays — the whole window looks
+            # noticeably blurry. Declare per-monitor awareness before creating
+            # any Tk widgets so the dialog renders at the native resolution.
+            try:
+                import ctypes
+                ctypes.windll.shcore.SetProcessDpiAwareness(1)
+            except Exception:
+                try:
+                    ctypes.windll.user32.SetProcessDPIAware()
+                except Exception:
+                    pass
             root = tk.Tk()
             root.withdraw()
             root.attributes("-topmost", True)
@@ -1059,8 +1198,7 @@ async def browse_folder(title: str = "Select Folder", _auth: None = Depends(requ
             path = filedialog.askdirectory(title=title)
             root.destroy()
             return path
-        loop = asyncio.get_event_loop()
-        path = await loop.run_in_executor(None, _open)
+        path = await asyncio.to_thread(_open)
         return JSONResponse({"path": path or ""})
     except Exception as e:
         return JSONResponse({"path": "", "error": str(e)})
@@ -1091,8 +1229,23 @@ def main():
              f"or a LAN address exposes local file read (scan any directory) and write "
              f"(output_dir) to anyone on the network.",
     )
+    def _port_int(raw: str) -> int:
+        # argparse `type` callback: rejects non-integer or out-of-range
+        # BEFORE main() even runs, so `--port notanumber` / `--port 0` /
+        # `--port 99999` exit with the standard argparse usage error rather
+        # than getting handed to the socket layer (where `--port 0` would
+        # bind to an arbitrary OS-assigned port without any user-facing
+        # signal, and out-of-range ints would just be silently truncated).
+        try:
+            v = int(raw)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"expected an integer, got {raw!r}")
+        if not (1 <= v <= 65535):
+            raise argparse.ArgumentTypeError(f"port must be in 1..65535, got {v}")
+        return v
+
     parser.add_argument(
-        "--port", type=int, default=config["port"],
+        "--port", type=_port_int, default=config["port"],
         help=f"Listen port (default {config['port']}, or set 'port' in {_config_file()})",
     )
     parser.add_argument(
@@ -1102,6 +1255,18 @@ def main():
              f"are already maxing out your CPU; raise it on a many-core machine.",
     )
     parser.add_argument("--dir", help="Directory to auto-scan on startup")
+    # Defaults to True to match the historical CLI behavior — the UI checkbox
+    # defaults to False, but `--dir` has always scanned recursively since the
+    # feature shipped. --no-recursive lets an operator override that (e.g. a
+    # folder with thousands of files nested under deep subfolder trees where
+    # only the top-level files are wanted) without breaking existing
+    # invocations that never passed this flag at all.
+    parser.add_argument(
+        "--recursive", action=argparse.BooleanOptionalAction, default=True,
+        help="When used with --dir, scan subfolders too (default True, the "
+             "historical behavior; pass --no-recursive to scan only the top "
+             "level).",
+    )
     args = parser.parse_args()
 
     global CONCURRENT_WORKERS, WORKSPACE_CLEANUP_DELAY, SESSION_IDLE_TIMEOUT
@@ -1116,7 +1281,7 @@ def main():
             prescan = AppState()
             prescan.input_dir = str(d)
             ws = prescan.new_workspace()
-            images = _scan_images(d)
+            images = _scan_images(d, recursive=args.recursive)
             for idx, img_path in enumerate(images):
                 rel = str(img_path.relative_to(d))
                 thumb_rel = f"thumb/{idx}_{img_path.stem}.jpg"

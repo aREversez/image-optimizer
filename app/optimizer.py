@@ -30,7 +30,45 @@ class Optimizer:
 
     @property
     def ready(self) -> bool:
+        """True iff the lossy PNG path (Standard compression mode) is usable,
+        i.e. pngquant is available. Kept for backwards compatibility — it
+        only answers "can this build do the most aggressive Standard-mode
+        PNG pipeline?", nothing else. Callers wanting the modern answer
+        ("which format×mode combinations actually work right now?") should
+        use `available_modes()` instead.
+
+        Note in particular: `ready` says nothing about lossless / resize_only
+        PNG compression (those only need oxipng or even just Pillow), nor
+        about WebP (which needs no external binary at all — Pillow's built-in
+        encoder is always available). A build with neither pngquant nor
+        oxipng installed can still optimize WebP files successfully while
+        reporting `ready == False`.
+        """
         return self.pngquant_path is not None
+
+    def available_modes(self) -> set[tuple[str, str]]:
+        """Returns the set of (output_format, compression_mode) tuples this
+        Optimizer instance can actually produce output for right now, given
+        which external binaries were auto-detected.
+
+        - WebP (any compression_mode) always works — Pillow's built-in
+          WebP encoder is the only thing needed.
+        - PNG lossless / resize_only need oxipng OR Pillow's PNG encoder
+          (oxipng just shrinks further; both modes still produce a valid
+          PNG without it, only bigger), so they're always available too.
+        - PNG standard needs pngquant specifically — oxipng only optimizes,
+          it doesn't do the lossy color quantization that's the whole
+          point of Standard mode.
+
+        This is the API new code should call instead of `ready` when deciding
+        whether to enable a particular (format, mode) option in the UI or
+        accept it on the server side.
+        """
+        if self.pngquant_path is not None:
+            return {("png", "standard"), ("png", "lossless"), ("png", "resize_only"),
+                    ("webp", "standard"), ("webp", "lossless"), ("webp", "resize_only")}
+        return {("png", "lossless"), ("png", "resize_only"),
+                ("webp", "standard"), ("webp", "lossless"), ("webp", "resize_only")}
 
     def _find_binary(self, name: str) -> Optional[Path]:
         try:
@@ -135,7 +173,7 @@ class Optimizer:
 
         try:
             working_path = input_path
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
 
             # Step 0: guarantee we're working with a real PNG from here on, regardless
             # of the source format and regardless of whether a resize happens next.
@@ -278,7 +316,7 @@ class Optimizer:
             "warning": None,
         }
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
 
             def _encode():
                 img = Image.open(input_path)

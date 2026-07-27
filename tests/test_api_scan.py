@@ -126,6 +126,44 @@ class TestScanGuards:
         assert r2.status_code == 400
         wait_for(lambda: not client.get("/api/scan-progress", headers=auth_headers).json()["running"])
 
+    def test_upload_while_scan_in_flight_is_rejected(self, client, auth_headers, tmp_path, app_module, monkeypatch):
+        """Bug: /api/upload only guarded against `is_running` (optimize in
+        progress), not `scan_running`. A scan-via-fire-and-forget task was
+        still writing thumbnails into state.workspace, but a simultaneous
+        upload silently reset() the state and swapped in a fresh workspace
+        — the old one queued for delayed deletion. A worker could then
+        finish writing into a directory the OS was about to nuke, plus the
+        in-flight scan's results would land in the new session's view
+        half-applied. Same fix as the second-scan guard above: reject."""
+        d = tmp_path / "scanning"
+        d.mkdir()
+        for i in range(8):
+            Image.new("RGB", (60, 60)).save(d / f"img{i}.png")
+
+        import time as time_module
+        real_gen_thumbnail = app_module._gen_thumbnail
+
+        def slow_gen_thumbnail(src, dst, *a, **kw):
+            time_module.sleep(0.05)
+            return real_gen_thumbnail(src, dst, *a, **kw)
+
+        monkeypatch.setattr(app_module, "_gen_thumbnail", slow_gen_thumbnail)
+
+        client.post("/api/scan", json={"directory": str(d), "recursive": False}, headers=auth_headers)
+        # Try to drop new files in mid-scan: a tiny in-memory PNG.
+        from io import BytesIO
+        buf = BytesIO()
+        Image.new("RGB", (16, 16)).save(buf, format="PNG")
+        buf.seek(0)
+        r = client.post(
+            "/api/upload",
+            files={"files": ("drop.png", buf, "image/png")},
+            headers=auth_headers,
+        )
+        assert r.status_code == 400
+        assert "scan" in r.json()["error"].lower(), r.json()["error"]
+        wait_for(lambda: not client.get("/api/scan-progress", headers=auth_headers).json()["running"])
+
     def test_nonexistent_directory_rejected(self, client, auth_headers, tmp_path):
         r = client.post(
             "/api/scan", json={"directory": str(tmp_path / "does_not_exist")}, headers=auth_headers
