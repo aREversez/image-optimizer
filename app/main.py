@@ -889,9 +889,6 @@ async def _process_files(
         if output_dir:
             state.logs.append(f"  Output saved to: {Path(output_dir).resolve()}")
 
-        if output_dir:
-            state.logs.append(f"  Output saved to: {Path(output_dir).resolve()}")
-
 
 @app.get("/api/progress")
 async def get_progress(state: AppState = Depends(get_session)):
