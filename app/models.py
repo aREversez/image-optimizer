@@ -32,6 +32,9 @@ class OptimizeRequest(BaseModel):
 
 
 class FileInfo(BaseModel):
+    """Shape of one entry in AppState.files / the /api/scan|upload payloads.
+    Documentation-only — those dicts are built by hand for flexibility, but
+    this model is the reference for what consumers can rely on."""
     id: str
     name: str
     path: str
@@ -40,9 +43,14 @@ class FileInfo(BaseModel):
 
 
 class ResultInfo(BaseModel):
+    """Shape of one entry in AppState.results / the /api/progress payload.
+    Documentation-only, same reasoning as FileInfo."""
     id: str
     name: str
     original_path: str
+    # Output path relative to the workspace output dir — may differ from
+    # name+suffix when a filename collision was disambiguated.
+    output_name: Optional[str] = None
     original_size: int
     compressed_size: int
     savings: int
@@ -50,7 +58,6 @@ class ResultInfo(BaseModel):
     success: bool
     error: Optional[str] = None
     warning: Optional[str] = None
-    result_url: Optional[str] = None
 
 
 class RecentRemoveRequest(BaseModel):
