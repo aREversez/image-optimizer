@@ -2,9 +2,59 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [1.0.2] - 2026-07-28
+
+### Security
+- `/api/preview` now enforces the same workspace-ownership check as every
+  other workspace-scoped endpoint and HTML-escapes the URLs it embeds.
+  Previously an arbitrary `ws_name` path segment was reflected unescaped
+  into the page — a crafted URL could execute script in the app's origin
+  and harvest `APP_TOKEN`, defeating the CSRF defense.
+- `/api/upload` reported the raw client-supplied filename as the file's
+  `name`; `_process_files` joins that name onto the output directory, so a
+  `../`-carrying filename (from a non-browser client) could write optimized
+  output outside the workspace. The name is now reduced to a sanitized
+  basename, and `_process_files` additionally refuses any output path that
+  resolves outside the output directory (defense in depth).
+- Frontend now HTML-escapes log lines and per-file error messages before
+  rendering (both embed file names, which may legally contain `<`/`>` on
+  non-Windows filesystems).
 
 ### Fixed
+- Output filename collision: `photo.png` and `photo.jpg` both mapped to
+  `photo.png` after the output-format suffix swap and silently overwrote
+  each other mid-batch (both reported as successes). Output paths are now
+  pre-assigned per batch with deterministic disambiguation (`photo_2.png`),
+  case-folded to match Windows/macOS filesystem semantics; results carry
+  the actual `output_name`, which `/api/preview` uses instead of
+  re-deriving the path. This also removes the concurrent temp-file
+  collisions (`photo.resized.png` etc.) that followed from shared stems.
+- Optimizer temp files (`*.src.png`, `*.pngquant.png`, ...) are now swept
+  in a `finally` block — an exception mid-pipeline used to leave them in
+  `ws/output/`, where `/api/download` would zip them into the user's
+  archive.
+- `/api/health` no longer blocks the event loop: binary re-detection shells
+  out to `where`/`which`, which now runs via `asyncio.to_thread` (and with
+  a 5 s subprocess timeout so a hung PATH entry can't wedge health checks).
+- `checkHealth()` no longer unconditionally disables the Start button —
+  button state is owned solely by `updateStartButtonState()`.
+- Thumbnails of transparent images (RGBA/LA/PA/P) are composited onto a
+  white background instead of going black (`convert("RGB")` drops alpha);
+  LA-mode images previously failed the JPEG save outright and got no
+  thumbnail at all. Pillow images are opened via context managers so file
+  handles are released promptly on error paths (Windows file locking).
+- EXIF orientation is baked in when converting non-PNG sources and when
+  encoding WebP — portrait phone photos no longer come out sideways.
+- `_scan_images` missed `.webp` entirely and mixed-case extensions
+  (`photo.Png`) on case-sensitive filesystems; it now does a single
+  directory walk with a case-folded suffix check.
+- Invalid `quality` values are rejected with a 400 like the other enum
+  fields instead of silently falling back to "medium".
+- `_find_free_port` sets `SO_REUSEADDR` on non-Windows so a lingering
+  TIME_WAIT socket from a previous run doesn't skip a perfectly usable
+  port.
+- Corrected the session-isolation comment: the cookie is browser-wide, not
+  per-tab — two tabs share one session and rely on the 400 guards.
 - Concurrent file processing: an unhandled exception from a single file
   (e.g. a permission error writing output) could make `asyncio.gather()`
   return early while the other in-flight workers kept running orphaned in
@@ -23,6 +73,19 @@ All notable changes to this project will be documented in this file.
   already removed from the actual UI in an earlier change.
 
 ### Added
+- Page refresh now restores the session's files/results from `/api/state`
+  (previously unused) and re-attaches to a still-running batch instead of
+  coming back blank.
+- `POST /api/reset`: the Reset button also clears server-side session
+  state (files, results, workspace) — previously it only wiped the page,
+  so the server kept everything alive until the idle sweep.
+- `/api/optimize` returns a `warning` field (surfaced as a toast) when the
+  requested format×mode combination is degraded — e.g. Standard-mode PNG
+  without pngquant silently fell back to lossless-only compression with no
+  user-visible signal. `Optimizer.available_modes()` is now actually used.
+- Uploads stream to disk in 1 MiB chunks instead of buffering whole files
+  in memory; the file picker now also accepts TIFF and WebP, matching what
+  the scanner and optimizer support.
 - Scan progress bar: scanning a large folder now shows live progress
   (`GET /api/scan-progress`) instead of the UI appearing frozen until
   every thumbnail finishes. Thumbnail generation also now runs on the

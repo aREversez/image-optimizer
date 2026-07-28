@@ -294,7 +294,7 @@ header h1 span { color: var(--accent); }
         <input type="checkbox" id="recursive-scan" /> Include subfolders
       </label>
     </div>
-    <input type="file" id="file-input" accept="image/png,image/jpeg,image/bmp" multiple style="display:none" />
+    <input type="file" id="file-input" accept="image/png,image/jpeg,image/bmp,image/tiff,image/webp" multiple style="display:none" />
   </div>
 
   <!-- Output Path -->
@@ -540,7 +540,9 @@ async function checkHealth() {
     const allOk = d.pngquant && d.oxipng;
     healthStatus.innerHTML =
       `<span class="status-dot ${allOk ? 'ok' : 'warn'}"></span>${tools.join(' ')}`;
-    startBtn.disabled = true;
+    // NOTE: deliberately no startBtn touching here — missing binaries only
+    // degrade compression (see available_modes server-side), they don't
+    // make Start invalid. updateStartButtonState() owns that button.
     return allOk;
   } catch(e) {
     healthStatus.innerHTML = '<span class="status-dot err"></span>Connection failed';
@@ -897,6 +899,7 @@ startBtn.addEventListener('click', async () => {
       updateStartButtonState();
       return;
     }
+    if (d.warning) showNotice(d.warning, 'info');
 
     // Poll progress
     STATE.pollTimer = setInterval(pollProgress, 400);
@@ -923,18 +926,15 @@ async function pollProgress() {
 
     // Update logs
     if (d.logs && d.logs.length) {
-      const logs = d.logs;
-      const lastLog = logs[logs.length - 1] || '';
-      let cls = 'log-entry';
-      if (lastLog.indexOf('OK ') !== -1 || lastLog.indexOf('✓') !== -1) cls += ' ok';
-      else if (lastLog.indexOf('FAILED') !== -1 || lastLog.indexOf('✗') !== -1) cls += ' err';
-      else if (lastLog.startsWith('  ')) cls += ' info';
-      logBox.innerHTML = logs.map((l, i) => {
+      // escHtml on every line: log lines embed file names, and a name like
+      // "<img src=x onerror=...>.png" (legal on Linux) must render as text,
+      // not execute.
+      logBox.innerHTML = d.logs.map(l => {
         let c = 'log-entry';
         if (l.indexOf('OK ') !== -1 || l.indexOf('✓') !== -1) c += ' ok';
         else if (l.indexOf('FAILED') !== -1 || l.indexOf('✗') !== -1) c += ' err';
         else if (l.startsWith('  ')) c += ' info';
-        return `<div class="${c}">${l}</div>`;
+        return `<div class="${c}">${escHtml(l)}</div>`;
       }).join('');
       logBox.scrollTop = logBox.scrollHeight;
     }
@@ -1005,19 +1005,12 @@ function showResults() {
     if (!r.success) {
       html += `
         <div class="result-card" style="opacity:.5">
-          <div class="rname">✗ ${r.name.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>
-          <div class="rstats">${r.error || 'Failed'}</div>
+          <div class="rname" title="${escHtml(r.name || '')}">✗ ${escHtml(r.name || '')}</div>
+          <div class="rstats">${escHtml(r.error || 'Failed')}</div>
         </div>`;
       continue;
     }
-    // Build preview URL
-    let previewUrl = '#';
-    const wsName = STATE.wsName;
-    previewUrl = `/api/preview/${wsName}/${r.id}`;
-
-    // Get relative path for result URL
-    const origPath = r.original_path || '';
-    const results = STATE.results;
+    const previewUrl = `/api/preview/${STATE.wsName}/${r.id}`;
 
     html += `
       <div class="result-card">
@@ -1056,9 +1049,12 @@ downloadBtn.addEventListener('click', async () => {
 });
 
 // Reset
-resetBtn.addEventListener('click', () => {
+resetBtn.addEventListener('click', async () => {
   dismissPersistentNotice();
   resetScanUI();
+  // Clear the server-side session too — otherwise the files/results stay
+  // alive on the server and a page refresh (restoreState) resurrects them.
+  try { await apiFetch('/api/reset', { method: 'POST' }); } catch(e) { /* best-effort */ }
   STATE.files = [];
   STATE.results = [];
   STATE.wsName = '';
@@ -1078,6 +1074,33 @@ resetBtn.addEventListener('click', () => {
   progressText.textContent = 'Waiting...';
 });
 
+// Restore server-side session state after a page refresh — the server
+// keeps files/results per session, but the UI used to come back blank
+// (and /api/state sat unused). Also reattaches to a still-running batch.
+async function restoreState() {
+  try {
+    const r = await fetch('/api/state');
+    const d = await r.json();
+    if (!d.files || !d.files.length) return;
+    STATE.files = d.files;
+    STATE.wsName = d.files[0]?.thumbnail?.split('/')[3] || '';
+    if (d.input_dir) dirPath.value = d.input_dir;
+    renderFiles();
+    showConfigSection();
+    if (d.is_running) {
+      STATE.isRunning = true;
+      cancelBtn.style.display = '';
+      updateStartButtonState();
+      STATE.pollTimer = setInterval(pollProgress, 400);
+    } else if (d.results && d.results.length) {
+      STATE.results = d.results;
+      showResults();
+    }
+  } catch(e) {
+    // Fresh session or server unreachable — nothing to restore.
+  }
+}
+
 // Init
 checkHealth();
 loadRecentPaths();
@@ -1089,6 +1112,8 @@ const autoDir = params.get('dir');
 if (autoDir) {
   dirPath.value = autoDir;
   scanBtn.click();
+} else {
+  restoreState();
 }
 </script>
 </body>

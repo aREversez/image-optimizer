@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import Callable, Optional
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 HEX_COLOR_RE = re.compile(r"^#?[0-9A-Fa-f]{6}$")
@@ -73,7 +73,10 @@ class Optimizer:
     def _find_binary(self, name: str) -> Optional[Path]:
         try:
             cmd = "where" if sys.platform == "win32" else "which"
-            result = subprocess.run([cmd, name], capture_output=True, text=True)
+            # timeout: a hung `where`/`which` (e.g. a dead network drive on
+            # PATH) must not wedge detection — and with it /api/health —
+            # forever.
+            result = subprocess.run([cmd, name], capture_output=True, text=True, timeout=5)
             if result.returncode == 0 and result.stdout.strip():
                 return Path(result.stdout.strip().splitlines()[0])
         except Exception:
@@ -104,21 +107,25 @@ class Optimizer:
         this step, non-PNG sources that skip the resize path get silently copied
         through unchanged but renamed to .png (invalid/mislabeled output).
         """
-        img = Image.open(src)
-        if img.mode == "CMYK":
-            img = img.convert("RGB")
-        img.save(dst, format="PNG")
+        with Image.open(src) as img:
+            # Bake in the EXIF orientation (phone JPEGs) — PNG has no
+            # orientation tag, so without this a portrait photo comes out
+            # sideways in the optimized output.
+            img = ImageOps.exif_transpose(img)
+            if img.mode == "CMYK":
+                img = img.convert("RGB")
+            img.save(dst, format="PNG")
 
     @staticmethod
     def _resize_image(src: Path, dst: Path, max_width: int):
-        img = Image.open(src)
-        w, h = img.size
-        if w <= max_width:
-            return
-        ratio = max_width / w
-        new_size = (max_width, int(h * ratio))
-        img = img.resize(new_size, Image.Resampling.LANCZOS)
-        img.save(dst, format="PNG")
+        with Image.open(src) as img:
+            w, h = img.size
+            if w <= max_width:
+                return
+            ratio = max_width / w
+            new_size = (max_width, int(h * ratio))
+            img = img.resize(new_size, Image.Resampling.LANCZOS)
+            img.save(dst, format="PNG")
 
     @staticmethod
     def _make_color_map(colors: list[str], dst: Path) -> bool:
@@ -267,19 +274,17 @@ class Optimizer:
                     await proc.communicate()
 
                 if oxipng_tmp.exists():
+                    # Registered as a temp BEFORE the replace: if replace()
+                    # fails (e.g. output_path unexpectedly blocked), the
+                    # finally-sweep still removes it. On success the file
+                    # has moved, so the sweep's exists() check skips it.
+                    temp_files.append(oxipng_tmp)
                     oxipng_tmp.replace(output_path)
                 else:
                     shutil.copy2(working_path, output_path)
             else:
                 if working_path != output_path:
                     shutil.copy2(working_path, output_path)
-
-            for f in temp_files:
-                try:
-                    if f.exists() and f != output_path:
-                        f.unlink()
-                except Exception:
-                    pass
 
             if output_path.exists():
                 compressed_size = os.path.getsize(output_path)
@@ -292,6 +297,18 @@ class Optimizer:
         except Exception as e:
             result["success"] = False
             result["error"] = str(e)
+
+        finally:
+            # Sweep temps on success AND on the exception path — they live
+            # inside ws/output, and /api/download zips that tree with
+            # rglob("*"), so leftovers like *.src.png would end up in the
+            # user's ZIP.
+            for f in temp_files:
+                try:
+                    if f.exists() and f != output_path:
+                        f.unlink()
+                except Exception:
+                    pass
 
         return result
 
@@ -319,22 +336,25 @@ class Optimizer:
             loop = asyncio.get_running_loop()
 
             def _encode():
-                img = Image.open(input_path)
-                if img.mode == "CMYK":
-                    img = img.convert("RGB")
+                with Image.open(input_path) as opened:
+                    # Same EXIF-orientation bake-in as _ensure_png — WebP
+                    # output shouldn't come out sideways either.
+                    img = ImageOps.exif_transpose(opened)
+                    if img.mode == "CMYK":
+                        img = img.convert("RGB")
 
-                if max_width > 0:
-                    w, h = img.size
-                    if w > max_width:
-                        ratio = max_width / w
-                        img = img.resize((max_width, int(h * ratio)), Image.Resampling.LANCZOS)
+                    if max_width > 0:
+                        w, h = img.size
+                        if w > max_width:
+                            ratio = max_width / w
+                            img = img.resize((max_width, int(h * ratio)), Image.Resampling.LANCZOS)
 
-                if compression_mode == "lossless" or compression_mode == "resize_only":
-                    img.save(output_path, format="WEBP", lossless=True, method=6)
-                else:
-                    quality_map = {"high": 90, "medium": 75, "low": 55}
-                    q = quality_map.get(quality, 75)
-                    img.save(output_path, format="WEBP", quality=q, method=6)
+                    if compression_mode == "lossless" or compression_mode == "resize_only":
+                        img.save(output_path, format="WEBP", lossless=True, method=6)
+                    else:
+                        quality_map = {"high": 90, "medium": 75, "low": 55}
+                        q = quality_map.get(quality, 75)
+                        img.save(output_path, format="WEBP", quality=q, method=6)
 
             if progress_callback:
                 mode_desc = "lossless" if compression_mode in ("lossless", "resize_only") else f"quality={quality}"

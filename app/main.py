@@ -31,8 +31,15 @@ else:
 
 
 def _find_free_port(host: str, start: int, max_attempts: int = 10) -> int:
+    # NOTE: this is inherently a probe — there's a small TOCTOU window
+    # between closing the probe socket and uvicorn binding the real one.
+    # SO_REUSEADDR (non-Windows only: on Windows it means "steal the port",
+    # not "ignore TIME_WAIT") keeps a lingering TIME_WAIT from a previous
+    # run from making the probe reject a port uvicorn could bind just fine.
     for port in range(start, start + max_attempts):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if sys.platform != "win32":
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 s.bind((host, port))
                 return port
@@ -122,9 +129,12 @@ class AppState:
 
 
 # Each browser session (identified by a cookie) gets its own AppState, so
-# two tabs — or two people on the same LAN if this were ever pointed at
-# 0.0.0.0 — no longer share scan results, progress, or a workspace and
-# can't clobber each other's in-flight work.
+# two different browsers/profiles — or two people on the same LAN if this
+# were ever pointed at 0.0.0.0 — no longer share scan results, progress, or
+# a workspace and can't clobber each other's in-flight work. Note the
+# cookie is browser-wide, NOT per-tab: two tabs in the same browser still
+# share one AppState, which is why the scan/optimize endpoints reject
+# concurrent work with a 400 instead of silently swapping state.
 SESSIONS: dict[str, AppState] = {}
 SESSION_COOKIE = "imgopt_session"
 SESSION_IDLE_TIMEOUT = 4 * 3600  # sweep sessions untouched for this long
@@ -351,12 +361,24 @@ async def session_cookie_middleware(request: Request, call_next):
 
 def _gen_thumbnail(src: Path, dst: Path, max_size: int = 200):
     try:
-        img = Image.open(src)
-        img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-        if img.mode in ("RGBA", "P"):
-            img = img.convert("RGB")
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        img.save(dst, "JPEG", quality=70)
+        # Context manager so the source file handle is released even on the
+        # error path (matters on Windows, where a lingering handle can keep
+        # the user's file locked until GC gets around to it).
+        with Image.open(src) as img:
+            img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+            if img.mode in ("RGBA", "LA", "PA", "P"):
+                # Composite transparency onto white instead of a bare
+                # convert("RGB"), which renders transparent areas black.
+                # Also covers LA/PA, whose alpha made the JPEG save fail
+                # outright (no thumbnail at all).
+                rgba = img.convert("RGBA")
+                bg = Image.new("RGB", rgba.size, (255, 255, 255))
+                bg.paste(rgba, mask=rgba.getchannel("A"))
+                img = bg
+            elif img.mode != "RGB":
+                img = img.convert("RGB")
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            img.save(dst, "JPEG", quality=70)
     except Exception as e:
         print(f"[Warning] Thumbnail failed for {src.name}: {e}")
 
@@ -485,14 +507,17 @@ async def _run_worker_pool(
     await asyncio.gather(*workers)
 
 
+SCAN_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
+
+
 def _scan_images(directory: Path, recursive: bool = True) -> list:
-    patterns = ["*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tiff", "*.tif",
-                "*.PNG", "*.JPG", "*.JPEG", "*.BMP", "*.TIFF", "*.TIF"]
-    images = []
+    # One directory walk with a case-folded suffix check, instead of one
+    # glob pass per extension×case pattern. Catches mixed-case names like
+    # "photo.Png" on case-sensitive filesystems (the old explicit
+    # upper/lower pattern list missed those), and includes .webp — the
+    # optimizer reads it like any other Pillow-supported input.
     iter_method = directory.rglob if recursive else directory.glob
-    for pat in patterns:
-        images.extend(iter_method(pat))
-    return sorted(set(images))
+    return sorted(p for p in iter_method("*") if p.is_file() and p.suffix.lower() in SCAN_EXTS)
 
 
 @app.exception_handler(Exception)
@@ -526,9 +551,10 @@ async def health():
         return JSONResponse({"error": "Optimizer not initialized"}, status_code=503)
     # Re-detect every health check so that placing pngquant/oxipng in the
     # bin/ directory (or PATH) after startup is reflected on the next page
-    # refresh — no restart needed. The detection is purely a filesystem
-    # check and trivially cheap; no running subprocess is affected.
-    optimizer._detect_binaries()
+    # refresh — no restart needed. Detection shells out to `where`/`which`,
+    # which is blocking I/O — run it off the event loop so a health check
+    # never stalls other sessions' in-flight requests.
+    await asyncio.to_thread(optimizer._detect_binaries)
     return JSONResponse({
         "pngquant": optimizer.pngquant_path is not None,
         "oxipng": optimizer.oxipng_path is not None,
@@ -656,11 +682,25 @@ async def upload_files(files: List[UploadFile] = File(...), state: AppState = De
     for idx, f in enumerate(files):
         if not f.filename:
             continue
-        name = Path(f.filename).name
+        # Path(...).name strips any directory components a non-browser
+        # client could smuggle into the filename (browsers only ever send
+        # a basename). The sanitized name must be used for BOTH the stored
+        # file and the reported "name" field — file_info["name"] is later
+        # joined onto the output directory in _process_files, so a raw
+        # "../"-carrying filename would write outside the workspace.
+        name = Path(f.filename.replace("\\", "/")).name
+        if not name:
+            continue
         unique_name = f"{int(time.time())}_{idx}_{name}"
         file_path = upload_dir / unique_name
-        content = await f.read()
-        file_path.write_bytes(content)
+        # Stream to disk in 1 MiB chunks instead of buffering each whole
+        # file in memory — a batch of large images would otherwise spike
+        # memory by the combined upload size.
+        size = 0
+        with open(file_path, "wb") as out:
+            while chunk := await f.read(1024 * 1024):
+                out.write(chunk)
+                size += len(chunk)
 
         thumb_rel = f"thumb/upload_{idx}_{name}.jpg"
         thumb_path = ws / thumb_rel
@@ -668,9 +708,9 @@ async def upload_files(files: List[UploadFile] = File(...), state: AppState = De
 
         result_files.append({
             "id": str(idx),
-            "name": f.filename,
+            "name": name,
             "path": str(file_path),
-            "size": len(content),
+            "size": size,
             "thumbnail": f"/api/thumb/{state.workspace.name}/{thumb_rel}",
         })
 
@@ -696,6 +736,14 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
 
     if data.compression_mode not in ("standard", "lossless", "resize_only"):
         return JSONResponse({"error": "Invalid compression_mode"}, status_code=400)
+    if data.quality not in ("high", "medium", "low"):
+        # Previously an unknown quality silently fell back to "medium" deep
+        # inside the optimizer — reject it here like the other enum fields
+        # so a typo'd client request fails loudly instead.
+        return JSONResponse(
+            {"error": f"Invalid quality: {data.quality!r}. Supported: 'high', 'medium', 'low'."},
+            status_code=400,
+        )
     if data.output_format not in ("png", "webp"):
         # The pipeline only ever produces real PNG or WebP bytes — accepting
         # anything else here would silently produce a file whose extension
@@ -733,6 +781,18 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
     state.results = []
     state.cancelled = False
 
+    # Surface degraded capability up front instead of only as a per-file
+    # log line: PNG+standard without pngquant still runs, but silently
+    # downgrades to lossless-only compression — the user should know why
+    # their files barely shrank. available_modes() is the source of truth.
+    warning = None
+    if optimizer is not None and (data.output_format, data.compression_mode) not in optimizer.available_modes():
+        warning = (
+            "pngquant not found — Standard mode PNG output falls back to lossless-only "
+            "compression (larger files). Place pngquant in the bin/ directory for full compression."
+        )
+        state.logs.append(f"[Warning] {warning}")
+
     asyncio.create_task(
         _process_files(
             state,
@@ -747,7 +807,7 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
         )
     )
 
-    return JSONResponse({"ok": True, "total": len(files_to_process)})
+    return JSONResponse({"ok": True, "total": len(files_to_process), "warning": warning})
 
 
 CONCURRENT_WORKERS = 4  # default; overridden by main() from config.json / --workers
@@ -779,6 +839,31 @@ async def _process_files(
         await _async_rmtree(opt_output_dir)
     opt_output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Pre-assign every file's output path so name collisions are resolved
+    # deterministically: "photo.png" and "photo.jpg" both map to
+    # "photo.png" after the suffix swap and would silently overwrite each
+    # other mid-batch (last worker to finish wins, both reported as
+    # successes). First occurrence keeps the plain name; later collisions
+    # get a numbered stem ("photo_2.png"). Keys are case-folded because
+    # Windows/macOS filesystems collide case-insensitively. A None entry
+    # marks a name whose resolved path escapes the output dir (should be
+    # impossible after upload-side sanitization — defense in depth) and is
+    # turned into a per-file failure inside process_one.
+    base_resolved = str(opt_output_dir.resolve())
+    out_paths: dict[str, Optional[Path]] = {}
+    used_names: set[str] = set()
+    for file_info in files:
+        base = (opt_output_dir / file_info["name"]).with_suffix(f".{output_format}")
+        candidate = base
+        n = 2
+        while str(candidate).lower() in used_names:
+            candidate = base.with_name(f"{base.stem}_{n}{base.suffix}")
+            n += 1
+        used_names.add(str(candidate).lower())
+        resolved = str(candidate.resolve())
+        inside = resolved == base_resolved or resolved.startswith(base_resolved + os.sep)
+        out_paths[file_info["id"]] = candidate if inside else None
+
     async def log(msg):
         state.logs.append(f"  {msg}")
 
@@ -787,12 +872,13 @@ async def _process_files(
 
         # file_info["name"] is always the clean, structure-preserving
         # relative name (e.g. "2023/vacation/IMG_0001.png") for both the
-        # scan and upload flows — use it directly rather than trying to
-        # re-derive it from the physical storage path, which for uploads
-        # is intentionally flattened/deduplicated and does NOT mirror
-        # the original folder structure.
-        out_path = opt_output_dir / file_info["name"]
-        out_path = out_path.with_suffix(f".{output_format}")
+        # scan and upload flows — out_paths derives from it directly rather
+        # than from the physical storage path, which for uploads is
+        # intentionally flattened/deduplicated and does NOT mirror the
+        # original folder structure.
+        out_path = out_paths[file_info["id"]]
+        if out_path is None:
+            raise ValueError("unsafe file name escapes the output directory")
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
         state.logs.append(f"Processing: {file_info['name']}")
@@ -813,6 +899,11 @@ async def _process_files(
         result["name"] = file_info["name"]
         result["original_path"] = file_info["path"]
         result["output_format"] = output_format
+        # The actual output location relative to ws/output — may differ
+        # from name+suffix when a collision was disambiguated above, so
+        # consumers (e.g. /api/preview) must use this instead of
+        # re-deriving it from "name".
+        result["output_name"] = str(out_path.relative_to(opt_output_dir))
 
         if result["success"]:
             result["savings"] = result["original_size"] - result["compressed_size"]
@@ -940,6 +1031,14 @@ async def get_result(ws_name: str, result_path: str, state: AppState = Depends(g
 
 @app.get("/api/preview/{ws_name}/{file_id}")
 async def preview(ws_name: str, file_id: str, state: AppState = Depends(get_session)):
+    # Same ownership check as every other workspace-scoped endpoint. Doing
+    # it FIRST also closes a reflected-XSS hole: ws_name is an arbitrary
+    # URL path segment that gets embedded in the HTML below — without this
+    # gate (plus the html.escape on the URLs), a crafted ws_name like
+    # `"><script>...` would execute in this app's origin and could then
+    # harvest APP_TOKEN from the index page, defeating the CSRF defense.
+    if not (state.workspace and state.workspace.name == ws_name):
+        return HTMLResponse("<h2>Not found</h2>", status_code=404)
     html = """<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <style>
@@ -976,19 +1075,20 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
             break
 
     if not result:
-        return HTMLResponse("<h2>Not found</h2>")
-
-    orig_url = f"/api/source-file/{ws_name}/{file_id}"
-
-    # Same reasoning as _process_files: result["name"] is the clean,
-    # structure-preserving relative name for both scan and upload flows —
-    # use it directly instead of re-deriving from the physical storage path.
-    out_fmt = result.get("output_format", "png")
-    comp_rel = str(Path(result["name"]).with_suffix(f".{out_fmt}"))
-
-    comp_url = f"/api/result/{ws_name}/{comp_rel}" if comp_rel else ""
+        return HTMLResponse("<h2>Not found</h2>", status_code=404)
 
     import html as _html
+
+    orig_url = _html.escape(f"/api/source-file/{ws_name}/{file_id}", quote=True)
+
+    # Use the exact output path recorded by _process_files — it may carry a
+    # collision-disambiguated name ("photo_2.png") that can't be re-derived
+    # from result["name"]. Fallback keeps old sessions/results working.
+    out_fmt = result.get("output_format", "png")
+    comp_rel = result.get("output_name") or str(Path(result["name"]).with_suffix(f".{out_fmt}"))
+
+    comp_url = _html.escape(f"/api/result/{ws_name}/{comp_rel}", quote=True) if comp_rel else ""
+
     safe_name = _html.escape(str(result['name']))
     safe_basename = _html.escape(Path(result['name']).name)
     html = html.replace(
@@ -1214,6 +1314,23 @@ async def get_state(state: AppState = Depends(get_session)):
         "current": state.current,
         "total": state.total,
     })
+
+
+@app.post("/api/reset")
+async def reset_session(state: AppState = Depends(get_session), _auth: None = Depends(require_token)):
+    """Clear this session's server-side state (the UI Reset button used to
+    only wipe the page, leaving files/results alive server-side — a page
+    refresh with /api/state restore would resurrect them). The workspace is
+    deleted with the same grace period as a workspace swap."""
+    if state.is_running:
+        return JSONResponse({"error": "Optimization in progress, please wait"}, status_code=400)
+    if state.scan_running:
+        return JSONResponse({"error": "A scan is already in progress, please wait"}, status_code=400)
+    if state.workspace:
+        asyncio.create_task(_delayed_rmtree(state.workspace))
+        state.workspace = None
+    state.reset()
+    return JSONResponse({"ok": True})
 
 
 def main():
