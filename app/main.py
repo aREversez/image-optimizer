@@ -852,16 +852,25 @@ async def _process_files(
 
     ws = state.workspace
     opt_output_dir = ws / "output"
-    if opt_output_dir.exists() and not retry and not skip_existing:
+    if opt_output_dir.exists() and not retry:
         # Off the event loop: a leftover output dir from a previous run could
         # hold thousands of files; deleting them synchronously here would
         # block the worker spawn below (and any other concurrent async work
         # in this process) for the duration of the unlink.
         #
-        # Skipped entirely on a retry: the earlier run's successful outputs
-        # live in here, and retry only re-runs the previously-failed files —
+        # Skipped ONLY on a retry: the earlier run's successful outputs live
+        # in here, and retry only re-runs the previously-failed files —
         # wiping the dir would delete good results (breaking their Compare
         # links and the download ZIP) just to regenerate a few failures.
+        #
+        # skip_existing does NOT suppress the wipe. Its purpose is purely
+        # per-file ("can this file be reused instead of recompressed?"), and
+        # the reuse path copies from output_dir back into ws/output anyway —
+        # it never relies on ws/output surviving. Coupling the wipe to it
+        # meant a normal subset run with skip_existing on would leave last
+        # run's now-unselected outputs in ws/output, and the whole-dir ZIP
+        # build would then leak those stale files into the download even
+        # though they aren't in this run's results/selection.
         await _async_rmtree(opt_output_dir)
     opt_output_dir.mkdir(parents=True, exist_ok=True)
 

@@ -331,3 +331,45 @@ class TestSkipExisting:
         assert r.status_code == 200
         # No persistent output folder -> nothing to reuse -> normal compression.
         assert not any(res.get("skipped") for res in d["results"])
+
+    def test_normal_subset_run_with_skip_existing_wipes_stale_outputs(self, client, auth_headers, test_images, tmp_path):
+        """Regression: skip_existing must NOT suppress the ws/output wipe on a
+        normal (non-retry) run. The wipe is per-batch and only retry should
+        preserve prior outputs; skip_existing is a per-file reuse decision and
+        its reuse path copies from output_dir back into ws/output, so it never
+        needs ws/output to survive. Coupling the wipe to it left a deselected
+        file's earlier output on disk, and the whole-dir ZIP build then leaked
+        that stale file into the download even though it wasn't in this run's
+        results or selection."""
+        import io
+        from zipfile import ZipFile
+
+        out_dir = tmp_path / "out"
+        scanned = scan_and_wait(client, auth_headers, test_images)
+        r, d = optimize_and_wait(client, auth_headers, output_dir=str(out_dir))
+        assert r.status_code == 200 and len(d["results"]) == 3
+
+        st = _session(client)
+        ws_name = st.workspace.name
+        ws_output = st.workspace / "output"
+        assert len([p for p in ws_output.rglob("*") if p.is_file()]) == 3
+
+        # Same workspace, no re-scan: run only ONE file with skip_existing on,
+        # as a normal Start (retry defaults False), deselecting the other two.
+        keep_id = scanned["files"][0]["id"]
+        keep_name = next(f["name"] for f in scanned["files"] if f["id"] == keep_id).replace("\\", "/")
+        r, d = optimize_and_wait(client, auth_headers, file_ids=[keep_id], skip_existing=True)
+        assert r.status_code == 200
+        assert [res["id"] for res in d["results"]] == [keep_id]
+
+        # ws/output now holds only this run's file; the two deselected files'
+        # stale outputs were wiped.
+        ws_files = {str(p.relative_to(ws_output)).replace("\\", "/")
+                    for p in ws_output.rglob("*") if p.is_file()}
+        assert ws_files == {keep_name}
+
+        # And the download ZIP contains exactly that one file, no stale leak.
+        zr = client.get(f"/api/download/{ws_name}")
+        assert zr.status_code == 200
+        names = {n.replace("\\", "/") for n in ZipFile(io.BytesIO(zr.content)).namelist()}
+        assert names == {keep_name}
