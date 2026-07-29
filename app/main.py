@@ -93,6 +93,12 @@ class AppState:
         self.scan_current = 0
         self.scan_total = 0
         self.scan_error: Optional[str] = None
+        # ZIP download cache: output_version bumps once per completed run
+        # (outputs changed); zip_built_version records which version the
+        # on-disk optimized.zip reflects, so download_zip can skip a rebuild
+        # when nothing changed since the last archive.
+        self.output_version = 0
+        self.zip_built_version = -1
 
     def reset(self):
         self.files = []
@@ -107,6 +113,8 @@ class AppState:
         self.scan_current = 0
         self.scan_total = 0
         self.scan_error = None
+        self.output_version = 0
+        self.zip_built_version = -1
 
     def new_workspace(self):
         if self.workspace:
@@ -778,8 +786,17 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
     state.current = 0
     state.total = len(files_to_process)
     state.logs = []
-    state.results = []
     state.cancelled = False
+    if data.retry:
+        # Retry re-runs only the previously-failed files. Keep every result
+        # that isn't being retried (the earlier successes and their outputs
+        # on disk stay intact) and drop just the stale entries for the ids
+        # about to be re-run, so they don't appear twice once the fresh
+        # results are appended.
+        retry_ids = {f["id"] for f in files_to_process}
+        state.results = [r for r in state.results if r.get("id") not in retry_ids]
+    else:
+        state.results = []
 
     # Surface degraded capability up front instead of only as a per-file
     # log line: PNG+standard without pngquant still runs, but silently
@@ -804,6 +821,8 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
             data.compression_mode,
             data.protected_colors,
             data.dithering,
+            retry=data.retry,
+            skip_existing=data.skip_existing,
         )
     )
 
@@ -823,6 +842,8 @@ async def _process_files(
     compression_mode: str = "standard",
     protected_colors: Optional[list] = None,
     dithering: bool = True,
+    retry: bool = False,
+    skip_existing: bool = False,
 ):
     if optimizer is None:
         state.logs.append("Optimizer not initialized")
@@ -831,11 +852,16 @@ async def _process_files(
 
     ws = state.workspace
     opt_output_dir = ws / "output"
-    if opt_output_dir.exists():
+    if opt_output_dir.exists() and not retry and not skip_existing:
         # Off the event loop: a leftover output dir from a previous run could
         # hold thousands of files; deleting them synchronously here would
         # block the worker spawn below (and any other concurrent async work
         # in this process) for the duration of the unlink.
+        #
+        # Skipped entirely on a retry: the earlier run's successful outputs
+        # live in here, and retry only re-runs the previously-failed files —
+        # wiping the dir would delete good results (breaking their Compare
+        # links and the download ZIP) just to regenerate a few failures.
         await _async_rmtree(opt_output_dir)
     opt_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -880,6 +906,37 @@ async def _process_files(
         if out_path is None:
             raise ValueError("unsafe file name escapes the output directory")
         out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Skip-already-optimized: if the user re-runs against the same output
+        # folder and this file's target is already there, reuse it instead of
+        # paying pngquant/oxipng again. We still copy it back into ws/output so
+        # Compare/preview (/api/result) and the download ZIP keep working — the
+        # copy is cheap next to a re-compress. No-op without output_dir (the
+        # temp workspace is wiped/empty each fresh run, nothing to reuse).
+        if skip_existing and output_dir:
+            rel = out_path.relative_to(opt_output_dir)
+            dest = Path(output_dir) / rel
+            if dest.exists() and dest.stat().st_size > 0:
+                shutil.copy2(dest, out_path)
+                orig_size = input_path.stat().st_size if input_path.exists() else 0
+                comp_size = dest.stat().st_size
+                savings = orig_size - comp_size
+                skipped_result = {
+                    "id": file_info["id"],
+                    "name": file_info["name"],
+                    "original_path": file_info["path"],
+                    "output_format": output_format,
+                    "output_name": str(rel),
+                    "success": True,
+                    "skipped": True,
+                    "original_size": orig_size,
+                    "compressed_size": comp_size,
+                    "savings": savings,
+                    "savings_percent": round(savings / orig_size * 100, 1) if orig_size > 0 else 0,
+                }
+                state.logs.append(f"  SKIP {file_info['name']} (already optimized)")
+                state.results.append(skipped_result)
+                return
 
         state.logs.append(f"Processing: {file_info['name']}")
 
@@ -974,6 +1031,10 @@ async def _process_files(
 
     finally:
         state.is_running = False
+        # Outputs for this run are now final — invalidate any cached ZIP so the
+        # next download rebuilds (see download_zip). Bumped once per run (fresh
+        # or retry), which is exactly when ws/output contents change.
+        state.output_version += 1
         total_orig = sum(r["original_size"] for r in state.results if r["success"])
         total_comp = sum(r["compressed_size"] for r in state.results if r["success"])
         saved = total_orig - total_comp
@@ -987,13 +1048,28 @@ async def _process_files(
 
 
 @app.get("/api/progress")
-async def get_progress(state: AppState = Depends(get_session)):
+async def get_progress(
+    state: AppState = Depends(get_session),
+    since_result: int = 0,
+    since_log: Optional[int] = None,
+):
+    # Incremental cursor: the frontend passes how many results/log lines it
+    # has already received so we only send the tail. For a few-thousand-file
+    # batch, re-sending the whole results array every 400ms poll was O(n) per
+    # poll / O(n^2) over the run — the dominant client-side cost. Slicing from
+    # a cursor makes each result/log line travel exactly once (O(n) total).
+    #
+    # Backward compatible: since_result defaults to 0 (results[0:] == full) and
+    # since_log defaults to None (last-100 lines, the original behavior), so
+    # callers/tests that omit the params see the pre-existing full payload.
     return JSONResponse({
         "running": state.is_running,
         "current": state.current,
         "total": state.total,
-        "logs": state.logs[-100:],
-        "results": state.results,
+        "logs": state.logs[since_log:] if since_log is not None else state.logs[-100:],
+        "results": state.results[since_result:],
+        "result_total": len(state.results),
+        "log_total": len(state.logs),
     })
 
 
@@ -1229,7 +1305,14 @@ async def download_zip(ws_name: str, state: AppState = Depends(get_session)):
                     arcname = str(f.relative_to(output_dir))
                     zf.write(f, arcname)
 
-    await asyncio.to_thread(_build_zip)
+    # Cache: rebuild only when the archive is missing or the outputs changed
+    # since it was built (output_version bumps once per completed run). A
+    # repeated download of an unchanged batch — or a second click after the
+    # browser's first request — then serves the existing file without paying
+    # the rglob + re-compress cost again.
+    if not (zip_path.exists() and state.zip_built_version == state.output_version):
+        await asyncio.to_thread(_build_zip)
+        state.zip_built_version = state.output_version
 
     return FileResponse(
         str(zip_path),

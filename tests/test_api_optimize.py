@@ -55,6 +55,43 @@ class TestFileIdsSemantics:
         assert d["results"][0]["id"] == one_id
 
 
+class TestRetryPreservesEarlierResults:
+    """The Retry Failed button re-runs only a subset with retry=True. Unlike
+    a normal subset run (which wipes ws/output and replaces state.results),
+    retry must keep the earlier successes' outputs on disk AND merge the
+    re-run entries back into the full results set instead of shrinking it to
+    just the retried files."""
+
+    def _output_dir(self, client):
+        import app.main as m
+        return m.SESSIONS[client.cookies.get("imgopt_session")].workspace / "output"
+
+    def test_retry_subset_keeps_full_result_set_and_outputs(self, client, auth_headers, test_images):
+        scanned = scan_and_wait(client, auth_headers, test_images)
+        r, d = optimize_and_wait(client, auth_headers)
+        assert r.status_code == 200 and len(d["results"]) == 3
+        assert len(list(self._output_dir(client).rglob("*.png"))) == 3
+
+        one_id = scanned["files"][0]["id"]
+        r, d = optimize_and_wait(client, auth_headers, file_ids=[one_id], retry=True)
+        assert r.status_code == 200
+        # Merged, not replaced: all three results survive (2 preserved + 1 re-run).
+        assert len(d["results"]) == 3
+        assert {res["id"] for res in d["results"]} == {f["id"] for f in scanned["files"]}
+        # Output dir was not wiped: earlier successes' files are still there.
+        assert len(list(self._output_dir(client).rglob("*.png"))) == 3
+
+    def test_non_retry_subset_still_replaces_results(self, client, auth_headers, test_images):
+        """Guard the default path: without retry, a subset run replaces the
+        result set (existing behavior relied on by the UI's normal Start)."""
+        scanned = scan_and_wait(client, auth_headers, test_images)
+        optimize_and_wait(client, auth_headers)
+        one_id = scanned["files"][0]["id"]
+        r, d = optimize_and_wait(client, auth_headers, file_ids=[one_id])
+        assert r.status_code == 200
+        assert len(d["results"]) == 1
+
+
 class TestOutputDirStructure:
     """Bug: `dest = user_output / f.name` flattened the output directory,
     so two files with the same basename in different subfolders silently
@@ -197,3 +234,100 @@ class TestNonPngInputNormalization:
         assert out_file.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n", (
             "output claims .png but contains non-PNG bytes"
         )
+
+
+def _session(client):
+    import app.main as m
+    return m.SESSIONS[client.cookies.get("imgopt_session")]
+
+
+class TestProgressIncrementalCursor:
+    """/api/progress supports an incremental cursor so a long batch doesn't
+    re-ship the whole results array every poll. since_result slices the tail;
+    result_total reports the full count. Omitting the params keeps the
+    original full-payload behavior every existing caller/test relies on."""
+
+    def test_since_result_returns_only_the_tail(self, client, auth_headers, test_images):
+        scan_and_wait(client, auth_headers, test_images)
+        r, d = optimize_and_wait(client, auth_headers)
+        assert r.status_code == 200 and len(d["results"]) == 3
+
+        tail = client.get("/api/progress?since_result=2", headers=auth_headers).json()
+        assert len(tail["results"]) == 1
+        assert tail["result_total"] == 3
+        assert tail["log_total"] >= 1
+
+    def test_omitting_cursor_still_returns_full_set(self, client, auth_headers, test_images):
+        scan_and_wait(client, auth_headers, test_images)
+        optimize_and_wait(client, auth_headers)
+        full = client.get("/api/progress", headers=auth_headers).json()
+        assert len(full["results"]) == 3
+        assert full["result_total"] == 3
+
+
+class TestZipDownloadCache:
+    """The download ZIP is rebuilt only when outputs changed since it was last
+    built (output_version bumps once per completed run). Repeated downloads of
+    an unchanged batch serve the cached archive without re-globbing/re-zipping;
+    a fresh run invalidates it."""
+
+    def test_zip_cached_until_next_run(self, client, auth_headers, test_images):
+        scan_and_wait(client, auth_headers, test_images)
+        optimize_and_wait(client, auth_headers)
+        st = _session(client)
+        ws_name = st.workspace.name
+        zip_path = st.workspace / "optimized.zip"
+
+        r1 = client.get(f"/api/download/{ws_name}")
+        assert r1.status_code == 200
+        assert st.zip_built_version == st.output_version
+        mtime1 = zip_path.stat().st_mtime_ns
+
+        # No new run -> cache hit -> the archive file is left untouched.
+        r2 = client.get(f"/api/download/{ws_name}")
+        assert r2.status_code == 200
+        assert zip_path.stat().st_mtime_ns == mtime1
+
+        # A fresh run bumps output_version, so the next download rebuilds.
+        prev_version = st.output_version
+        optimize_and_wait(client, auth_headers)
+        assert st.output_version == prev_version + 1
+        r3 = client.get(f"/api/download/{ws_name}")
+        assert r3.status_code == 200
+        assert st.zip_built_version == st.output_version
+
+
+class TestSkipExisting:
+    """skip_existing reuses an already-optimized file in the output folder
+    instead of recompressing it, while still copying it back into ws/output
+    so Compare/preview and the download ZIP keep working."""
+
+    def test_skip_reuses_existing_outputs_without_recompressing(self, client, auth_headers, test_images, tmp_path):
+        out_dir = tmp_path / "out"
+        scan_and_wait(client, auth_headers, test_images)
+        r, d = optimize_and_wait(client, auth_headers, output_dir=str(out_dir))
+        assert r.status_code == 200 and all(res["success"] for res in d["results"])
+        produced = [p for p in out_dir.rglob("*") if p.is_file()]
+        assert produced, "first run should populate the output folder"
+        mtimes = {p: p.stat().st_mtime_ns for p in produced}
+
+        # Re-scan the same source (new workspace) and re-run with skip_existing.
+        scan_and_wait(client, auth_headers, test_images)
+        r, d = optimize_and_wait(client, auth_headers, output_dir=str(out_dir), skip_existing=True)
+        assert r.status_code == 200
+        assert all(res.get("skipped") for res in d["results"])
+        assert all(res["success"] for res in d["results"])
+
+        # Destination files were reused, not rewritten (mtimes unchanged).
+        for p, mt in mtimes.items():
+            assert p.stat().st_mtime_ns == mt, f"{p} was recompressed on a skip run"
+        # ws/output was repopulated so Compare/ZIP still work.
+        ws_output = _session(client).workspace / "output"
+        assert len([p for p in ws_output.rglob("*") if p.is_file()]) == len(produced)
+
+    def test_skip_existing_without_output_dir_is_noop(self, client, auth_headers, test_images):
+        scan_and_wait(client, auth_headers, test_images)
+        r, d = optimize_and_wait(client, auth_headers, skip_existing=True)
+        assert r.status_code == 200
+        # No persistent output folder -> nothing to reuse -> normal compression.
+        assert not any(res.get("skipped") for res in d["results"])

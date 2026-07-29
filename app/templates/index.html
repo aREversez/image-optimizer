@@ -21,6 +21,31 @@
   --radius: 8px;
   --shadow: 0 1px 6px rgba(0,0,0,.08);
 }
+/* Dark palette. accent/green/red/yellow stay identical across themes so the
+   brand color and status colors read the same; only the neutral surfaces and
+   text flip. Applied via data-theme="dark" (manual toggle) OR, when the user
+   hasn't explicitly chosen a theme (no data-theme attribute), via the OS
+   prefers-color-scheme media query below. */
+:root[data-theme="dark"] {
+  --bg: #1e1c1a;
+  --surface: #2a2724;
+  --surface2: #332f2b;
+  --border: #413b35;
+  --text: #e8e3dc;
+  --text2: #9a938b;
+  --shadow: 0 1px 6px rgba(0,0,0,.4);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    --bg: #1e1c1a;
+    --surface: #2a2724;
+    --surface2: #332f2b;
+    --border: #413b35;
+    --text: #e8e3dc;
+    --text2: #9a938b;
+    --shadow: 0 1px 6px rgba(0,0,0,.4);
+  }
+}
 * { margin:0; padding:0; box-sizing:border-box; }
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans SC", sans-serif;
@@ -53,6 +78,12 @@ header h1 span { color: var(--accent); }
 .status-dot.ok { background: var(--green); }
 .status-dot.warn { background: var(--yellow); }
 .status-dot.err { background: var(--red); }
+.theme-toggle {
+  background: var(--bg); border: 1px solid var(--border); color: var(--text2);
+  border-radius: var(--radius); cursor: pointer; padding: 6px 10px; font-size: 15px;
+  line-height: 1; transition: all .15s;
+}
+.theme-toggle:hover { border-color: var(--accent); color: var(--text); }
 
 #notice-container {
   position: fixed; top: 16px; right: 16px; z-index: 1000;
@@ -212,6 +243,16 @@ header h1 span { color: var(--accent); }
 .result-summary {
   display: flex; gap: 24px; margin-bottom: 16px; flex-wrap: wrap;
 }
+.result-toolbar {
+  display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-bottom: 12px;
+}
+.result-toolbar label { font-size: 12px; color: var(--text2); }
+.result-toolbar select {
+  padding: 6px 10px; background: var(--bg); border: 1px solid var(--border);
+  border-radius: var(--radius); color: var(--text); font-size: 13px; outline: none;
+}
+.result-toolbar select:focus { border-color: var(--accent); }
+.result-toolbar .count { font-size: 12px; color: var(--text2); margin-left: auto; }
 .result-stat { text-align: center; min-width: 100px; }
 .result-stat .value { font-size: 24px; font-weight: 700; }
 .result-stat .value.green { color: var(--green); }
@@ -266,6 +307,7 @@ header h1 span { color: var(--accent); }
   <div class="header-right">
     <span id="health-status"><span class="status-dot warn"></span>Checking...</span>
     <span id="workspace-info"></span>
+    <button class="theme-toggle" id="theme-toggle" title="Toggle light / dark theme" aria-label="Toggle theme"></button>
   </div>
 </header>
 
@@ -305,6 +347,10 @@ header h1 span { color: var(--accent); }
       <button class="btn btn-secondary" id="output-browse-btn">Browse Folder...</button>
     </div>
     <div class="recent-chips" id="recent-output-dirs"></div>
+    <label class="check-row" style="margin-top:8px;cursor:pointer;user-select:none;font-size:13px;display:flex;align-items:center;gap:4px"
+      title="When re-running against the same output folder, files already optimized there are reused instead of being recompressed. Only applies when an output folder is set.">
+      <input type="checkbox" id="skip-existing" /> Skip files already in the output folder
+    </label>
   </div>
 
   <!-- Config + Action -->
@@ -416,8 +462,26 @@ header h1 span { color: var(--accent); }
     <div class="action-bar" style="margin-bottom:12px">
       <span id="output-path-info" style="font-size:12px;color:var(--text2)"></span>
       <div class="spacer"></div>
+      <button class="btn btn-secondary" id="retry-btn" style="display:none">Retry Failed</button>
       <button class="btn btn-primary" id="download-btn" style="display:none">Download All (ZIP)</button>
       <button class="btn btn-secondary" id="reset-btn">Reset</button>
+    </div>
+    <div class="result-toolbar" id="result-toolbar" style="display:none">
+      <label for="result-sort">Sort</label>
+      <select id="result-sort">
+        <option value="default">Completion order</option>
+        <option value="savings_desc">Compression % (high to low)</option>
+        <option value="savings_asc">Compression % (low to high)</option>
+        <option value="size_desc">Compressed size (large to small)</option>
+        <option value="saved_desc">Bytes saved (most first)</option>
+      </select>
+      <label for="result-filter">Show</label>
+      <select id="result-filter">
+        <option value="all">All</option>
+        <option value="success">Succeeded only</option>
+        <option value="failed">Failed only</option>
+      </select>
+      <span class="count" id="result-count"></span>
     </div>
     <div class="result-grid" id="result-grid"></div>
   </div>
@@ -433,6 +497,12 @@ const STATE = {
   wsName: '',
   isRunning: false,
   pollTimer: null,
+  runStartTime: 0,      // ms timestamp when the current run began (for ETA)
+  resultSort: 'default',
+  resultFilter: 'all',
+  resultCursor: 0,      // # of results already pulled (incremental /api/progress)
+  logCursor: 0,         // # of log lines already pulled
+  logLines: [],         // accumulated log lines (capped for display)
 };
 
 // DOM refs
@@ -518,7 +588,13 @@ const dirPath = $('dir-path'),
       protectColorsGroup = $('protect-colors-group'),
       ditheringInput = $('dithering'),
       ditheringGroup = $('dithering-group'),
-      modeHint = $('mode-hint');
+      modeHint = $('mode-hint'),
+      retryBtn = $('retry-btn'),
+      resultToolbar = $('result-toolbar'),
+      resultSortSel = $('result-sort'),
+      resultFilterSel = $('result-filter'),
+      resultCountEl = $('result-count'),
+      themeToggle = $('theme-toggle');
 
 // Utility
 function fmtSize(bytes) {
@@ -526,6 +602,88 @@ function fmtSize(bytes) {
   if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
   return (bytes / 1048576).toFixed(2) + ' MB';
 }
+
+// Format a duration in seconds as "mm:ss" (or "h:mm:ss" past an hour).
+function fmtDuration(sec) {
+  sec = Math.max(0, Math.round(sec));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  const pad = n => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+}
+
+// Theme: 'light' | 'dark' persisted in localStorage. When nothing is stored
+// we leave the data-theme attribute off entirely so the prefers-color-scheme
+// media query decides (follow the OS). The toggle always writes an explicit
+// choice, which from then on overrides the OS setting.
+function currentTheme() {
+  const stored = localStorage.getItem('imgopt.theme');
+  if (stored === 'light' || stored === 'dark') return stored;
+  return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+function applyStoredTheme() {
+  const stored = localStorage.getItem('imgopt.theme');
+  if (stored === 'light' || stored === 'dark') {
+    document.documentElement.setAttribute('data-theme', stored);
+  } else {
+    document.documentElement.removeAttribute('data-theme');
+  }
+  themeToggle.textContent = currentTheme() === 'dark' ? '\u2600' : '\u263e'; // sun when dark (click->light), moon when light
+}
+themeToggle.addEventListener('click', () => {
+  const next = currentTheme() === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('imgopt.theme', next);
+  applyStoredTheme();
+});
+
+// Config memory: persist the last-used settings so a page refresh doesn't
+// reset Quality/Format/Mode/etc. back to the HTML defaults. Stored under one
+// key as a plain object; missing/corrupt storage falls back to the HTML
+// defaults (the hardcoded `checked` attributes) untouched.
+function saveConfig() {
+  try {
+    const cfg = {
+      quality: (document.querySelector('input[name="quality"]:checked') || {}).value,
+      maxWidth: $('max-width').value,
+      format: (document.querySelector('input[name="format"]:checked') || {}).value,
+      mode: (document.querySelector('input[name="mode"]:checked') || {}).value,
+      dithering: ditheringInput.checked,
+      protectColors: protectColorsInput.value,
+      recursive: $('recursive-scan').checked,
+      skipExisting: $('skip-existing').checked,
+    };
+    localStorage.setItem('imgopt.config', JSON.stringify(cfg));
+  } catch (e) { /* storage unavailable/full — non-critical */ }
+}
+function loadConfig() {
+  let cfg;
+  try { cfg = JSON.parse(localStorage.getItem('imgopt.config') || 'null'); }
+  catch (e) { cfg = null; }
+  if (!cfg) return;
+  const setRadio = (name, val) => {
+    if (val == null) return;
+    const el = document.querySelector(`input[name="${name}"][value="${val}"]`);
+    if (el) el.checked = true;
+  };
+  setRadio('quality', cfg.quality);
+  setRadio('format', cfg.format);
+  setRadio('mode', cfg.mode);
+  if (cfg.maxWidth != null && $('max-width').querySelector(`option[value="${cfg.maxWidth}"]`)) {
+    $('max-width').value = cfg.maxWidth;
+  }
+  if (typeof cfg.dithering === 'boolean') ditheringInput.checked = cfg.dithering;
+  if (typeof cfg.protectColors === 'string') protectColorsInput.value = cfg.protectColors;
+  if (typeof cfg.recursive === 'boolean') $('recursive-scan').checked = cfg.recursive;
+  if (typeof cfg.skipExisting === 'boolean') $('skip-existing').checked = cfg.skipExisting;
+}
+// Save on any config change. updateModeDependentControls (bound separately
+// for format/mode) also recomputes disabled states; saveConfig is additive.
+['quality', 'format', 'mode'].forEach(name =>
+  document.querySelectorAll(`input[name="${name}"]`).forEach(r => r.addEventListener('change', saveConfig)));
+$('max-width').addEventListener('change', saveConfig);
+ditheringInput.addEventListener('change', saveConfig);
+protectColorsInput.addEventListener('input', saveConfig);
+$('recursive-scan').addEventListener('change', saveConfig);
+$('skip-existing').addEventListener('change', saveConfig);
 
 // Health check
 async function checkHealth() {
@@ -855,10 +1013,12 @@ function updateStartButtonState() {
   startBtn.disabled = STATE.isRunning || !hasFiles || resizeOnlyNeedsWidth;
 }
 
-// Start optimization
-startBtn.addEventListener('click', async () => {
-  const selected = fileGrid.querySelectorAll('.file-card.selected');
-  const ids = Array.from(selected).map(el => el.dataset.id);
+// Start optimization. Shared by the Start button (full/selected run) and the
+// Retry Failed button (retry=true re-runs only the given ids server-side
+// without wiping earlier successful outputs).
+async function runOptimize(ids, opts) {
+  opts = opts || {};
+  const retry = !!opts.retry;
 
   const quality = document.querySelector('input[name="quality"]:checked').value;
   const maxWidth = parseInt($('max-width').value);
@@ -869,7 +1029,15 @@ startBtn.addEventListener('click', async () => {
   const dithering = ditheringInput.checked;
 
   STATE.isRunning = true;
-  STATE.results = [];
+  STATE.runStartTime = Date.now();
+  if (!retry) STATE.results = [];
+  // Incremental-poll cursors always restart at 0 for a new run: the server's
+  // state.results is the source of truth (on retry it already holds the
+  // preserved successes), so a from-zero first poll re-syncs the full set,
+  // then subsequent polls only carry the tail.
+  STATE.resultCursor = 0;
+  STATE.logCursor = 0;
+  STATE.logLines = [];
 
   dismissPersistentNotice();
 
@@ -879,8 +1047,9 @@ startBtn.addEventListener('click', async () => {
   cancelBtn.style.display = '';
   logBox.innerHTML = '';
   progressFill.style.width = '0%';
-  progressText.textContent = 'Starting...';
+  progressText.textContent = retry ? 'Retrying...' : 'Starting...';
   startBtn.disabled = true;
+  retryBtn.disabled = true;
 
   try {
     const r = await apiFetch('/api/optimize', {
@@ -888,7 +1057,8 @@ startBtn.addEventListener('click', async () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         file_ids: ids, quality, max_width: maxWidth, output_format: format, output_dir: outputDir,
-        compression_mode: compressionMode, protected_colors: protectedColors, dithering,
+        compression_mode: compressionMode, protected_colors: protectedColors, dithering, retry,
+        skip_existing: $('skip-existing').checked,
       }),
     });
     const d = await r.json();
@@ -896,6 +1066,7 @@ startBtn.addEventListener('click', async () => {
       showNotice(d.error, 'err');
       STATE.isRunning = false;
       cancelBtn.style.display = 'none';
+      retryBtn.disabled = false;
       updateStartButtonState();
       return;
     }
@@ -905,49 +1076,87 @@ startBtn.addEventListener('click', async () => {
     STATE.pollTimer = setInterval(pollProgress, 400);
     loadRecentPaths();
   } catch(e) {
-    showNotice('Start failed: ' + e.message, 'err');
+    showNotice((retry ? 'Retry failed: ' : 'Start failed: ') + e.message, 'err');
     STATE.isRunning = false;
     cancelBtn.style.display = 'none';
+    retryBtn.disabled = false;
     updateStartButtonState();
   }
+}
+
+startBtn.addEventListener('click', () => {
+  const selected = fileGrid.querySelectorAll('.file-card.selected');
+  const ids = Array.from(selected).map(el => el.dataset.id);
+  runOptimize(ids, { retry: false });
+});
+
+retryBtn.addEventListener('click', () => {
+  const failedIds = STATE.results.filter(r => !r.success).map(r => r.id).filter(id => id != null);
+  if (!failedIds.length) { showNotice('No failed files to retry', 'info'); return; }
+  runOptimize(failedIds, { retry: true });
 });
 
 async function pollProgress() {
   try {
-    const r = await fetch('/api/progress');
+    const r = await fetch(`/api/progress?since_result=${STATE.resultCursor}&since_log=${STATE.logCursor}`);
     const d = await r.json();
 
     STATE.isRunning = d.running;
 
+    // Accumulate the incremental results tail. When the cursor is 0 (first
+    // poll of a run, or a reattach) we replace; afterwards we append only the
+    // new entries the server sent. STATE.results stays the full set either way.
+    if (d.results && d.results.length) {
+      if (STATE.resultCursor === 0) STATE.results = d.results.slice();
+      else for (const item of d.results) STATE.results.push(item);
+    }
+    if (typeof d.result_total === 'number') STATE.resultCursor = d.result_total;
+
     // Update progress bar
     const pct = d.total > 0 ? Math.round(d.current / d.total * 100) : 0;
     progressFill.style.width = pct + '%';
-    progressText.textContent = d.running ? `Processing ${d.current}/${d.total}` : `${d.current}/${d.total}`;
-
-    // Update logs
+    let txt = d.running ? `Processing ${d.current}/${d.total}` : `${d.current}/${d.total}`;
+    // Speed + ETA from the average rate since this run started (current/elapsed).
+    // A running average is steadier than an instantaneous per-poll delta and
+    // needs no extra server data. Only shown once at least one file is done.
+    if (d.running && d.current > 0 && STATE.runStartTime) {
+      const elapsed = (Date.now() - STATE.runStartTime) / 1000;
+      if (elapsed > 0) {
+        const rate = d.current / elapsed;
+        const remaining = Math.max(0, d.total - d.current);
+        const eta = rate > 0 ? remaining / rate : 0;
+        txt += `  \u00b7  ${rate.toFixed(1)} img/s \u00b7 ~${fmtDuration(eta)} left`;
+      }
+    }
+    progressText.textContent = txt;
+    
+    // Update logs (incremental). Accumulate the new tail into STATE.logLines,
+    // cap the buffer so a multi-thousand-file run can't grow the DOM without
+    // bound, then re-render. escHtml on every line: log lines embed file
+    // names, and a name like "<img src=x onerror=...>.png" (legal on Linux)
+    // must render as text, not execute.
     if (d.logs && d.logs.length) {
-      // escHtml on every line: log lines embed file names, and a name like
-      // "<img src=x onerror=...>.png" (legal on Linux) must render as text,
-      // not execute.
-      logBox.innerHTML = d.logs.map(l => {
+      for (const l of d.logs) STATE.logLines.push(l);
+      if (STATE.logLines.length > 500) STATE.logLines = STATE.logLines.slice(-500);
+      logBox.innerHTML = STATE.logLines.map(l => {
         let c = 'log-entry';
-        if (l.indexOf('OK ') !== -1 || l.indexOf('✓') !== -1) c += ' ok';
-        else if (l.indexOf('FAILED') !== -1 || l.indexOf('✗') !== -1) c += ' err';
+        if (l.indexOf('OK ') !== -1 || l.indexOf('\u2713') !== -1) c += ' ok';
+        else if (l.indexOf('FAILED') !== -1 || l.indexOf('\u2717') !== -1) c += ' err';
         else if (l.startsWith('  ')) c += ' info';
         return `<div class="${c}">${escHtml(l)}</div>`;
       }).join('');
       logBox.scrollTop = logBox.scrollHeight;
     }
-
+    if (typeof d.log_total === 'number') STATE.logCursor = d.log_total;
+    
     // Check if done
     if (!d.running) {
       clearInterval(STATE.pollTimer);
       cancelBtn.style.display = 'none';
-      if (d.results && d.results.length > 0) {
-        STATE.results = d.results;
+      if (STATE.results.length > 0) {
         STATE.wsName = STATE.files[0]?.thumbnail?.split('/')[3] || '';
         showResults();
-        showPersistentNotice(`Compression complete! ${d.results.filter(r => r.success).length}/${d.results.length} files optimized.`, 'ok');
+        showPersistentNotice(`Compression complete! ${STATE.results.filter(r => r.success).length}/${STATE.results.length} files optimized.`, 'ok');
       } else {
         // e.g. cancelled before any file finished — nothing to show, but
         // Start still needs to become clickable again.
@@ -970,6 +1179,7 @@ function showResults() {
   resultsEmpty.style.display = 'none';
   const results = STATE.results;
   const success = results.filter(r => r.success);
+  const failed = results.filter(r => !r.success);
 
   // Summary
   const totalOrig = success.reduce((s, r) => s + r.original_size, 0);
@@ -999,28 +1209,9 @@ function showResults() {
     </div>
   `;
 
-  // Result cards
-  let html = '';
-  for (const r of results) {
-    if (!r.success) {
-      html += `
-        <div class="result-card" style="opacity:.5">
-          <div class="rname" title="${escHtml(r.name || '')}">✗ ${escHtml(r.name || '')}</div>
-          <div class="rstats">${escHtml(r.error || 'Failed')}</div>
-        </div>`;
-      continue;
-    }
-    const previewUrl = `/api/preview/${STATE.wsName}/${r.id}`;
-
-    html += `
-      <div class="result-card">
-        <div class="rname" title="${escHtml(r.name)}">${escHtml(r.name)}</div>
-        <div class="rstats">${fmtSize(r.original_size)} → ${fmtSize(r.compressed_size)}</div>
-        <div class="rsaved">Saved ${r.savings_percent}%</div>
-        <a class="compare-btn" href="${previewUrl}" target="_blank">Compare</a>
-      </div>`;
-  }
-  resultGrid.innerHTML = html;
+  // Sort/filter toolbar is only useful once there's something to sort.
+  resultToolbar.style.display = results.length ? 'flex' : 'none';
+  renderResultGrid();
 
   // Show output path info
   const outputDir = $('output-dir').value.trim();
@@ -1030,13 +1221,61 @@ function showResults() {
     $('output-path-info').textContent = '';
   }
 
-  // Enable download
-  if (success.length > 0) {
-    downloadBtn.style.display = 'inline-block';
-  }
+  // Enable download (any success) and Retry Failed (any failure).
+  downloadBtn.style.display = success.length > 0 ? 'inline-block' : 'none';
+  retryBtn.style.display = failed.length > 0 ? 'inline-block' : 'none';
+  retryBtn.disabled = false;
   updateStartButtonState();
   progressText.textContent = 'Complete';
 }
+
+// Render the result cards applying the current filter then sort. Reads from
+// STATE.results (never mutates it — default order must survive), so the
+// toolbar can re-render instantly without re-fetching.
+function renderResultGrid() {
+  let rows = STATE.results.slice();
+  if (STATE.resultFilter === 'success') rows = rows.filter(r => r.success);
+  else if (STATE.resultFilter === 'failed') rows = rows.filter(r => !r.success);
+
+  const savedBytes = r => (r.original_size || 0) - (r.compressed_size || 0);
+  switch (STATE.resultSort) {
+    case 'savings_desc': rows.sort((a, b) => (b.savings_percent || 0) - (a.savings_percent || 0)); break;
+    case 'savings_asc': rows.sort((a, b) => (a.savings_percent || 0) - (b.savings_percent || 0)); break;
+    case 'size_desc': rows.sort((a, b) => (b.compressed_size || 0) - (a.compressed_size || 0)); break;
+    case 'saved_desc': rows.sort((a, b) => savedBytes(b) - savedBytes(a)); break;
+    default: break; // 'default' keeps completion order
+  }
+
+  let html = '';
+  for (const r of rows) {
+    if (!r.success) {
+      html += `
+        <div class="result-card" style="opacity:.5">
+          <div class="rname" title="${escHtml(r.name || '')}">✗ ${escHtml(r.name || '')}</div>
+          <div class="rstats">${escHtml(r.error || 'Failed')}</div>
+        </div>`;
+      continue;
+    }
+    const previewUrl = `/api/preview/${STATE.wsName}/${r.id}`;
+    const savedLine = r.skipped
+      ? `<div class="rsaved">Skipped (already optimized)</div>`
+      : `<div class="rsaved">Saved ${r.savings_percent}%</div>`;
+    html += `
+      <div class="result-card">
+        <div class="rname" title="${escHtml(r.name)}">${escHtml(r.name)}</div>
+        <div class="rstats">${fmtSize(r.original_size)} → ${fmtSize(r.compressed_size)}</div>
+        ${savedLine}
+        <a class="compare-btn" href="${previewUrl}" target="_blank">Compare</a>
+      </div>`;
+  }
+  resultGrid.innerHTML = html;
+
+  const total = STATE.results.length, shown = rows.length;
+  resultCountEl.textContent = shown === total ? `${total} file(s)` : `${shown} of ${total} shown`;
+}
+
+resultSortSel.addEventListener('change', () => { STATE.resultSort = resultSortSel.value; renderResultGrid(); });
+resultFilterSel.addEventListener('change', () => { STATE.resultFilter = resultFilterSel.value; renderResultGrid(); });
 
 // Download
 downloadBtn.addEventListener('click', async () => {
@@ -1068,6 +1307,13 @@ resetBtn.addEventListener('click', async () => {
   startBtn.disabled = true;
   fileCountInfo.textContent = '';
   downloadBtn.style.display = 'none';
+  retryBtn.style.display = 'none';
+  resultToolbar.style.display = 'none';
+  resultCountEl.textContent = '';
+  STATE.runStartTime = 0;
+  STATE.resultCursor = 0;
+  STATE.logCursor = 0;
+  STATE.logLines = [];
   $('output-path-info').textContent = '';
   logBox.innerHTML = '';
   progressFill.style.width = '0%';
@@ -1089,6 +1335,15 @@ async function restoreState() {
     showConfigSection();
     if (d.is_running) {
       STATE.isRunning = true;
+      // We didn't see this run start, so treat "now" as t0 for ETA. The
+      // estimate will be rough until a few more files complete under our
+      // own timing, then converge — good enough for a reattach.
+      STATE.runStartTime = Date.now();
+      // Reattaching mid-run: pull from the start so the first poll re-syncs
+      // whatever results/logs already accumulated, then go incremental.
+      STATE.resultCursor = 0;
+      STATE.logCursor = 0;
+      STATE.logLines = [];
       cancelBtn.style.display = '';
       updateStartButtonState();
       STATE.pollTimer = setInterval(pollProgress, 400);
@@ -1102,6 +1357,8 @@ async function restoreState() {
 }
 
 // Init
+applyStoredTheme();
+loadConfig();
 checkHealth();
 loadRecentPaths();
 updateModeDependentControls();
