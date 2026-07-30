@@ -29,6 +29,17 @@ class OptimizeRequest(BaseModel):
     # Whether pngquant should dither (Floyd-Steinberg). Only relevant when
     # compression_mode == "standard".
     dithering: bool = True
+    # Retry mode: re-run only the given file_ids (the previously-failed ones)
+    # without wiping the output dir or discarding earlier successful results.
+    # Default False keeps the normal "fresh full run" behavior (clears output,
+    # replaces results) that every existing caller/test relies on.
+    retry: bool = False
+    # Skip files whose optimized output already exists in output_dir: instead
+    # of recompressing, reuse the existing file (copied back into ws/output so
+    # Compare/preview and the download ZIP still work). Only meaningful with a
+    # persistent output_dir set; a no-op otherwise (the temp workspace starts
+    # empty each run). Default False keeps the normal recompress-everything run.
+    skip_existing: bool = False
 
 
 class FileInfo(BaseModel):
