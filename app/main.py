@@ -88,6 +88,7 @@ class AppState:
         self.total = 0
         self.logs: list = []
         self.cancelled = False
+        self.paused = False
         self.last_seen = time.time()
         self.scan_running = False
         self.scan_current = 0
@@ -109,6 +110,7 @@ class AppState:
         self.total = 0
         self.logs = []
         self.cancelled = False
+        self.paused = False
         self.scan_running = False
         self.scan_current = 0
         self.scan_total = 0
@@ -438,6 +440,7 @@ async def _run_worker_pool(
     *,
     n_workers: Optional[int] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
+    pause_check: Optional[Callable[[], bool]] = None,
     on_item_error: Optional[Callable[[Any, Exception], None]] = None,
     on_item_done: Optional[Callable[[Any], None]] = None,
 ):
@@ -490,27 +493,43 @@ async def _run_worker_pool(
 
     async def worker():
         while True:
+            # Cancel takes precedence over everything (including pause): a
+            # paused-then-cancelled run drains the queue and ends. We check
+            # it first so a worker stuck in the pause loop below still
+            # observes a cancel and exits. See test_cancel_during_pause_ends_run.
+            cancelled = cancel_check and cancel_check()
+            if cancelled:
+                # Drain one item without processing. A cancelled item
+                # intentionally does NOT call on_item_done() — the original
+                # optimize flow didn't bump the progress counter for
+                # cancelled items (only files that actually started
+                # processing counted toward state.current), and that
+                # distinction is how /api/progress reports "current < total"
+                # after a cancel. Bumping here would erase that signal.
+                # See test_cancel_stops_new_work_but_finishes_in_flight.
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                queue.task_done()
+                continue
+            # Soft pause (optimize only): stop SCHEDULING new items, but
+            # anything already in flight (past this gate on another worker)
+            # runs to completion — no subprocess kill, no signal handling.
+            # Sleep briefly rather than busy-spinning; resume latency is one
+            # sleep interval (~50ms). If the queue is already empty there's
+            # nothing held back, so the worker exits (prevents a deadlock
+            # where a paused run with no queued work never completes).
+            if pause_check and pause_check():
+                if queue.empty():
+                    return
+                await asyncio.sleep(0.05)
+                continue
             try:
                 item = queue.get_nowait()
             except asyncio.QueueEmpty:
                 return
-            cancelled = cancel_check and cancel_check()
             try:
-                if cancelled:
-                    # Drain without processing, rather than stopping this one
-                    # worker while others keep pulling — matches the old
-                    # behavior of "never start a new file after Cancel, but
-                    # let everything already in flight finish naturally".
-                    #
-                    # NOTE: a cancelled item intentionally does NOT call
-                    # on_item_done() below — the original optimize flow
-                    # didn't bump the progress counter for cancelled items
-                    # (only files that actually started processing counted
-                    # toward state.current), and that distinction is how
-                    # /api/progress reports "current < total" after a
-                    # cancel. Bumping the counter here would erase that
-                    # signal. See test_cancel_stops_new_work_but_finishes_in_flight.
-                    continue
                 await process_item(item)
             except Exception as e:
                 # Any exception process_item doesn't already catch must be
@@ -518,7 +537,7 @@ async def _run_worker_pool(
                 if on_item_error is not None:
                     on_item_error(item, e)
             finally:
-                if on_item_done is not None and not cancelled:
+                if on_item_done is not None:
                     on_item_done(item)
                 queue.task_done()
 
@@ -799,6 +818,7 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
     state.total = len(files_to_process)
     state.logs = []
     state.cancelled = False
+    state.paused = False
     if data.retry:
         # Retry re-runs only the previously-failed files. Keep every result
         # that isn't being retried (the earlier successes and their outputs
@@ -1052,6 +1072,7 @@ async def _process_files(
             process_one,
             n_workers=CONCURRENT_WORKERS,
             cancel_check=lambda: state.cancelled,
+            pause_check=lambda: state.paused,
             on_item_error=on_item_error,
             on_item_done=on_item_done,
         )
@@ -1098,6 +1119,7 @@ async def get_progress(
     # callers/tests that omit the params see the pre-existing full payload.
     return JSONResponse({
         "running": state.is_running,
+        "paused": state.paused,
         "current": state.current,
         "total": state.total,
         "logs": state.logs[since_log:] if since_log is not None else state.logs[-100:],
@@ -1110,6 +1132,26 @@ async def get_progress(
 @app.post("/api/cancel")
 async def cancel(state: AppState = Depends(get_session), _auth: None = Depends(require_token)):
     state.cancelled = True
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/pause")
+async def pause(state: AppState = Depends(get_session), _auth: None = Depends(require_token)):
+    """Soft pause: the worker pool stops scheduling NEW files, but any file
+    already mid-compression (its pngquant/oxipng subprocess running) finishes
+    naturally — no process kill. Resume drains the rest. Only valid while a
+    run is actually in progress; pausing an idle session is a no-op error."""
+    if not state.is_running:
+        return JSONResponse({"error": "No optimization in progress"}, status_code=400)
+    state.paused = True
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/resume")
+async def resume(state: AppState = Depends(get_session), _auth: None = Depends(require_token)):
+    if not state.paused:
+        return JSONResponse({"error": "Not paused"}, status_code=400)
+    state.paused = False
     return JSONResponse({"ok": True})
 
 

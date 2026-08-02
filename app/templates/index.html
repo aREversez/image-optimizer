@@ -453,7 +453,11 @@ header h1 span { color: var(--accent); }
     <div class="progress-bar"><div class="progress-bar-fill" id="progress-fill"></div></div>
     <div class="progress-info">
       <span id="progress-text">Waiting...</span>
-      <span><button class="btn btn-danger btn-sm" id="cancel-btn" style="display:none;padding:4px 12px;font-size:12px">Cancel</button></span>
+      <span>
+        <button class="btn btn-secondary btn-sm" id="pause-btn" style="display:none;padding:4px 12px;font-size:12px" title="Pause: stop starting new files (in-flight ones finish). Click Resume to continue.">Pause</button>
+        <button class="btn btn-primary btn-sm" id="resume-btn" style="display:none;padding:4px 12px;font-size:12px">Resume</button>
+        <button class="btn btn-danger btn-sm" id="cancel-btn" style="display:none;padding:4px 12px;font-size:12px">Cancel</button>
+      </span>
     </div>
     <div class="log-box" id="log-box"></div>
   </div>
@@ -576,6 +580,8 @@ const dirPath = $('dir-path'),
       progressFill = $('progress-fill'),
       progressText = $('progress-text'),
       cancelBtn = $('cancel-btn'),
+      pauseBtn = $('pause-btn'),
+      resumeBtn = $('resume-btn'),
       escHtml = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'),
       logBox = $('log-box'),
       resultsSection = $('results-section'),
@@ -1052,6 +1058,8 @@ async function runOptimize(ids, opts) {
   progressSection.classList.add('active');
   resultsSection.classList.remove('active');
   cancelBtn.style.display = '';
+  pauseBtn.style.display = '';
+  resumeBtn.style.display = 'none';
   logBox.innerHTML = '';
   progressFill.style.width = '0%';
   progressText.textContent = retry ? 'Retrying...' : 'Starting...';
@@ -1074,6 +1082,8 @@ async function runOptimize(ids, opts) {
       showNotice(d.error, 'err');
       STATE.isRunning = false;
       cancelBtn.style.display = 'none';
+      pauseBtn.style.display = 'none';
+      resumeBtn.style.display = 'none';
       retryBtn.disabled = false;
       updateStartButtonState();
       return;
@@ -1087,6 +1097,8 @@ async function runOptimize(ids, opts) {
     showNotice((retry ? 'Retry failed: ' : 'Start failed: ') + e.message, 'err');
     STATE.isRunning = false;
     cancelBtn.style.display = 'none';
+    pauseBtn.style.display = 'none';
+    resumeBtn.style.display = 'none';
     retryBtn.disabled = false;
     updateStartButtonState();
   }
@@ -1110,6 +1122,8 @@ async function pollProgress() {
     const d = await r.json();
 
     STATE.isRunning = d.running;
+    STATE.isPaused = !!d.paused;
+    setRunButtons(d.running, d.paused);
 
     // Accumulate the incremental results tail. When the cursor is 0 (first
     // poll of a run, or a reattach) we replace; afterwards we append only the
@@ -1176,9 +1190,32 @@ async function pollProgress() {
   }
 }
 
+// Pause/Resume button visibility. Called from pollProgress on every poll:
+// running → Cancel + Pause; paused → Resume; idle → nothing. The SSE
+// transport (when enabled) drives the same function from its events.
+function setRunButtons(running, paused) {
+  if (running) {
+    cancelBtn.style.display = '';
+    pauseBtn.style.display = paused ? 'none' : '';
+    resumeBtn.style.display = paused ? '' : 'none';
+  } else {
+    cancelBtn.style.display = 'none';
+    pauseBtn.style.display = 'none';
+    resumeBtn.style.display = 'none';
+  }
+}
+
 // Cancel
 cancelBtn.addEventListener('click', async () => {
   await apiFetch('/api/cancel', { method: 'POST' });
+});
+
+// Pause / Resume (soft pause: new files stop scheduling, in-flight finish)
+pauseBtn.addEventListener('click', async () => {
+  await apiFetch('/api/pause', { method: 'POST' });
+});
+resumeBtn.addEventListener('click', async () => {
+  await apiFetch('/api/resume', { method: 'POST' });
 });
 
 // Show results
