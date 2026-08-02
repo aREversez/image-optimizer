@@ -40,6 +40,20 @@ class OptimizeRequest(BaseModel):
     # persistent output_dir set; a no-op otherwise (the temp workspace starts
     # empty each run). Default False keeps the normal recompress-everything run.
     skip_existing: bool = False
+    # Retain a curated EXIF subset (camera make/model, date, exposure) in the
+    # output while dropping Orientation (already baked into pixels by
+    # exif_transpose — re-writing it would double-rotate), GPS (privacy), and
+    # MakerNote (bulk). Default False preserves the historical strip-everything
+    # behavior (pngquant --strip / oxipng --strip safe / WebP with no exif=).
+    keep_exif: bool = False
+    # Per-file parameter override: {file_id: {field: value, ...}}. Only the
+    # listed fields override the top-level defaults for that one file; every
+    # other field falls back to the top-level value. Only file_ids the user
+    # manually expanded "advanced settings" on appear here — the common case
+    # (one global setting) sends an empty dict. Field names are fixed (see
+    # OVERRIDEABLE_FIELDS in main.py) so the request shape can't drift between
+    # frontend and backend; unknown fields are rejected with 400.
+    overrides: dict[str, dict] = {}
 
 
 class FileInfo(BaseModel):
@@ -78,3 +92,18 @@ class RecentRemoveRequest(BaseModel):
 
 class RecentClearRequest(BaseModel):
     key: str
+
+
+class PreviewRequest(BaseModel):
+    """Single-file pre-compression dry run. Carries the same compression
+    parameters as OptimizeRequest for one file, but no batch/output
+    controls (no output_dir, skip_existing, retry, file_ids list) — a
+    preview never persists anything. See OPTIMIZATION_PLAN.md §2."""
+    file_id: str
+    quality: str = "medium"
+    max_width: int = 0
+    output_format: str = "png"
+    compression_mode: str = "standard"
+    protected_colors: list[str] = []
+    dithering: bool = True
+    keep_exif: bool = False

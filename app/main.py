@@ -15,13 +15,13 @@ from typing import Any, Awaitable, Callable, List, Optional
 from zipfile import ZipFile
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from PIL import Image
 
 if __package__ is None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.models import OptimizeRequest, RecentClearRequest, RecentRemoveRequest, ScanRequest
+from app.models import OptimizeRequest, PreviewRequest, RecentClearRequest, RecentRemoveRequest, ScanRequest
 from app.optimizer import HEX_COLOR_RE, Optimizer
 
 if getattr(sys, "frozen", False):
@@ -88,6 +88,7 @@ class AppState:
         self.total = 0
         self.logs: list = []
         self.cancelled = False
+        self.paused = False
         self.last_seen = time.time()
         self.scan_running = False
         self.scan_current = 0
@@ -109,6 +110,7 @@ class AppState:
         self.total = 0
         self.logs = []
         self.cancelled = False
+        self.paused = False
         self.scan_running = False
         self.scan_current = 0
         self.scan_total = 0
@@ -235,7 +237,8 @@ def _recent_file() -> Path:
 DEFAULT_CONFIG = {
     "host": "127.0.0.1",
     "port": 8090,
-    "concurrent_workers": 4,   # how many images to compress/thumbnail at once
+    "concurrent_workers": 4,   # how many images to compress at once (pngquant/oxipng/Pillow)
+    "thumbnail_workers": 4,    # how many images to thumbnail at once during a scan
     "workspace_cleanup_delay": 10.0,  # seconds to wait before deleting a replaced workspace
     "session_idle_timeout_hours": 4,  # how long an inactive browser session is kept
 }
@@ -286,6 +289,16 @@ def _load_app_config() -> dict:
             f"using default {DEFAULT_CONFIG['concurrent_workers']}"
         )
         cfg["concurrent_workers"] = DEFAULT_CONFIG["concurrent_workers"]
+    try:
+        cfg["thumbnail_workers"] = int(cfg["thumbnail_workers"])
+        if cfg["thumbnail_workers"] < 1:
+            raise ValueError("thumbnail_workers must be >= 1")
+    except Exception:
+        print(
+            f"[Warning] Invalid config.json 'thumbnail_workers' ({cfg['thumbnail_workers']!r}), "
+            f"using default {DEFAULT_CONFIG['thumbnail_workers']}"
+        )
+        cfg["thumbnail_workers"] = DEFAULT_CONFIG["thumbnail_workers"]
     try:
         cfg["workspace_cleanup_delay"] = float(cfg["workspace_cleanup_delay"])
         if cfg["workspace_cleanup_delay"] < 0:
@@ -427,6 +440,7 @@ async def _run_worker_pool(
     *,
     n_workers: Optional[int] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
+    pause_check: Optional[Callable[[], bool]] = None,
     on_item_error: Optional[Callable[[Any, Exception], None]] = None,
     on_item_done: Optional[Callable[[Any], None]] = None,
 ):
@@ -479,27 +493,43 @@ async def _run_worker_pool(
 
     async def worker():
         while True:
+            # Cancel takes precedence over everything (including pause): a
+            # paused-then-cancelled run drains the queue and ends. We check
+            # it first so a worker stuck in the pause loop below still
+            # observes a cancel and exits. See test_cancel_during_pause_ends_run.
+            cancelled = cancel_check and cancel_check()
+            if cancelled:
+                # Drain one item without processing. A cancelled item
+                # intentionally does NOT call on_item_done() — the original
+                # optimize flow didn't bump the progress counter for
+                # cancelled items (only files that actually started
+                # processing counted toward state.current), and that
+                # distinction is how /api/progress reports "current < total"
+                # after a cancel. Bumping here would erase that signal.
+                # See test_cancel_stops_new_work_but_finishes_in_flight.
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                queue.task_done()
+                continue
+            # Soft pause (optimize only): stop SCHEDULING new items, but
+            # anything already in flight (past this gate on another worker)
+            # runs to completion — no subprocess kill, no signal handling.
+            # Sleep briefly rather than busy-spinning; resume latency is one
+            # sleep interval (~50ms). If the queue is already empty there's
+            # nothing held back, so the worker exits (prevents a deadlock
+            # where a paused run with no queued work never completes).
+            if pause_check and pause_check():
+                if queue.empty():
+                    return
+                await asyncio.sleep(0.05)
+                continue
             try:
                 item = queue.get_nowait()
             except asyncio.QueueEmpty:
                 return
-            cancelled = cancel_check and cancel_check()
             try:
-                if cancelled:
-                    # Drain without processing, rather than stopping this one
-                    # worker while others keep pulling — matches the old
-                    # behavior of "never start a new file after Cancel, but
-                    # let everything already in flight finish naturally".
-                    #
-                    # NOTE: a cancelled item intentionally does NOT call
-                    # on_item_done() below — the original optimize flow
-                    # didn't bump the progress counter for cancelled items
-                    # (only files that actually started processing counted
-                    # toward state.current), and that distinction is how
-                    # /api/progress reports "current < total" after a
-                    # cancel. Bumping the counter here would erase that
-                    # signal. See test_cancel_stops_new_work_but_finishes_in_flight.
-                    continue
                 await process_item(item)
             except Exception as e:
                 # Any exception process_item doesn't already catch must be
@@ -507,7 +537,7 @@ async def _run_worker_pool(
                 if on_item_error is not None:
                     on_item_error(item, e)
             finally:
-                if on_item_done is not None and not cancelled:
+                if on_item_done is not None:
                     on_item_done(item)
                 queue.task_done()
 
@@ -626,6 +656,7 @@ async def _scan_and_thumbnail(state: AppState, directory: Path, recursive: bool)
     await _run_worker_pool(
         [(idx, img_path) for idx, img_path in enumerate(images)],
         process_item,
+        n_workers=THUMBNAIL_WORKERS,
         on_item_error=on_item_error,
         on_item_done=on_item_done,
     )
@@ -782,11 +813,20 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
     if data.output_dir:
         _push_recent("output_dirs", str(Path(data.output_dir).resolve()))
 
+    # Validate per-file overrides before mutating any state — a bad override
+    # must fail the request loudly, not half-start a run. See
+    # _validate_overrides for the field-value/unknown-key/resize_only rules.
+    selected_ids = {f["id"] for f in files_to_process}
+    ov_err = _validate_overrides(data.overrides, selected_ids, data.compression_mode, data.max_width)
+    if ov_err:
+        return JSONResponse({"error": ov_err}, status_code=400)
+
     state.is_running = True
     state.current = 0
     state.total = len(files_to_process)
     state.logs = []
     state.cancelled = False
+    state.paused = False
     if data.retry:
         # Retry re-runs only the previously-failed files. Keep every result
         # that isn't being retried (the earlier successes and their outputs
@@ -823,6 +863,8 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
             data.dithering,
             retry=data.retry,
             skip_existing=data.skip_existing,
+            keep_exif=data.keep_exif,
+            overrides=data.overrides,
         )
     )
 
@@ -830,6 +872,66 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
 
 
 CONCURRENT_WORKERS = 4  # default; overridden by main() from config.json / --workers
+# Compression concurrency knob (alias of CONCURRENT_WORKERS for readability at
+# the call site). Kept as the same name the tests monkeypatch
+# (CONCURRENT_WORKERS) so the existing pause/concurrency tests keep working
+# when they force a single compress worker.
+# THUMBNAIL_WORKERS is the independent scan-thumbnail concurrency knob —
+# splitting the two lets a scan that's I/O-bound on thumbnail generation not
+# starve (or be starved by) a concurrent compression run in another session,
+# and lets each be tuned to the machine. See OPTIMIZATION_PLAN.md §6.
+THUMBNAIL_WORKERS = 4  # default; overridden by main() from config.json / --thumbnail-workers
+
+# Fields a per-file override may set. Fixed list so the request shape can't
+# drift between frontend and backend (see OPTIMIZATION_PLAN.md §3). Unknown
+# fields in an override are rejected with 400 rather than silently ignored —
+# a typo'd "qualitiy" must fail loudly, not silently do nothing.
+OVERRIDEABLE_FIELDS = (
+    "quality", "compression_mode", "max_width", "dithering",
+    "protected_colors", "keep_exif", "output_format",
+)
+
+
+def _validate_overrides(overrides: dict, selected_ids: set, top_mode: str, top_width: int) -> Optional[str]:
+    """Validate every per-file override entry. Returns an error string on the
+    first problem, or None if all entries are well-formed.
+
+    Field-value checks (enum/colors/unknown-keys) run for EVERY entry, even
+    ids not in the selection — a typo in an override for a deselected file is
+    still a typo worth reporting. The resize_only+max_width cross-check only
+    runs for selected ids: an override on an unselected file has no effect,
+    so complaining about it would be a false positive."""
+    for fid, ov in overrides.items():
+        if not isinstance(ov, dict):
+            return f"Override for file {fid!r} must be an object"
+        bad_keys = [k for k in ov if k not in OVERRIDEABLE_FIELDS]
+        if bad_keys:
+            return (f"Unknown override field(s) for file {fid!r}: {bad_keys}. "
+                    f"Supported: {list(OVERRIDEABLE_FIELDS)}")
+        if "quality" in ov and ov["quality"] not in ("high", "medium", "low"):
+            return f"Invalid quality in override for file {fid!r}: {ov['quality']!r}"
+        if "compression_mode" in ov and ov["compression_mode"] not in ("standard", "lossless", "resize_only"):
+            return f"Invalid compression_mode in override for file {fid!r}: {ov['compression_mode']!r}"
+        if "output_format" in ov and ov["output_format"] not in ("png", "webp"):
+            return f"Invalid output_format in override for file {fid!r}: {ov['output_format']!r}"
+        if "max_width" in ov and (not isinstance(ov["max_width"], int) or isinstance(ov["max_width"], bool) or ov["max_width"] < 0):
+            return f"Invalid max_width in override for file {fid!r}: {ov['max_width']!r}"
+        if "dithering" in ov and not isinstance(ov["dithering"], bool):
+            return f"Invalid dithering in override for file {fid!r} (must be bool)"
+        if "keep_exif" in ov and not isinstance(ov["keep_exif"], bool):
+            return f"Invalid keep_exif in override for file {fid!r} (must be bool)"
+        if "protected_colors" in ov:
+            bc = [c for c in ov["protected_colors"] if not HEX_COLOR_RE.match(str(c).strip())]
+            if bc:
+                return f"Invalid color(s) in override for file {fid!r}: {', '.join(bc)}"
+        # resize_only needs a max_width — check the effective combination, but
+        # only for files actually being processed.
+        if fid in selected_ids:
+            eff_mode = ov.get("compression_mode", top_mode)
+            eff_width = ov.get("max_width", top_width)
+            if eff_mode == "resize_only" and eff_width <= 0:
+                return f"Resize Only mode requires Max Width (override for file {fid!r})"
+    return None
 
 
 async def _process_files(
@@ -844,11 +946,15 @@ async def _process_files(
     dithering: bool = True,
     retry: bool = False,
     skip_existing: bool = False,
+    keep_exif: bool = False,
+    overrides: Optional[dict] = None,
 ):
     if optimizer is None:
         state.logs.append("Optimizer not initialized")
         state.is_running = False
         return
+
+    overrides = overrides or {}
 
     ws = state.workspace
     opt_output_dir = ws / "output"
@@ -888,7 +994,11 @@ async def _process_files(
     out_paths: dict[str, Optional[Path]] = {}
     used_names: set[str] = set()
     for file_info in files:
-        base = (opt_output_dir / file_info["name"]).with_suffix(f".{output_format}")
+        # A per-file output_format override changes this file's suffix (and
+        # thus its output path / collision slot). Different suffixes don't
+        # collide ("photo.png" vs "photo.webp"), which is correct.
+        eff_fmt = overrides.get(file_info["id"], {}).get("output_format", output_format)
+        base = (opt_output_dir / file_info["name"]).with_suffix(f".{eff_fmt}")
         candidate = base
         n = 2
         while str(candidate).lower() in used_names:
@@ -916,12 +1026,27 @@ async def _process_files(
             raise ValueError("unsafe file name escapes the output directory")
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # Resolve this file's effective parameters: a per-file override
+        # (overrides[file_id]) wins for any field it lists, otherwise the
+        # top-level defaults apply. out_path was already allocated with the
+        # effective output_format, so they stay consistent.
+        ov = overrides.get(file_info["id"], {})
+        eff_quality = ov.get("quality", quality)
+        eff_max_width = ov.get("max_width", max_width)
+        eff_compression_mode = ov.get("compression_mode", compression_mode)
+        eff_protected_colors = ov.get("protected_colors", protected_colors)
+        eff_dithering = ov.get("dithering", dithering)
+        eff_keep_exif = ov.get("keep_exif", keep_exif)
+        eff_output_format = ov.get("output_format", output_format)
+
         # Skip-already-optimized: if the user re-runs against the same output
         # folder and this file's target is already there, reuse it instead of
         # paying pngquant/oxipng again. We still copy it back into ws/output so
         # Compare/preview (/api/result) and the download ZIP keep working — the
         # copy is cheap next to a re-compress. No-op without output_dir (the
         # temp workspace is wiped/empty each fresh run, nothing to reuse).
+        # Note: a skipped file is NOT recompressed, so per-file overrides are
+        # intentionally ignored on the skip path (the existing output stands).
         if skip_existing and output_dir:
             rel = out_path.relative_to(opt_output_dir)
             dest = Path(output_dir) / rel
@@ -934,7 +1059,7 @@ async def _process_files(
                     "id": file_info["id"],
                     "name": file_info["name"],
                     "original_path": file_info["path"],
-                    "output_format": output_format,
+                    "output_format": eff_output_format,
                     "output_name": str(rel),
                     "success": True,
                     "skipped": True,
@@ -952,19 +1077,20 @@ async def _process_files(
         result = await optimizer.optimize_png(
             input_path=input_path,
             output_path=out_path,
-            quality=quality,
-            max_width=max_width,
-            compression_mode=compression_mode,
-            protected_colors=protected_colors,
-            dithering=dithering,
-            output_format=output_format,
+            quality=eff_quality,
+            max_width=eff_max_width,
+            compression_mode=eff_compression_mode,
+            protected_colors=eff_protected_colors,
+            dithering=eff_dithering,
+            output_format=eff_output_format,
             progress_callback=log,
+            keep_exif=eff_keep_exif,
         )
 
         result["id"] = file_info["id"]
         result["name"] = file_info["name"]
         result["original_path"] = file_info["path"]
-        result["output_format"] = output_format
+        result["output_format"] = eff_output_format
         # The actual output location relative to ws/output — may differ
         # from name+suffix when a collision was disambiguated above, so
         # consumers (e.g. /api/preview) must use this instead of
@@ -1026,7 +1152,9 @@ async def _process_files(
         await _run_worker_pool(
             files,
             process_one,
+            n_workers=CONCURRENT_WORKERS,
             cancel_check=lambda: state.cancelled,
+            pause_check=lambda: state.paused,
             on_item_error=on_item_error,
             on_item_done=on_item_done,
         )
@@ -1073,6 +1201,7 @@ async def get_progress(
     # callers/tests that omit the params see the pre-existing full payload.
     return JSONResponse({
         "running": state.is_running,
+        "paused": state.paused,
         "current": state.current,
         "total": state.total,
         "logs": state.logs[since_log:] if since_log is not None else state.logs[-100:],
@@ -1082,10 +1211,225 @@ async def get_progress(
     })
 
 
+def _sse_format(event_type: str, data, eid: Optional[str]) -> str:
+    """Format one SSE message. `id` (when given) encodes the cumulative
+    (result, log) cursor as `r{R}:l{L}` so a client can reattach via
+    Last-Event-ID and replay only the tail — same cursor semantics the
+    polling /api/progress endpoint uses with since_result/since_log."""
+    import json as _json
+    parts = []
+    if eid is not None:
+        parts.append(f"id: {eid}")
+    parts.append(f"event: {event_type}")
+    parts.append(f"data: {_json.dumps(data)}")
+    return "\n".join(parts) + "\n\n"
+
+
+@app.get("/api/events")
+async def events(request: Request, state: AppState = Depends(get_session)):
+    """SSE progress transport — the streaming counterpart to /api/progress.
+
+    Emits `result`, `log`, and `done` events. Each carries an `id` of the
+    form `r{R}:l{L}` (results seen : logs seen), so a client that drops and
+    reconnects sends `Last-Event-ID` and the server replays only the tail —
+    reattach for a page refresh. The HTTP polling endpoint stays as the
+    automatic fallback (SSE can be buffered/dropped by some proxies); the
+    two read the same state so they always agree.
+
+    No app-token requirement (mirrors /api/progress — both are read-only,
+    and EventSource can't send custom headers anyway). Session-scoped via
+    the cookie EventSource sends same-origin.
+
+    A `: keepalive` comment is emitted every few idle seconds so
+    intermediate proxies don't time out an open but quiet connection."""
+    last_id = request.headers.get("last-event-id", "")
+    r_cur, l_cur = 0, 0
+    if last_id:
+        for part in last_id.split(":"):
+            if part.startswith("r"):
+                try:
+                    r_cur = max(0, int(part[1:]))
+                except ValueError:
+                    r_cur = 0
+            elif part.startswith("l"):
+                try:
+                    l_cur = max(0, int(part[1:]))
+                except ValueError:
+                    l_cur = 0
+
+    async def event_stream():
+        nonlocal r_cur, l_cur
+        last_emit = time.time()
+        while True:
+            # Emit any new results since the cursor.
+            for res in state.results[r_cur:]:
+                r_cur += 1
+                yield _sse_format("result", res, f"r{r_cur}:l{l_cur}")
+                last_emit = time.time()
+            # Emit any new log lines since the cursor.
+            for line in state.logs[l_cur:]:
+                l_cur += 1
+                yield _sse_format("log", {"line": line}, f"r{r_cur}:l{l_cur}")
+                last_emit = time.time()
+
+            if not state.is_running:
+                # The run's finally block sets is_running=False BEFORE
+                # appending the final "Done!" summary log, so sleep a beat
+                # and drain once more to catch it, then close with `done`.
+                await asyncio.sleep(0.05)
+                for res in state.results[r_cur:]:
+                    r_cur += 1
+                    yield _sse_format("result", res, f"r{r_cur}:l{l_cur}")
+                for line in state.logs[l_cur:]:
+                    l_cur += 1
+                    yield _sse_format("log", {"line": line}, f"r{r_cur}:l{l_cur}")
+                yield _sse_format("done", {
+                    "running": False,
+                    "paused": state.paused,
+                    "current": state.current,
+                    "total": state.total,
+                    "result_total": len(state.results),
+                    "log_total": len(state.logs),
+                }, f"r{r_cur}:l{l_cur}")
+                return
+
+            # Heartbeat: if nothing was emitted for a while, send a comment
+            # so proxies buffering idle connections don't drop the stream.
+            if time.time() - last_emit > 5:
+                yield ": keepalive\n\n"
+                last_emit = time.time()
+            await asyncio.sleep(0.1)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
+
+
 @app.post("/api/cancel")
 async def cancel(state: AppState = Depends(get_session), _auth: None = Depends(require_token)):
     state.cancelled = True
     return JSONResponse({"ok": True})
+
+
+@app.post("/api/pause")
+async def pause(state: AppState = Depends(get_session), _auth: None = Depends(require_token)):
+    """Soft pause: the worker pool stops scheduling NEW files, but any file
+    already mid-compression (its pngquant/oxipng subprocess running) finishes
+    naturally — no process kill. Resume drains the rest. Only valid while a
+    run is actually in progress; pausing an idle session is a no-op error."""
+    if not state.is_running:
+        return JSONResponse({"error": "No optimization in progress"}, status_code=400)
+    state.paused = True
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/resume")
+async def resume(state: AppState = Depends(get_session), _auth: None = Depends(require_token)):
+    if not state.paused:
+        return JSONResponse({"error": "Not paused"}, status_code=400)
+    state.paused = False
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/preview-optimize")
+async def preview_optimize(data: PreviewRequest, state: AppState = Depends(get_session), _auth: None = Depends(require_token)):
+    """Single-file dry run: project the compressed size of one file under
+    the current settings WITHOUT touching the batch state machine.
+
+    Reuses `optimizer.optimize_png` but writes to a temp file under
+    ws/preview (never ws/output, which the download ZIP rglobs), measures
+    the size, then deletes the temp. Must NOT mutate state.results /
+    state.current / state.total / state.output_version / state.logs /
+    state.is_running, and must NOT copy anything into a persistent
+    output_dir. See OPTIMIZATION_PLAN.md §2.
+
+    Allowed while a batch is running — it only contends for the optimizer
+    semaphore, never for batch state. The progress_callback is a no-op so
+    preview progress doesn't leak into the batch's live log."""
+    if optimizer is None:
+        return JSONResponse({"error": "Optimizer not initialized"}, status_code=503)
+    # Same enum validation as /api/optimize, so a preview reflects what the
+    # real run would actually accept (a typo'd mode fails here, not silently).
+    if data.compression_mode not in ("standard", "lossless", "resize_only"):
+        return JSONResponse({"error": "Invalid compression_mode"}, status_code=400)
+    if data.quality not in ("high", "medium", "low"):
+        return JSONResponse(
+            {"error": f"Invalid quality: {data.quality!r}. Supported: 'high', 'medium', 'low'."},
+            status_code=400,
+        )
+    if data.output_format not in ("png", "webp"):
+        return JSONResponse(
+            {"error": f"Unsupported output_format: {data.output_format!r}. Supported: 'png', 'webp'."},
+            status_code=400,
+        )
+    if data.compression_mode == "resize_only" and data.max_width <= 0:
+        return JSONResponse(
+            {"error": "Resize Only mode requires Max Width to be set"}, status_code=400
+        )
+    bad_colors = [c for c in data.protected_colors if not HEX_COLOR_RE.match(c.strip())]
+    if bad_colors:
+        return JSONResponse(
+            {"error": f"Invalid color(s) in Protect Colors: {', '.join(bad_colors)}. Use hex format like #2ecc71."},
+            status_code=400,
+        )
+
+    file_info = next((f for f in state.files if f.get("id") == data.file_id), None)
+    if file_info is None:
+        return JSONResponse({"error": "File not found"}, status_code=404)
+    if not state.workspace:
+        return JSONResponse({"error": "No active workspace"}, status_code=400)
+
+    preview_dir = state.workspace / "preview"
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    out_path = preview_dir / f"{data.file_id}.{data.output_format}"
+    try:
+        out_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    input_path = Path(file_info["path"])
+    original_size = input_path.stat().st_size if input_path.exists() else 0
+
+    async def _noop_progress(_msg):
+        pass
+
+    try:
+        result = await optimizer.optimize_png(
+            input_path=input_path,
+            output_path=out_path,
+            quality=data.quality,
+            max_width=data.max_width,
+            compression_mode=data.compression_mode,
+            protected_colors=data.protected_colors,
+            dithering=data.dithering,
+            output_format=data.output_format,
+            progress_callback=_noop_progress,
+            keep_exif=data.keep_exif,
+        )
+    finally:
+        # Best-effort cleanup of the preview temp. optimize_png's own
+        # finally-sweep already removes its *.src.png/*.pngquant.png/etc
+        # sidecars; this removes the final output file too so ws/preview
+        # never accumulates and can't leak into anything.
+        try:
+            out_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    compressed_size = result.get("compressed_size", 0) if result.get("success") else 0
+    savings = original_size - compressed_size
+    pct = round(savings / original_size * 100, 1) if original_size > 0 else 0
+    return JSONResponse({
+        "success": result["success"],
+        "original_size": original_size,
+        "compressed_size": compressed_size,
+        "savings": savings,
+        "savings_percent": pct,
+        "error": result.get("error"),
+        "warning": result.get("warning"),
+    })
 
 
 @app.get("/api/source-file/{ws_name}/{file_id}")
@@ -1459,9 +1803,16 @@ def main():
     )
     parser.add_argument(
         "--workers", type=int, default=config["concurrent_workers"],
-        help=f"How many images to process concurrently (default {config['concurrent_workers']}, "
+        help=f"How many images to compress concurrently (default {config['concurrent_workers']}, "
              f"or set 'concurrent_workers' in {_config_file()}). Lower this if pngquant/oxipng "
              f"are already maxing out your CPU; raise it on a many-core machine.",
+    )
+    parser.add_argument(
+        "--thumbnail-workers", type=int, default=config["thumbnail_workers"],
+        help=f"How many images to thumbnail concurrently during a scan (default "
+             f"{config['thumbnail_workers']}, or set 'thumbnail_workers' in {_config_file()}). "
+             f"Independent from --workers so a scan's I/O-bound thumbnailing can be tuned "
+             f"separately from CPU-bound compression.",
     )
     parser.add_argument("--dir", help="Directory to auto-scan on startup")
     # Defaults to True to match the historical CLI behavior — the UI checkbox
@@ -1478,8 +1829,9 @@ def main():
     )
     args = parser.parse_args()
 
-    global CONCURRENT_WORKERS, WORKSPACE_CLEANUP_DELAY, SESSION_IDLE_TIMEOUT
+    global CONCURRENT_WORKERS, THUMBNAIL_WORKERS, WORKSPACE_CLEANUP_DELAY, SESSION_IDLE_TIMEOUT
     CONCURRENT_WORKERS = max(1, args.workers)
+    THUMBNAIL_WORKERS = max(1, args.thumbnail_workers)
     WORKSPACE_CLEANUP_DELAY = config["workspace_cleanup_delay"]
     SESSION_IDLE_TIMEOUT = config["session_idle_timeout_hours"] * 3600
 

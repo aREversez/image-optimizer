@@ -62,9 +62,12 @@ python -m app --host 127.0.0.1 --port 8090 --workers 4 --dir "D:\screenshots"
 
 - `--host` — listen address (default `127.0.0.1`, see Security below)
 - `--port` — listen port (default `8090`; if taken, the next free port is used automatically)
-- `--workers` — how many images to process/thumbnail concurrently (default `4`).
+- `--workers` — how many images to compress concurrently (default `4`).
   Lower this if pngquant/oxipng are already maxing out your CPU; raise it on a
   many-core machine for faster batches.
+- `--thumbnail-workers` — how many images to thumbnail concurrently during a
+  scan (default `4`). Independent from `--workers`, so a scan's I/O-bound
+  thumbnailing can be tuned separately from CPU-bound compression.
 - `--dir` — auto-scan this folder on startup
 - `--recursive` / `--no-recursive` — when used with `--dir`, whether to
   scan subfolders too (default `--recursive`, the historical behavior).
@@ -83,6 +86,7 @@ start from scratch with:
   "host": "127.0.0.1",
   "port": 8090,
   "concurrent_workers": 4,
+  "thumbnail_workers": 4,
   "workspace_cleanup_delay": 10.0,
   "session_idle_timeout_hours": 4
 }

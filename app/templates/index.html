@@ -216,6 +216,37 @@ header h1 span { color: var(--accent); }
   font-size: 11px; color: transparent; transition: all .2s;
 }
 .file-card.selected .check { background: var(--accent); border-color: var(--accent); color: #000; }
+.file-card .preview-btn {
+  position: absolute; bottom: 4px; right: 4px;
+  font-size: 10px; padding: 2px 6px; border-radius: 4px;
+  border: 1px solid var(--border); background: var(--card); color: var(--text2);
+  cursor: pointer; white-space: nowrap; max-width: calc(100% - 12px);
+  overflow: hidden; text-overflow: ellipsis; transition: opacity .15s;
+  opacity: 0;
+}
+.file-card:hover .preview-btn, .file-card .preview-btn:not(:disabled) { opacity: .9; }
+.file-card .preview-btn:hover { opacity: 1; border-color: var(--accent); color: var(--accent); }
+.file-card .preview-btn:disabled { cursor: default; opacity: .8; }
+.file-card .card-gear {
+  position: absolute; top: 4px; left: 4px;
+  font-size: 12px; width: 20px; height: 20px; line-height: 18px;
+  border-radius: 50%; border: 1px solid var(--border); background: rgba(0,0,0,.5);
+  color: var(--text2); cursor: pointer; padding: 0; opacity: 0; transition: opacity .15s;
+}
+.file-card:hover .card-gear { opacity: .85; }
+.file-card .card-gear:hover { opacity: 1; color: var(--accent); border-color: var(--accent); }
+.file-card.has-override .card-gear { opacity: 1; color: var(--accent); border-color: var(--accent); }
+.file-card .file-override {
+  position: absolute; left: 0; right: 0; bottom: 0; z-index: 2;
+  background: var(--card); border-top: 1px solid var(--border);
+  padding: 4px 6px; font-size: 10px; display: flex; flex-direction: column; gap: 2px;
+}
+.file-card .fo-row { display: flex; align-items: center; gap: 4px; }
+.file-card .fo-label { width: 42px; color: var(--text2); flex-shrink: 0; }
+.file-card .fo-row select, .file-card .fo-row input {
+  flex: 1; min-width: 0; font-size: 10px; padding: 1px 2px;
+  background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 3px;
+}
 .file-list-empty {
   text-align: center; padding: 30px; color: var(--text2); white-space: nowrap;
 }
@@ -351,6 +382,10 @@ header h1 span { color: var(--accent); }
       title="When re-running against the same output folder, files already optimized there are reused instead of being recompressed. Only applies when an output folder is set.">
       <input type="checkbox" id="skip-existing" /> Skip files already in the output folder
     </label>
+    <label class="check-row" style="margin-top:8px;cursor:pointer;user-select:none;font-size:13px;display:flex;align-items:center;gap:4px"
+      title="Keep a curated subset of EXIF metadata (camera make/model, date, exposure) in the output. GPS coordinates, Orientation (already baked into the pixels), and bulky MakerNote are dropped. Off by default — turn on only if you need the metadata preserved.">
+      <input type="checkbox" id="keep-exif" /> Keep EXIF metadata (camera info, date; GPS stripped)
+    </label>
   </div>
 
   <!-- Config + Action -->
@@ -449,7 +484,11 @@ header h1 span { color: var(--accent); }
     <div class="progress-bar"><div class="progress-bar-fill" id="progress-fill"></div></div>
     <div class="progress-info">
       <span id="progress-text">Waiting...</span>
-      <span><button class="btn btn-danger btn-sm" id="cancel-btn" style="display:none;padding:4px 12px;font-size:12px">Cancel</button></span>
+      <span>
+        <button class="btn btn-secondary btn-sm" id="pause-btn" style="display:none;padding:4px 12px;font-size:12px" title="Pause: stop starting new files (in-flight ones finish). Click Resume to continue.">Pause</button>
+        <button class="btn btn-primary btn-sm" id="resume-btn" style="display:none;padding:4px 12px;font-size:12px">Resume</button>
+        <button class="btn btn-danger btn-sm" id="cancel-btn" style="display:none;padding:4px 12px;font-size:12px">Cancel</button>
+      </span>
     </div>
     <div class="log-box" id="log-box"></div>
   </div>
@@ -503,6 +542,7 @@ const STATE = {
   resultCursor: 0,      // # of results already pulled (incremental /api/progress)
   logCursor: 0,         // # of log lines already pulled
   logLines: [],         // accumulated log lines (capped for display)
+  fileOverrides: {},    // {file_id: {field: value}} — per-file settings that override the globals; only files the user expanded get an entry
 };
 
 // DOM refs
@@ -572,6 +612,8 @@ const dirPath = $('dir-path'),
       progressFill = $('progress-fill'),
       progressText = $('progress-text'),
       cancelBtn = $('cancel-btn'),
+      pauseBtn = $('pause-btn'),
+      resumeBtn = $('resume-btn'),
       escHtml = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'),
       logBox = $('log-box'),
       resultsSection = $('results-section'),
@@ -650,6 +692,7 @@ function saveConfig() {
       protectColors: protectColorsInput.value,
       recursive: $('recursive-scan').checked,
       skipExisting: $('skip-existing').checked,
+      keepExif: $('keep-exif').checked,
     };
     localStorage.setItem('imgopt.config', JSON.stringify(cfg));
   } catch (e) { /* storage unavailable/full — non-critical */ }
@@ -674,6 +717,7 @@ function loadConfig() {
   if (typeof cfg.protectColors === 'string') protectColorsInput.value = cfg.protectColors;
   if (typeof cfg.recursive === 'boolean') $('recursive-scan').checked = cfg.recursive;
   if (typeof cfg.skipExisting === 'boolean') $('skip-existing').checked = cfg.skipExisting;
+  if (typeof cfg.keepExif === 'boolean') $('keep-exif').checked = cfg.keepExif;
 }
 // Save on any config change. updateModeDependentControls (bound separately
 // for format/mode) also recomputes disabled states; saveConfig is additive.
@@ -684,6 +728,7 @@ ditheringInput.addEventListener('change', saveConfig);
 protectColorsInput.addEventListener('input', saveConfig);
 $('recursive-scan').addEventListener('change', saveConfig);
 $('skip-existing').addEventListener('change', saveConfig);
+$('keep-exif').addEventListener('change', saveConfig);
 
 // Health check
 async function checkHealth() {
@@ -912,6 +957,14 @@ async function uploadFiles(files) {
 // Render file grid
 function renderFiles() {
   const files = STATE.files;
+  // Drop override entries for ids no longer present (e.g. after a re-scan
+  // of a different folder). Keeps STATE.fileOverrides in sync with the
+  // current file set without wiping the user's per-file edits on a mere
+  // re-render (same ids are preserved).
+  const ids = new Set(files.map(f => f.id));
+  for (const k of Object.keys(STATE.fileOverrides)) {
+    if (!ids.has(k)) delete STATE.fileOverrides[k];
+  }
   if (!files.length) {
     fileGrid.innerHTML = '';
     filesEmpty.textContent = 'No images found';
@@ -929,6 +982,29 @@ function renderFiles() {
         <div class="fname" title="${escHtml(f.name)}">${escHtml(f.name)}</div>
         <div class="fsize">${fmtSize(f.size)}</div>
         <div class="check">✓</div>
+        <button class="card-gear" type="button" title="Per-file settings (override the global quality/mode for just this file)"
+          onclick="event.stopPropagation(); toggleFileOverride('${f.id}', this)">⚙</button>
+        <button class="preview-btn" type="button"
+          title="Run a single-file dry run with the current settings to project the compressed size. Does not affect results or the download ZIP."
+          onclick="event.stopPropagation(); previewFile('${f.id}', this)">Preview</button>
+        <div class="file-override" data-id="${f.id}" hidden onclick="event.stopPropagation()">
+          <div class="fo-row">
+            <span class="fo-label">Quality</span>
+            <select data-field="quality" onchange="setFileOverride('${f.id}')">
+              <option value="">inherit</option><option value="high">high</option><option value="medium">medium</option><option value="low">low</option>
+            </select>
+          </div>
+          <div class="fo-row">
+            <span class="fo-label">Mode</span>
+            <select data-field="compression_mode" onchange="setFileOverride('${f.id}')">
+              <option value="">inherit</option><option value="standard">standard</option><option value="lossless">lossless</option><option value="resize_only">resize only</option>
+            </select>
+          </div>
+          <div class="fo-row">
+            <span class="fo-label">Width</span>
+            <input type="number" min="0" data-field="max_width" placeholder="inherit" oninput="setFileOverride('${f.id}')">
+          </div>
+        </div>
       </div>
     `;
   }
@@ -945,6 +1021,84 @@ function toggleFile(id) {
   const all = fileGrid.querySelectorAll('.file-card');
   const sel = fileGrid.querySelectorAll('.file-card.selected');
   selectAll.checked = all.length === sel.length;
+}
+
+// Single-file dry run: projects the compressed size of one file under the
+// current settings WITHOUT touching the results list or the download ZIP
+// (server-side it writes to ws/preview, not ws/output, then deletes it).
+// Reads the same controls runOptimize uses so the projection matches what
+// a real run would produce for this file.
+async function previewFile(id, btn) {
+  if (STATE.isRunning) { showNotice('Wait for the current run to finish before previewing.', 'err'); return; }
+  const quality = document.querySelector('input[name="quality"]:checked').value;
+  const maxWidth = parseInt($('max-width').value);
+  const format = document.querySelector('input[name="format"]:checked').value;
+  const compressionMode = document.querySelector('input[name="mode"]:checked').value;
+  const protectedColors = protectColorsInput.value.split(',').map(s => s.trim()).filter(Boolean);
+  const dithering = ditheringInput.checked;
+  const keepExif = $('keep-exif').checked;
+  const prevText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '...';
+  try {
+    const r = await apiFetch('/api/preview-optimize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        file_id: id, quality, max_width: maxWidth, output_format: format,
+        compression_mode: compressionMode, protected_colors: protectedColors,
+        dithering, keep_exif: keepExif,
+      }),
+    });
+    const d = await r.json();
+    if (!r.ok || d.error) {
+      btn.textContent = 'failed';
+      showNotice(d.error || 'Preview failed', 'err');
+    } else {
+      // Show projected size + savings; reverts after a few seconds.
+      btn.textContent = `${fmtSize(d.compressed_size)} (-${d.savings_percent}%)`;
+    }
+  } catch (e) {
+    btn.textContent = 'failed';
+  } finally {
+    btn.disabled = false;
+    setTimeout(() => { if (btn.textContent !== 'Preview') btn.textContent = 'Preview'; }, 4000);
+  }
+}
+
+// Per-file override UI: clicking the gear toggles a small panel where the
+// user sets quality/mode/width for just this file. Empty/"inherit" values
+// are dropped, so STATE.fileOverrides only holds files with at least one
+// non-default field — exactly the "only override files the user manually
+// expanded" rule from the review. The whole map is sent on Start; the
+// server ignores entries for unselected ids.
+function toggleFileOverride(id, gearBtn) {
+  const card = fileGrid.querySelector(`.file-card[data-id="${id}"]`);
+  if (!card) return;
+  const panel = card.querySelector('.file-override');
+  const willShow = panel.hasAttribute('hidden');
+  if (willShow) panel.removeAttribute('hidden'); else panel.setAttribute('hidden', '');
+  // Pre-fill the panel from any existing override for this file.
+  const ov = STATE.fileOverrides[id] || {};
+  card.querySelectorAll('.file-override [data-field]').forEach(el => {
+    el.value = ov[el.dataset.field] != null ? ov[el.dataset.field] : '';
+  });
+}
+function setFileOverride(id) {
+  const card = fileGrid.querySelector(`.file-card[data-id="${id}"]`);
+  if (!card) return;
+  const ov = {};
+  card.querySelectorAll('.file-override [data-field]').forEach(el => {
+    const v = el.value.trim();
+    if (v !== '') ov[el.dataset.field] = el.dataset.field === 'max_width' ? parseInt(v) : v;
+  });
+  if (Object.keys(ov).length) {
+    STATE.fileOverrides[id] = ov;
+    card.classList.add('has-override');
+  } else {
+    delete STATE.fileOverrides[id];
+    card.classList.remove('has-override');
+  }
 }
 
 selectAll.addEventListener('change', () => {
@@ -1030,6 +1184,7 @@ async function runOptimize(ids, opts) {
 
   STATE.isRunning = true;
   STATE.runStartTime = Date.now();
+  STATE.total = ids.length;
   if (!retry) STATE.results = [];
   // Incremental-poll cursors always restart at 0 for a new run: the server's
   // state.results is the source of truth (on retry it already holds the
@@ -1038,6 +1193,9 @@ async function runOptimize(ids, opts) {
   STATE.resultCursor = 0;
   STATE.logCursor = 0;
   STATE.logLines = [];
+  // Clean up any transport left over from a previous run before starting fresh.
+  if (STATE.pollTimer) { clearInterval(STATE.pollTimer); STATE.pollTimer = null; }
+  stopSSE();
 
   dismissPersistentNotice();
 
@@ -1045,6 +1203,8 @@ async function runOptimize(ids, opts) {
   progressSection.classList.add('active');
   resultsSection.classList.remove('active');
   cancelBtn.style.display = '';
+  pauseBtn.style.display = '';
+  resumeBtn.style.display = 'none';
   logBox.innerHTML = '';
   progressFill.style.width = '0%';
   progressText.textContent = retry ? 'Retrying...' : 'Starting...';
@@ -1059,6 +1219,8 @@ async function runOptimize(ids, opts) {
         file_ids: ids, quality, max_width: maxWidth, output_format: format, output_dir: outputDir,
         compression_mode: compressionMode, protected_colors: protectedColors, dithering, retry,
         skip_existing: $('skip-existing').checked,
+        keep_exif: $('keep-exif').checked,
+        overrides: STATE.fileOverrides,
       }),
     });
     const d = await r.json();
@@ -1066,19 +1228,24 @@ async function runOptimize(ids, opts) {
       showNotice(d.error, 'err');
       STATE.isRunning = false;
       cancelBtn.style.display = 'none';
+      pauseBtn.style.display = 'none';
+      resumeBtn.style.display = 'none';
       retryBtn.disabled = false;
       updateStartButtonState();
       return;
     }
     if (d.warning) showNotice(d.warning, 'info');
 
-    // Poll progress
-    STATE.pollTimer = setInterval(pollProgress, 400);
+    // Stream progress over SSE (primary); falls back to polling
+    // automatically on connect failure or sustained silence.
+    startSSE();
     loadRecentPaths();
   } catch(e) {
     showNotice((retry ? 'Retry failed: ' : 'Start failed: ') + e.message, 'err');
     STATE.isRunning = false;
     cancelBtn.style.display = 'none';
+    pauseBtn.style.display = 'none';
+    resumeBtn.style.display = 'none';
     retryBtn.disabled = false;
     updateStartButtonState();
   }
@@ -1102,6 +1269,8 @@ async function pollProgress() {
     const d = await r.json();
 
     STATE.isRunning = d.running;
+    STATE.isPaused = !!d.paused;
+    setRunButtons(d.running, d.paused);
 
     // Accumulate the incremental results tail. When the cursor is 0 (first
     // poll of a run, or a reattach) we replace; afterwards we append only the
@@ -1112,65 +1281,149 @@ async function pollProgress() {
     }
     if (typeof d.result_total === 'number') STATE.resultCursor = d.result_total;
 
-    // Update progress bar
-    const pct = d.total > 0 ? Math.round(d.current / d.total * 100) : 0;
-    progressFill.style.width = pct + '%';
-    let txt = d.running ? `Processing ${d.current}/${d.total}` : `${d.current}/${d.total}`;
-    // Speed + ETA from the average rate since this run started (current/elapsed).
-    // A running average is steadier than an instantaneous per-poll delta and
-    // needs no extra server data. Only shown once at least one file is done.
-    if (d.running && d.current > 0 && STATE.runStartTime) {
-      const elapsed = (Date.now() - STATE.runStartTime) / 1000;
-      if (elapsed > 0) {
-        const rate = d.current / elapsed;
-        const remaining = Math.max(0, d.total - d.current);
-        const eta = rate > 0 ? remaining / rate : 0;
-        txt += `  \u00b7  ${rate.toFixed(1)} img/s \u00b7 ~${fmtDuration(eta)} left`;
-      }
-    }
-    progressText.textContent = txt;
-    
-    // Update logs (incremental). Accumulate the new tail into STATE.logLines,
-    // cap the buffer so a multi-thousand-file run can't grow the DOM without
-    // bound, then re-render. escHtml on every line: log lines embed file
-    // names, and a name like "<img src=x onerror=...>.png" (legal on Linux)
-    // must render as text, not execute.
+    renderProgressBar(d.running, d.paused, d.current, d.total);
     if (d.logs && d.logs.length) {
       for (const l of d.logs) STATE.logLines.push(l);
-      if (STATE.logLines.length > 500) STATE.logLines = STATE.logLines.slice(-500);
-      logBox.innerHTML = STATE.logLines.map(l => {
-        let c = 'log-entry';
-        if (l.indexOf('OK ') !== -1 || l.indexOf('\u2713') !== -1) c += ' ok';
-        else if (l.indexOf('FAILED') !== -1 || l.indexOf('\u2717') !== -1) c += ' err';
-        else if (l.startsWith('  ')) c += ' info';
-        return `<div class="${c}">${escHtml(l)}</div>`;
-      }).join('');
-      logBox.scrollTop = logBox.scrollHeight;
+      renderLogs();
     }
     if (typeof d.log_total === 'number') STATE.logCursor = d.log_total;
-    
-    // Check if done
+
     if (!d.running) {
-      clearInterval(STATE.pollTimer);
-      cancelBtn.style.display = 'none';
-      if (STATE.results.length > 0) {
-        STATE.wsName = STATE.files[0]?.thumbnail?.split('/')[3] || '';
-        showResults();
-        showPersistentNotice(`Compression complete! ${STATE.results.filter(r => r.success).length}/${STATE.results.length} files optimized.`, 'ok');
-      } else {
-        // e.g. cancelled before any file finished — nothing to show, but
-        // Start still needs to become clickable again.
-        updateStartButtonState();
-      }
+      finalizeRun();
     }
   } catch(e) {
     // ignore poll errors
   }
 }
 
+// --- SSE transport (primary) with polling fallback ---
+// EventSource streams result/log/done events; if it errors or goes silent
+// for several seconds (proxy buffering, paused run), we drop to the polling
+// path above automatically. Both read the same server state, so the user
+// sees consistent progress either way. See OPTIMIZATION_PLAN.md §5.
+let sseSource = null, sseWatchdog = null, sseLastMsg = 0, usingSSE = false;
+const SSE_SILENCE_MS = 8000;
+
+function startSSE() {
+  usingSSE = true;
+  sseLastMsg = Date.now();
+  try {
+    sseSource = new EventSource('/api/events');
+  } catch (e) {
+    fallbackToPolling();
+    return;
+  }
+  sseSource.addEventListener('result', e => {
+    sseLastMsg = Date.now();
+    try { STATE.results.push(JSON.parse(e.data)); } catch (_) {}
+    setRunButtons(true, false);
+    renderProgressBar(true, false, STATE.results.length, STATE.total);
+  });
+  sseSource.addEventListener('log', e => {
+    sseLastMsg = Date.now();
+    try { STATE.logLines.push(JSON.parse(e.data).line); } catch (_) {}
+    renderLogs();
+  });
+  sseSource.addEventListener('done', e => {
+    sseLastMsg = Date.now();
+    let d = {};
+    try { d = JSON.parse(e.data); } catch (_) {}
+    STATE.isRunning = false;
+    stopSSE();
+    renderProgressBar(false, false, d.current != null ? d.current : STATE.results.length, d.total != null ? d.total : STATE.total);
+    finalizeRun();
+  });
+  sseSource.onerror = () => { fallbackToPolling(); };
+  // Watchdog: silent too long → a proxy may be buffering the stream, or the
+  // run is paused (SSE sends only heartbeats then). Polling reports the full
+  // state (including paused) so fall back rather than look frozen.
+  sseWatchdog = setInterval(() => {
+    if (usingSSE && Date.now() - sseLastMsg > SSE_SILENCE_MS) fallbackToPolling();
+  }, 2000);
+}
+
+function stopSSE() {
+  usingSSE = false;
+  if (sseSource) { sseSource.close(); sseSource = null; }
+  if (sseWatchdog) { clearInterval(sseWatchdog); sseWatchdog = null; }
+}
+
+function fallbackToPolling() {
+  stopSSE();
+  if (!STATE.pollTimer && STATE.isRunning) {
+    STATE.pollTimer = setInterval(pollProgress, 400);
+  }
+}
+
+// Shared render helpers used by both the SSE path and the polling fallback.
+function setRunButtons(running, paused) {
+  if (running) {
+    cancelBtn.style.display = '';
+    pauseBtn.style.display = paused ? 'none' : '';
+    resumeBtn.style.display = paused ? '' : 'none';
+  } else {
+    cancelBtn.style.display = 'none';
+    pauseBtn.style.display = 'none';
+    resumeBtn.style.display = 'none';
+  }
+}
+
+function renderProgressBar(running, paused, current, total) {
+  const pct = total > 0 ? Math.round(current / total * 100) : 0;
+  progressFill.style.width = pct + '%';
+  let txt = running ? (paused ? `Paused ${current}/${total}` : `Processing ${current}/${total}`) : `${current}/${total}`;
+  if (running && !paused && current > 0 && STATE.runStartTime) {
+    const elapsed = (Date.now() - STATE.runStartTime) / 1000;
+    if (elapsed > 0) {
+      const rate = current / elapsed;
+      const remaining = Math.max(0, total - current);
+      const eta = rate > 0 ? remaining / rate : 0;
+      txt += `  \u00b7  ${rate.toFixed(1)} img/s \u00b7 ~${fmtDuration(eta)} left`;
+    }
+  }
+  progressText.textContent = txt;
+}
+
+function renderLogs() {
+  if (STATE.logLines.length > 500) STATE.logLines = STATE.logLines.slice(-500);
+  // escHtml on every line: log lines embed file names, and a name like
+  // "<img src=x onerror=...>.png" (legal on Linux) must render as text.
+  logBox.innerHTML = STATE.logLines.map(l => {
+    let c = 'log-entry';
+    if (l.indexOf('OK ') !== -1 || l.indexOf('\u2713') !== -1) c += ' ok';
+    else if (l.indexOf('FAILED') !== -1 || l.indexOf('\u2717') !== -1) c += ' err';
+    else if (l.startsWith('  ')) c += ' info';
+    return `<div class="${c}">${escHtml(l)}</div>`;
+  }).join('');
+  logBox.scrollTop = logBox.scrollHeight;
+}
+
+function finalizeRun() {
+  if (STATE.pollTimer) { clearInterval(STATE.pollTimer); STATE.pollTimer = null; }
+  stopSSE();
+  setRunButtons(false, false);
+  if (STATE.results.length > 0) {
+    STATE.wsName = STATE.files[0]?.thumbnail?.split('/')[3] || '';
+    showResults();
+    showPersistentNotice(`Compression complete! ${STATE.results.filter(r => r.success).length}/${STATE.results.length} files optimized.`, 'ok');
+  } else {
+    // e.g. cancelled before any file finished — nothing to show, but
+    // Start still needs to become clickable again.
+    updateStartButtonState();
+  }
+}
+
 // Cancel
 cancelBtn.addEventListener('click', async () => {
   await apiFetch('/api/cancel', { method: 'POST' });
+});
+
+// Pause / Resume (soft pause: new files stop scheduling, in-flight finish)
+pauseBtn.addEventListener('click', async () => {
+  await apiFetch('/api/pause', { method: 'POST' });
+});
+resumeBtn.addEventListener('click', async () => {
+  await apiFetch('/api/resume', { method: 'POST' });
 });
 
 // Show results
@@ -1346,7 +1599,10 @@ async function restoreState() {
       STATE.logLines = [];
       cancelBtn.style.display = '';
       updateStartButtonState();
-      STATE.pollTimer = setInterval(pollProgress, 400);
+      // Reattach via SSE (primary): a fresh EventSource replays from r0:l0
+      // so the client re-syncs everything accumulated so far, then continues
+      // live. Falls back to polling on failure/silence.
+      startSSE();
     } else if (d.results && d.results.length) {
       STATE.results = d.results;
       showResults();

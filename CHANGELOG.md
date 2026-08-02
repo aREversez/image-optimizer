@@ -2,6 +2,52 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+Six features from the August 2026 project review. Each shipped test-first
+with a regression test that exposes its cross-cutting interaction with the
+existing batch state machine (`skip_existing` / `retry` / narrowed
+`file_ids` / `output_version`). Full design notes in `OPTIMIZATION_PLAN.md`.
+
+### Added
+- **EXIF metadata retention** (`keep_exif`, default off). When on, a curated
+  EXIF subset (camera make/model, date, exposure) is retained in the output;
+  Orientation (already baked into pixels by `exif_transpose` — re-writing it
+  would double-rotate), GPS (privacy), and MakerNote (bulk) are dropped.
+  Works for both PNG (eXIf chunk injected after pngquant/oxipng strip) and
+  WebP (Pillow `exif=` arg). UI toggle next to "Skip files already in the
+  output folder".
+- **Pre-compression preview** (`POST /api/preview-optimize`). Single-file
+  dry run that projects the compressed size under the current settings
+  without touching `state.results` / `output_version` / the download ZIP
+  (writes to `ws/preview`, not `ws/output`, then deletes). Per-file
+  "Preview" button in the file grid.
+- **Per-file parameter override** (`overrides: {file_id: {field: value}}`).
+  A per-file form (gear icon on each file card) overrides quality / mode /
+  width / dithering / protected colors / keep_exif / output format for just
+  that file; everything else inherits the global setting. Fixed field set
+  (unknown fields rejected with 400). `out_paths` collision resolution and
+  `skip_existing` reuse both honor the per-file format.
+- **Pause / Resume** (soft pause). `POST /api/pause` stops scheduling new
+  files; in-flight pngquant/oxipng subprocesses finish naturally (no kill).
+  `POST /api/resume` drains the rest. Cancel takes precedence over pause.
+  `/api/progress` reports `paused`. Pause/Resume buttons in the progress bar.
+- **SSE progress transport** (`GET /api/events`). Streams `result` / `log` /
+  `done` events with `id: r{R}:l{L}` cursor ids; a client reconnects with
+  `Last-Event-ID` to replay only the tail (reattach after a refresh). The
+  HTTP polling path stays as an automatic fallback (SSE connect failure or
+  sustained silence → polling). Shared render helpers keep both transports
+  visually identical.
+- **Split compress vs thumbnail concurrency.** New `thumbnail_workers`
+  config key and `--thumbnail-workers` CLI flag size the scan-thumbnail
+  pool independently from `concurrent_workers` / `--workers` (compress).
+  `tests/bench_workers.py` benchmarks scan+compress across knob combos.
+
+### Tests
+- 47 new tests across `test_exif.py`, `test_preview_optimize.py`,
+  `test_overrides.py`, `test_pause.py`, `test_worker_split.py`,
+  `test_sse.py`. The full suite (147 tests) passes.
+
 ## [1.0.2] - 2026-07-28
 
 ### Security
