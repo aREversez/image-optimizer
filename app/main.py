@@ -21,7 +21,7 @@ from PIL import Image
 if __package__ is None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.models import OptimizeRequest, RecentClearRequest, RecentRemoveRequest, ScanRequest
+from app.models import OptimizeRequest, PreviewRequest, RecentClearRequest, RecentRemoveRequest, ScanRequest
 from app.optimizer import HEX_COLOR_RE, Optimizer
 
 if getattr(sys, "frozen", False):
@@ -1235,6 +1235,105 @@ async def resume(state: AppState = Depends(get_session), _auth: None = Depends(r
         return JSONResponse({"error": "Not paused"}, status_code=400)
     state.paused = False
     return JSONResponse({"ok": True})
+
+
+@app.post("/api/preview-optimize")
+async def preview_optimize(data: PreviewRequest, state: AppState = Depends(get_session), _auth: None = Depends(require_token)):
+    """Single-file dry run: project the compressed size of one file under
+    the current settings WITHOUT touching the batch state machine.
+
+    Reuses `optimizer.optimize_png` but writes to a temp file under
+    ws/preview (never ws/output, which the download ZIP rglobs), measures
+    the size, then deletes the temp. Must NOT mutate state.results /
+    state.current / state.total / state.output_version / state.logs /
+    state.is_running, and must NOT copy anything into a persistent
+    output_dir. See OPTIMIZATION_PLAN.md §2.
+
+    Allowed while a batch is running — it only contends for the optimizer
+    semaphore, never for batch state. The progress_callback is a no-op so
+    preview progress doesn't leak into the batch's live log."""
+    if optimizer is None:
+        return JSONResponse({"error": "Optimizer not initialized"}, status_code=503)
+    # Same enum validation as /api/optimize, so a preview reflects what the
+    # real run would actually accept (a typo'd mode fails here, not silently).
+    if data.compression_mode not in ("standard", "lossless", "resize_only"):
+        return JSONResponse({"error": "Invalid compression_mode"}, status_code=400)
+    if data.quality not in ("high", "medium", "low"):
+        return JSONResponse(
+            {"error": f"Invalid quality: {data.quality!r}. Supported: 'high', 'medium', 'low'."},
+            status_code=400,
+        )
+    if data.output_format not in ("png", "webp"):
+        return JSONResponse(
+            {"error": f"Unsupported output_format: {data.output_format!r}. Supported: 'png', 'webp'."},
+            status_code=400,
+        )
+    if data.compression_mode == "resize_only" and data.max_width <= 0:
+        return JSONResponse(
+            {"error": "Resize Only mode requires Max Width to be set"}, status_code=400
+        )
+    bad_colors = [c for c in data.protected_colors if not HEX_COLOR_RE.match(c.strip())]
+    if bad_colors:
+        return JSONResponse(
+            {"error": f"Invalid color(s) in Protect Colors: {', '.join(bad_colors)}. Use hex format like #2ecc71."},
+            status_code=400,
+        )
+
+    file_info = next((f for f in state.files if f.get("id") == data.file_id), None)
+    if file_info is None:
+        return JSONResponse({"error": "File not found"}, status_code=404)
+    if not state.workspace:
+        return JSONResponse({"error": "No active workspace"}, status_code=400)
+
+    preview_dir = state.workspace / "preview"
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    out_path = preview_dir / f"{data.file_id}.{data.output_format}"
+    try:
+        out_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    input_path = Path(file_info["path"])
+    original_size = input_path.stat().st_size if input_path.exists() else 0
+
+    async def _noop_progress(_msg):
+        pass
+
+    try:
+        result = await optimizer.optimize_png(
+            input_path=input_path,
+            output_path=out_path,
+            quality=data.quality,
+            max_width=data.max_width,
+            compression_mode=data.compression_mode,
+            protected_colors=data.protected_colors,
+            dithering=data.dithering,
+            output_format=data.output_format,
+            progress_callback=_noop_progress,
+            keep_exif=data.keep_exif,
+        )
+    finally:
+        # Best-effort cleanup of the preview temp. optimize_png's own
+        # finally-sweep already removes its *.src.png/*.pngquant.png/etc
+        # sidecars; this removes the final output file too so ws/preview
+        # never accumulates and can't leak into anything.
+        try:
+            out_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    compressed_size = result.get("compressed_size", 0) if result.get("success") else 0
+    savings = original_size - compressed_size
+    pct = round(savings / original_size * 100, 1) if original_size > 0 else 0
+    return JSONResponse({
+        "success": result["success"],
+        "original_size": original_size,
+        "compressed_size": compressed_size,
+        "savings": savings,
+        "savings_percent": pct,
+        "error": result.get("error"),
+        "warning": result.get("warning"),
+    })
 
 
 @app.get("/api/source-file/{ws_name}/{file_id}")

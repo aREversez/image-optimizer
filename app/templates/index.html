@@ -216,6 +216,17 @@ header h1 span { color: var(--accent); }
   font-size: 11px; color: transparent; transition: all .2s;
 }
 .file-card.selected .check { background: var(--accent); border-color: var(--accent); color: #000; }
+.file-card .preview-btn {
+  position: absolute; bottom: 4px; right: 4px;
+  font-size: 10px; padding: 2px 6px; border-radius: 4px;
+  border: 1px solid var(--border); background: var(--card); color: var(--text2);
+  cursor: pointer; white-space: nowrap; max-width: calc(100% - 12px);
+  overflow: hidden; text-overflow: ellipsis; transition: opacity .15s;
+  opacity: 0;
+}
+.file-card:hover .preview-btn, .file-card .preview-btn:not(:disabled) { opacity: .9; }
+.file-card .preview-btn:hover { opacity: 1; border-color: var(--accent); color: var(--accent); }
+.file-card .preview-btn:disabled { cursor: default; opacity: .8; }
 .file-card .card-gear {
   position: absolute; top: 4px; left: 4px;
   font-size: 12px; width: 20px; height: 20px; line-height: 18px;
@@ -973,6 +984,9 @@ function renderFiles() {
         <div class="check">✓</div>
         <button class="card-gear" type="button" title="Per-file settings (override the global quality/mode for just this file)"
           onclick="event.stopPropagation(); toggleFileOverride('${f.id}', this)">⚙</button>
+        <button class="preview-btn" type="button"
+          title="Run a single-file dry run with the current settings to project the compressed size. Does not affect results or the download ZIP."
+          onclick="event.stopPropagation(); previewFile('${f.id}', this)">Preview</button>
         <div class="file-override" data-id="${f.id}" hidden onclick="event.stopPropagation()">
           <div class="fo-row">
             <span class="fo-label">Quality</span>
@@ -1007,6 +1021,49 @@ function toggleFile(id) {
   const all = fileGrid.querySelectorAll('.file-card');
   const sel = fileGrid.querySelectorAll('.file-card.selected');
   selectAll.checked = all.length === sel.length;
+}
+
+// Single-file dry run: projects the compressed size of one file under the
+// current settings WITHOUT touching the results list or the download ZIP
+// (server-side it writes to ws/preview, not ws/output, then deletes it).
+// Reads the same controls runOptimize uses so the projection matches what
+// a real run would produce for this file.
+async function previewFile(id, btn) {
+  if (STATE.isRunning) { showNotice('Wait for the current run to finish before previewing.', 'err'); return; }
+  const quality = document.querySelector('input[name="quality"]:checked').value;
+  const maxWidth = parseInt($('max-width').value);
+  const format = document.querySelector('input[name="format"]:checked').value;
+  const compressionMode = document.querySelector('input[name="mode"]:checked').value;
+  const protectedColors = protectColorsInput.value.split(',').map(s => s.trim()).filter(Boolean);
+  const dithering = ditheringInput.checked;
+  const keepExif = $('keep-exif').checked;
+  const prevText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '...';
+  try {
+    const r = await apiFetch('/api/preview-optimize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        file_id: id, quality, max_width: maxWidth, output_format: format,
+        compression_mode: compressionMode, protected_colors: protectedColors,
+        dithering, keep_exif: keepExif,
+      }),
+    });
+    const d = await r.json();
+    if (!r.ok || d.error) {
+      btn.textContent = 'failed';
+      showNotice(d.error || 'Preview failed', 'err');
+    } else {
+      // Show projected size + savings; reverts after a few seconds.
+      btn.textContent = `${fmtSize(d.compressed_size)} (-${d.savings_percent}%)`;
+    }
+  } catch (e) {
+    btn.textContent = 'failed';
+  } finally {
+    btn.disabled = false;
+    setTimeout(() => { if (btn.textContent !== 'Preview') btn.textContent = 'Preview'; }, 4000);
+  }
 }
 
 // Per-file override UI: clicking the gear toggles a small panel where the
