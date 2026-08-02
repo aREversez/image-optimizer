@@ -2,6 +2,7 @@
   "host": "127.0.0.1",
   "port": 8090,
   "concurrent_workers": 4,
+  "thumbnail_workers": 4,
   "workspace_cleanup_delay": 10.0,
   "session_idle_timeout_hours": 4
 }

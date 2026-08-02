@@ -235,7 +235,8 @@ def _recent_file() -> Path:
 DEFAULT_CONFIG = {
     "host": "127.0.0.1",
     "port": 8090,
-    "concurrent_workers": 4,   # how many images to compress/thumbnail at once
+    "concurrent_workers": 4,   # how many images to compress at once (pngquant/oxipng/Pillow)
+    "thumbnail_workers": 4,    # how many images to thumbnail at once during a scan
     "workspace_cleanup_delay": 10.0,  # seconds to wait before deleting a replaced workspace
     "session_idle_timeout_hours": 4,  # how long an inactive browser session is kept
 }
@@ -286,6 +287,16 @@ def _load_app_config() -> dict:
             f"using default {DEFAULT_CONFIG['concurrent_workers']}"
         )
         cfg["concurrent_workers"] = DEFAULT_CONFIG["concurrent_workers"]
+    try:
+        cfg["thumbnail_workers"] = int(cfg["thumbnail_workers"])
+        if cfg["thumbnail_workers"] < 1:
+            raise ValueError("thumbnail_workers must be >= 1")
+    except Exception:
+        print(
+            f"[Warning] Invalid config.json 'thumbnail_workers' ({cfg['thumbnail_workers']!r}), "
+            f"using default {DEFAULT_CONFIG['thumbnail_workers']}"
+        )
+        cfg["thumbnail_workers"] = DEFAULT_CONFIG["thumbnail_workers"]
     try:
         cfg["workspace_cleanup_delay"] = float(cfg["workspace_cleanup_delay"])
         if cfg["workspace_cleanup_delay"] < 0:
@@ -626,6 +637,7 @@ async def _scan_and_thumbnail(state: AppState, directory: Path, recursive: bool)
     await _run_worker_pool(
         [(idx, img_path) for idx, img_path in enumerate(images)],
         process_item,
+        n_workers=THUMBNAIL_WORKERS,
         on_item_error=on_item_error,
         on_item_done=on_item_done,
     )
@@ -830,6 +842,15 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
 
 
 CONCURRENT_WORKERS = 4  # default; overridden by main() from config.json / --workers
+# Compression concurrency knob (alias of CONCURRENT_WORKERS for readability at
+# the call site). Kept as the same name the tests monkeypatch
+# (CONCURRENT_WORKERS) so the existing pause/concurrency tests keep working
+# when they force a single compress worker.
+# THUMBNAIL_WORKERS is the independent scan-thumbnail concurrency knob —
+# splitting the two lets a scan that's I/O-bound on thumbnail generation not
+# starve (or be starved by) a concurrent compression run in another session,
+# and lets each be tuned to the machine. See OPTIMIZATION_PLAN.md §6.
+THUMBNAIL_WORKERS = 4  # default; overridden by main() from config.json / --thumbnail-workers
 
 
 async def _process_files(
@@ -1026,6 +1047,7 @@ async def _process_files(
         await _run_worker_pool(
             files,
             process_one,
+            n_workers=CONCURRENT_WORKERS,
             cancel_check=lambda: state.cancelled,
             on_item_error=on_item_error,
             on_item_done=on_item_done,
@@ -1459,9 +1481,16 @@ def main():
     )
     parser.add_argument(
         "--workers", type=int, default=config["concurrent_workers"],
-        help=f"How many images to process concurrently (default {config['concurrent_workers']}, "
+        help=f"How many images to compress concurrently (default {config['concurrent_workers']}, "
              f"or set 'concurrent_workers' in {_config_file()}). Lower this if pngquant/oxipng "
              f"are already maxing out your CPU; raise it on a many-core machine.",
+    )
+    parser.add_argument(
+        "--thumbnail-workers", type=int, default=config["thumbnail_workers"],
+        help=f"How many images to thumbnail concurrently during a scan (default "
+             f"{config['thumbnail_workers']}, or set 'thumbnail_workers' in {_config_file()}). "
+             f"Independent from --workers so a scan's I/O-bound thumbnailing can be tuned "
+             f"separately from CPU-bound compression.",
     )
     parser.add_argument("--dir", help="Directory to auto-scan on startup")
     # Defaults to True to match the historical CLI behavior — the UI checkbox
@@ -1478,8 +1507,9 @@ def main():
     )
     args = parser.parse_args()
 
-    global CONCURRENT_WORKERS, WORKSPACE_CLEANUP_DELAY, SESSION_IDLE_TIMEOUT
+    global CONCURRENT_WORKERS, THUMBNAIL_WORKERS, WORKSPACE_CLEANUP_DELAY, SESSION_IDLE_TIMEOUT
     CONCURRENT_WORKERS = max(1, args.workers)
+    THUMBNAIL_WORKERS = max(1, args.thumbnail_workers)
     WORKSPACE_CLEANUP_DELAY = config["workspace_cleanup_delay"]
     SESSION_IDLE_TIMEOUT = config["session_idle_timeout_hours"] * 3600
 
