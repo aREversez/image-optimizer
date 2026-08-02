@@ -351,6 +351,10 @@ header h1 span { color: var(--accent); }
       title="When re-running against the same output folder, files already optimized there are reused instead of being recompressed. Only applies when an output folder is set.">
       <input type="checkbox" id="skip-existing" /> Skip files already in the output folder
     </label>
+    <label class="check-row" style="margin-top:8px;cursor:pointer;user-select:none;font-size:13px;display:flex;align-items:center;gap:4px"
+      title="Keep a curated subset of EXIF metadata (camera make/model, date, exposure) in the output. GPS coordinates, Orientation (already baked into the pixels), and bulky MakerNote are dropped. Off by default — turn on only if you need the metadata preserved.">
+      <input type="checkbox" id="keep-exif" /> Keep EXIF metadata (camera info, date; GPS stripped)
+    </label>
   </div>
 
   <!-- Config + Action -->
@@ -650,6 +654,7 @@ function saveConfig() {
       protectColors: protectColorsInput.value,
       recursive: $('recursive-scan').checked,
       skipExisting: $('skip-existing').checked,
+      keepExif: $('keep-exif').checked,
     };
     localStorage.setItem('imgopt.config', JSON.stringify(cfg));
   } catch (e) { /* storage unavailable/full — non-critical */ }
@@ -674,6 +679,7 @@ function loadConfig() {
   if (typeof cfg.protectColors === 'string') protectColorsInput.value = cfg.protectColors;
   if (typeof cfg.recursive === 'boolean') $('recursive-scan').checked = cfg.recursive;
   if (typeof cfg.skipExisting === 'boolean') $('skip-existing').checked = cfg.skipExisting;
+  if (typeof cfg.keepExif === 'boolean') $('keep-exif').checked = cfg.keepExif;
 }
 // Save on any config change. updateModeDependentControls (bound separately
 // for format/mode) also recomputes disabled states; saveConfig is additive.
@@ -684,6 +690,7 @@ ditheringInput.addEventListener('change', saveConfig);
 protectColorsInput.addEventListener('input', saveConfig);
 $('recursive-scan').addEventListener('change', saveConfig);
 $('skip-existing').addEventListener('change', saveConfig);
+$('keep-exif').addEventListener('change', saveConfig);
 
 // Health check
 async function checkHealth() {
@@ -1059,6 +1066,7 @@ async function runOptimize(ids, opts) {
         file_ids: ids, quality, max_width: maxWidth, output_format: format, output_dir: outputDir,
         compression_mode: compressionMode, protected_colors: protectedColors, dithering, retry,
         skip_existing: $('skip-existing').checked,
+        keep_exif: $('keep-exif').checked,
       }),
     });
     const d = await r.json();

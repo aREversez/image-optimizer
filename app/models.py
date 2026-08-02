@@ -40,6 +40,12 @@ class OptimizeRequest(BaseModel):
     # persistent output_dir set; a no-op otherwise (the temp workspace starts
     # empty each run). Default False keeps the normal recompress-everything run.
     skip_existing: bool = False
+    # Retain a curated EXIF subset (camera make/model, date, exposure) in the
+    # output while dropping Orientation (already baked into pixels by
+    # exif_transpose — re-writing it would double-rotate), GPS (privacy), and
+    # MakerNote (bulk). Default False preserves the historical strip-everything
+    # behavior (pngquant --strip / oxipng --strip safe / WebP with no exif=).
+    keep_exif: bool = False
 
 
 class FileInfo(BaseModel):

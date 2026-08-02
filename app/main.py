@@ -835,6 +835,7 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
             data.dithering,
             retry=data.retry,
             skip_existing=data.skip_existing,
+            keep_exif=data.keep_exif,
         )
     )
 
@@ -865,6 +866,7 @@ async def _process_files(
     dithering: bool = True,
     retry: bool = False,
     skip_existing: bool = False,
+    keep_exif: bool = False,
 ):
     if optimizer is None:
         state.logs.append("Optimizer not initialized")
@@ -980,6 +982,7 @@ async def _process_files(
             dithering=dithering,
             output_format=output_format,
             progress_callback=log,
+            keep_exif=keep_exif,
         )
 
         result["id"] = file_info["id"]

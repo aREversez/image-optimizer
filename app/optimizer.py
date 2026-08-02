@@ -4,8 +4,10 @@ import asyncio
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
+import zlib
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -13,6 +15,16 @@ from PIL import Image, ImageOps
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 HEX_COLOR_RE = re.compile(r"^#?[0-9A-Fa-f]{6}$")
+
+# EXIF tag ids used by the retention logic (see OPTIMIZATION_PLAN.md §1).
+# Orientation is stripped because `exif_transpose` already bakes it into
+# the pixel grid — re-writing it would double-rotate in any reader that
+# honors EXIF orientation. GPSInfo is dropped for privacy (images may be
+# publicly shared). MakerNote is vendor-specific bulk with no display value.
+EXIF_TAG_ORIENTATION = 0x0112
+EXIF_TAG_GPS_INFO = 0x8825
+EXIF_TAG_EXIF_IFD = 0x8769
+EXIF_TAG_MAKER_NOTE = 0x927C
 
 
 class Optimizer:
@@ -114,6 +126,14 @@ class Optimizer:
             img = ImageOps.exif_transpose(img)
             if img.mode == "CMYK":
                 img = img.convert("RGB")
+            # Drop EXIF at normalization. The compress pipeline
+            # (pngquant --strip / oxipng --strip safe) strips it anyway in
+            # production, but the test stand-in binaries only copy bytes
+            # through — removing it here keeps default (keep_exif=False)
+            # behavior deterministic across both. A cleaned copy is
+            # re-attached at the very end of the pipeline only when
+            # keep_exif=True (see _finalize_png_exif / _optimize_webp).
+            img.info.pop("exif", None)
             img.save(dst, format="PNG")
 
     @staticmethod
@@ -125,6 +145,7 @@ class Optimizer:
             ratio = max_width / w
             new_size = (max_width, int(h * ratio))
             img = img.resize(new_size, Image.Resampling.LANCZOS)
+            img.info.pop("exif", None)
             img.save(dst, format="PNG")
 
     @staticmethod
@@ -148,6 +169,99 @@ class Optimizer:
         img.save(dst, format="PNG")
         return True
 
+    # --- EXIF retention helpers (see OPTIMIZATION_PLAN.md §1) ---
+    @staticmethod
+    def _clean_exif(exif) -> None:
+        """Strip EXIF fields that must NOT survive into optimized output.
+        Mutates the PIL Exif object in place.
+
+        - Orientation: `exif_transpose` already baked it into the pixels;
+          re-writing it would double-rotate in any reader honoring EXIF.
+        - GPSInfo: privacy — full GPS retention isn't wanted by default
+          for images that may be publicly shared.
+        - MakerNote: vendor-specific bulk, no display value.
+        """
+        exif.pop(EXIF_TAG_ORIENTATION, None)
+        exif.pop(EXIF_TAG_GPS_INFO, None)
+        try:
+            exif.get_ifd(EXIF_TAG_EXIF_IFD).pop(EXIF_TAG_MAKER_NOTE, None)
+        except Exception:
+            # ExifIFD may be absent; nothing to clean there.
+            pass
+
+    @staticmethod
+    def _capture_cleaned_exif(src: Path) -> bytes:
+        """Read the source's EXIF, drop the sensitive/redundant tags, and
+        return the cleaned bytes (raw TIFF, starting with the II/MM byte
+        order mark — ready for a PNG eXIf chunk or a WebP exif= save arg).
+        Returns b"" if the source has no EXIF or can't be read — callers
+        treat that as 'no EXIF to attach' and skip the finalize step.
+
+        PIL's `Exif.tobytes()` prepends the JPEG APP1 `Exif\\x00\\x00`
+        marker; that prefix is wrong for both the PNG eXIf chunk and
+        WebP's exif= arg (both want raw TIFF), so it's stripped here."""
+        try:
+            with Image.open(src) as img:
+                exif = img.getexif()
+                if not exif:
+                    return b""
+                Optimizer._clean_exif(exif)
+                raw = exif.tobytes() if exif else b""
+                if raw.startswith(b"Exif\x00\x00"):
+                    raw = raw[6:]
+                return raw
+        except Exception:
+            return b""
+
+    @staticmethod
+    def _strip_png_chunks(data: bytes, chunk_type: bytes) -> bytes:
+        """Return `data` (a PNG file's bytes) with every chunk of
+        `chunk_type` removed. Walks the chunk stream once, stops at IEND.
+        Malformed input is returned with whatever was reconstructed up to
+        the break — never raises."""
+        out = bytearray(data[:8])  # PNG signature
+        pos = 8
+        n = len(data)
+        while pos + 8 <= n:
+            length = int.from_bytes(data[pos:pos + 4], "big")
+            ctype = data[pos + 4:pos + 8]
+            total = 8 + length + 4  # length field + type + data + crc
+            if pos + total > n:
+                break  # malformed/truncated — bail
+            if ctype != chunk_type:
+                out += data[pos:pos + total]
+            if ctype == b"IEND":
+                break
+            pos += total
+        return bytes(out)
+
+    @staticmethod
+    def _finalize_png_exif(png_path: Path, exif_bytes: bytes) -> None:
+        """Attach cleaned EXIF to a finished PNG by inserting a single
+        eXIf chunk before IEND. Any pre-existing eXIf chunks are removed
+        first, so the result is deterministic regardless of what the
+        compress pipeline left behind (real pngquant/oxipng strip
+        metadata; the test stand-in binaries copy it through). Best-effort:
+        never raises into the caller — a failure to attach EXIF must not
+        turn a successful compression into a failure."""
+        if not exif_bytes or exif_bytes[:2] not in (b"II", b"MM"):
+            return
+        try:
+            data = png_path.read_bytes()
+            if data[:8] != PNG_MAGIC:
+                return
+            data = Optimizer._strip_png_chunks(data, b"eXIf")
+            chunk_body = exif_bytes
+            chunk = struct.pack(">I", len(chunk_body)) + b"eXIf" + chunk_body
+            chunk += struct.pack(">I", zlib.crc32(b"eXIf" + chunk_body) & 0xFFFFFFFF)
+            iend = data.find(b"IEND")
+            if iend < 8:
+                return
+            iend_start = iend - 4  # back up over IEND's 4-byte length field
+            png_path.write_bytes(data[:iend_start] + chunk + data[iend_start:])
+        except Exception:
+            pass
+
     async def optimize_png(
         self,
         input_path: Path,
@@ -159,13 +273,24 @@ class Optimizer:
         dithering: bool = True,
         output_format: str = "png",
         progress_callback: Optional[Callable] = None,
+        keep_exif: bool = False,
     ) -> dict:
         if compression_mode not in ("standard", "lossless", "resize_only"):
             compression_mode = "standard"
 
+        # Capture a cleaned EXIF copy from the source up front (before any
+        # pipeline step that strips/transposes it). Attached to the output
+        # at the very end — Orientation is already baked into pixels by
+        # exif_transpose, so the retained EXIF never carries Orientation
+        # (double-rotation guard).
+        cleaned_exif = b""
+        if keep_exif:
+            cleaned_exif = self._capture_cleaned_exif(input_path)
+
         if output_format == "webp":
             return await self._optimize_webp(
-                input_path, output_path, quality, max_width, compression_mode, progress_callback
+                input_path, output_path, quality, max_width, compression_mode,
+                progress_callback, keep_exif=keep_exif, cleaned_exif=cleaned_exif,
             )
 
         original_size = os.path.getsize(input_path)
@@ -286,6 +411,14 @@ class Optimizer:
                 if working_path != output_path:
                     shutil.copy2(working_path, output_path)
 
+            # Re-attach the cleaned EXIF as the very last PNG step, AFTER
+            # pngquant --strip / oxipng --strip safe have run (they remove
+            # all metadata, which is the point of those flags). The
+            # injected chunk carries no Orientation (already baked into
+            # pixels) — see _capture_cleaned_exif / _clean_exif.
+            if keep_exif and cleaned_exif:
+                self._finalize_png_exif(output_path, cleaned_exif)
+
             if output_path.exists():
                 compressed_size = os.path.getsize(output_path)
                 result["compressed_size"] = compressed_size
@@ -320,6 +453,9 @@ class Optimizer:
         max_width: int,
         compression_mode: str,
         progress_callback: Optional[Callable],
+        *,
+        keep_exif: bool = False,
+        cleaned_exif: bytes = b"",
     ) -> dict:
         """WebP goes through Pillow's own encoder rather than pngquant/oxipng
         (which only understand PNG) — there's no external binary dependency
@@ -349,12 +485,20 @@ class Optimizer:
                             ratio = max_width / w
                             img = img.resize((max_width, int(h * ratio)), Image.Resampling.LANCZOS)
 
+                    # Drop any EXIF carried in info so default (keep_exif=False)
+                    # WebP output is metadata-free; attach the cleaned copy
+                    # explicitly only when requested (no Orientation → no
+                    # double-rotation, same guard as the PNG path).
+                    img.info.pop("exif", None)
                     if compression_mode == "lossless" or compression_mode == "resize_only":
-                        img.save(output_path, format="WEBP", lossless=True, method=6)
+                        save_kwargs = {"format": "WEBP", "lossless": True, "method": 6}
                     else:
                         quality_map = {"high": 90, "medium": 75, "low": 55}
                         q = quality_map.get(quality, 75)
-                        img.save(output_path, format="WEBP", quality=q, method=6)
+                        save_kwargs = {"format": "WEBP", "quality": q, "method": 6}
+                    if keep_exif and cleaned_exif:
+                        save_kwargs["exif"] = cleaned_exif
+                    img.save(output_path, **save_kwargs)
 
             if progress_callback:
                 mode_desc = "lossless" if compression_mode in ("lossless", "resize_only") else f"quality={quality}"
