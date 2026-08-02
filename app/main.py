@@ -813,6 +813,14 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
     if data.output_dir:
         _push_recent("output_dirs", str(Path(data.output_dir).resolve()))
 
+    # Validate per-file overrides before mutating any state — a bad override
+    # must fail the request loudly, not half-start a run. See
+    # _validate_overrides for the field-value/unknown-key/resize_only rules.
+    selected_ids = {f["id"] for f in files_to_process}
+    ov_err = _validate_overrides(data.overrides, selected_ids, data.compression_mode, data.max_width)
+    if ov_err:
+        return JSONResponse({"error": ov_err}, status_code=400)
+
     state.is_running = True
     state.current = 0
     state.total = len(files_to_process)
@@ -856,6 +864,7 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
             retry=data.retry,
             skip_existing=data.skip_existing,
             keep_exif=data.keep_exif,
+            overrides=data.overrides,
         )
     )
 
@@ -873,6 +882,57 @@ CONCURRENT_WORKERS = 4  # default; overridden by main() from config.json / --wor
 # and lets each be tuned to the machine. See OPTIMIZATION_PLAN.md §6.
 THUMBNAIL_WORKERS = 4  # default; overridden by main() from config.json / --thumbnail-workers
 
+# Fields a per-file override may set. Fixed list so the request shape can't
+# drift between frontend and backend (see OPTIMIZATION_PLAN.md §3). Unknown
+# fields in an override are rejected with 400 rather than silently ignored —
+# a typo'd "qualitiy" must fail loudly, not silently do nothing.
+OVERRIDEABLE_FIELDS = (
+    "quality", "compression_mode", "max_width", "dithering",
+    "protected_colors", "keep_exif", "output_format",
+)
+
+
+def _validate_overrides(overrides: dict, selected_ids: set, top_mode: str, top_width: int) -> Optional[str]:
+    """Validate every per-file override entry. Returns an error string on the
+    first problem, or None if all entries are well-formed.
+
+    Field-value checks (enum/colors/unknown-keys) run for EVERY entry, even
+    ids not in the selection — a typo in an override for a deselected file is
+    still a typo worth reporting. The resize_only+max_width cross-check only
+    runs for selected ids: an override on an unselected file has no effect,
+    so complaining about it would be a false positive."""
+    for fid, ov in overrides.items():
+        if not isinstance(ov, dict):
+            return f"Override for file {fid!r} must be an object"
+        bad_keys = [k for k in ov if k not in OVERRIDEABLE_FIELDS]
+        if bad_keys:
+            return (f"Unknown override field(s) for file {fid!r}: {bad_keys}. "
+                    f"Supported: {list(OVERRIDEABLE_FIELDS)}")
+        if "quality" in ov and ov["quality"] not in ("high", "medium", "low"):
+            return f"Invalid quality in override for file {fid!r}: {ov['quality']!r}"
+        if "compression_mode" in ov and ov["compression_mode"] not in ("standard", "lossless", "resize_only"):
+            return f"Invalid compression_mode in override for file {fid!r}: {ov['compression_mode']!r}"
+        if "output_format" in ov and ov["output_format"] not in ("png", "webp"):
+            return f"Invalid output_format in override for file {fid!r}: {ov['output_format']!r}"
+        if "max_width" in ov and (not isinstance(ov["max_width"], int) or isinstance(ov["max_width"], bool) or ov["max_width"] < 0):
+            return f"Invalid max_width in override for file {fid!r}: {ov['max_width']!r}"
+        if "dithering" in ov and not isinstance(ov["dithering"], bool):
+            return f"Invalid dithering in override for file {fid!r} (must be bool)"
+        if "keep_exif" in ov and not isinstance(ov["keep_exif"], bool):
+            return f"Invalid keep_exif in override for file {fid!r} (must be bool)"
+        if "protected_colors" in ov:
+            bc = [c for c in ov["protected_colors"] if not HEX_COLOR_RE.match(str(c).strip())]
+            if bc:
+                return f"Invalid color(s) in override for file {fid!r}: {', '.join(bc)}"
+        # resize_only needs a max_width — check the effective combination, but
+        # only for files actually being processed.
+        if fid in selected_ids:
+            eff_mode = ov.get("compression_mode", top_mode)
+            eff_width = ov.get("max_width", top_width)
+            if eff_mode == "resize_only" and eff_width <= 0:
+                return f"Resize Only mode requires Max Width (override for file {fid!r})"
+    return None
+
 
 async def _process_files(
     state: AppState,
@@ -887,11 +947,14 @@ async def _process_files(
     retry: bool = False,
     skip_existing: bool = False,
     keep_exif: bool = False,
+    overrides: Optional[dict] = None,
 ):
     if optimizer is None:
         state.logs.append("Optimizer not initialized")
         state.is_running = False
         return
+
+    overrides = overrides or {}
 
     ws = state.workspace
     opt_output_dir = ws / "output"
@@ -931,7 +994,11 @@ async def _process_files(
     out_paths: dict[str, Optional[Path]] = {}
     used_names: set[str] = set()
     for file_info in files:
-        base = (opt_output_dir / file_info["name"]).with_suffix(f".{output_format}")
+        # A per-file output_format override changes this file's suffix (and
+        # thus its output path / collision slot). Different suffixes don't
+        # collide ("photo.png" vs "photo.webp"), which is correct.
+        eff_fmt = overrides.get(file_info["id"], {}).get("output_format", output_format)
+        base = (opt_output_dir / file_info["name"]).with_suffix(f".{eff_fmt}")
         candidate = base
         n = 2
         while str(candidate).lower() in used_names:
@@ -959,12 +1026,27 @@ async def _process_files(
             raise ValueError("unsafe file name escapes the output directory")
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # Resolve this file's effective parameters: a per-file override
+        # (overrides[file_id]) wins for any field it lists, otherwise the
+        # top-level defaults apply. out_path was already allocated with the
+        # effective output_format, so they stay consistent.
+        ov = overrides.get(file_info["id"], {})
+        eff_quality = ov.get("quality", quality)
+        eff_max_width = ov.get("max_width", max_width)
+        eff_compression_mode = ov.get("compression_mode", compression_mode)
+        eff_protected_colors = ov.get("protected_colors", protected_colors)
+        eff_dithering = ov.get("dithering", dithering)
+        eff_keep_exif = ov.get("keep_exif", keep_exif)
+        eff_output_format = ov.get("output_format", output_format)
+
         # Skip-already-optimized: if the user re-runs against the same output
         # folder and this file's target is already there, reuse it instead of
         # paying pngquant/oxipng again. We still copy it back into ws/output so
         # Compare/preview (/api/result) and the download ZIP keep working — the
         # copy is cheap next to a re-compress. No-op without output_dir (the
         # temp workspace is wiped/empty each fresh run, nothing to reuse).
+        # Note: a skipped file is NOT recompressed, so per-file overrides are
+        # intentionally ignored on the skip path (the existing output stands).
         if skip_existing and output_dir:
             rel = out_path.relative_to(opt_output_dir)
             dest = Path(output_dir) / rel
@@ -977,7 +1059,7 @@ async def _process_files(
                     "id": file_info["id"],
                     "name": file_info["name"],
                     "original_path": file_info["path"],
-                    "output_format": output_format,
+                    "output_format": eff_output_format,
                     "output_name": str(rel),
                     "success": True,
                     "skipped": True,
@@ -995,20 +1077,20 @@ async def _process_files(
         result = await optimizer.optimize_png(
             input_path=input_path,
             output_path=out_path,
-            quality=quality,
-            max_width=max_width,
-            compression_mode=compression_mode,
-            protected_colors=protected_colors,
-            dithering=dithering,
-            output_format=output_format,
+            quality=eff_quality,
+            max_width=eff_max_width,
+            compression_mode=eff_compression_mode,
+            protected_colors=eff_protected_colors,
+            dithering=eff_dithering,
+            output_format=eff_output_format,
             progress_callback=log,
-            keep_exif=keep_exif,
+            keep_exif=eff_keep_exif,
         )
 
         result["id"] = file_info["id"]
         result["name"] = file_info["name"]
         result["original_path"] = file_info["path"]
-        result["output_format"] = output_format
+        result["output_format"] = eff_output_format
         # The actual output location relative to ws/output — may differ
         # from name+suffix when a collision was disambiguated above, so
         # consumers (e.g. /api/preview) must use this instead of

@@ -46,6 +46,14 @@ class OptimizeRequest(BaseModel):
     # MakerNote (bulk). Default False preserves the historical strip-everything
     # behavior (pngquant --strip / oxipng --strip safe / WebP with no exif=).
     keep_exif: bool = False
+    # Per-file parameter override: {file_id: {field: value, ...}}. Only the
+    # listed fields override the top-level defaults for that one file; every
+    # other field falls back to the top-level value. Only file_ids the user
+    # manually expanded "advanced settings" on appear here — the common case
+    # (one global setting) sends an empty dict. Field names are fixed (see
+    # OVERRIDEABLE_FIELDS in main.py) so the request shape can't drift between
+    # frontend and backend; unknown fields are rejected with 400.
+    overrides: dict[str, dict] = {}
 
 
 class FileInfo(BaseModel):

@@ -216,6 +216,26 @@ header h1 span { color: var(--accent); }
   font-size: 11px; color: transparent; transition: all .2s;
 }
 .file-card.selected .check { background: var(--accent); border-color: var(--accent); color: #000; }
+.file-card .card-gear {
+  position: absolute; top: 4px; left: 4px;
+  font-size: 12px; width: 20px; height: 20px; line-height: 18px;
+  border-radius: 50%; border: 1px solid var(--border); background: rgba(0,0,0,.5);
+  color: var(--text2); cursor: pointer; padding: 0; opacity: 0; transition: opacity .15s;
+}
+.file-card:hover .card-gear { opacity: .85; }
+.file-card .card-gear:hover { opacity: 1; color: var(--accent); border-color: var(--accent); }
+.file-card.has-override .card-gear { opacity: 1; color: var(--accent); border-color: var(--accent); }
+.file-card .file-override {
+  position: absolute; left: 0; right: 0; bottom: 0; z-index: 2;
+  background: var(--card); border-top: 1px solid var(--border);
+  padding: 4px 6px; font-size: 10px; display: flex; flex-direction: column; gap: 2px;
+}
+.file-card .fo-row { display: flex; align-items: center; gap: 4px; }
+.file-card .fo-label { width: 42px; color: var(--text2); flex-shrink: 0; }
+.file-card .fo-row select, .file-card .fo-row input {
+  flex: 1; min-width: 0; font-size: 10px; padding: 1px 2px;
+  background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 3px;
+}
 .file-list-empty {
   text-align: center; padding: 30px; color: var(--text2); white-space: nowrap;
 }
@@ -511,6 +531,7 @@ const STATE = {
   resultCursor: 0,      // # of results already pulled (incremental /api/progress)
   logCursor: 0,         // # of log lines already pulled
   logLines: [],         // accumulated log lines (capped for display)
+  fileOverrides: {},    // {file_id: {field: value}} — per-file settings that override the globals; only files the user expanded get an entry
 };
 
 // DOM refs
@@ -925,6 +946,14 @@ async function uploadFiles(files) {
 // Render file grid
 function renderFiles() {
   const files = STATE.files;
+  // Drop override entries for ids no longer present (e.g. after a re-scan
+  // of a different folder). Keeps STATE.fileOverrides in sync with the
+  // current file set without wiping the user's per-file edits on a mere
+  // re-render (same ids are preserved).
+  const ids = new Set(files.map(f => f.id));
+  for (const k of Object.keys(STATE.fileOverrides)) {
+    if (!ids.has(k)) delete STATE.fileOverrides[k];
+  }
   if (!files.length) {
     fileGrid.innerHTML = '';
     filesEmpty.textContent = 'No images found';
@@ -942,6 +971,26 @@ function renderFiles() {
         <div class="fname" title="${escHtml(f.name)}">${escHtml(f.name)}</div>
         <div class="fsize">${fmtSize(f.size)}</div>
         <div class="check">✓</div>
+        <button class="card-gear" type="button" title="Per-file settings (override the global quality/mode for just this file)"
+          onclick="event.stopPropagation(); toggleFileOverride('${f.id}', this)">⚙</button>
+        <div class="file-override" data-id="${f.id}" hidden onclick="event.stopPropagation()">
+          <div class="fo-row">
+            <span class="fo-label">Quality</span>
+            <select data-field="quality" onchange="setFileOverride('${f.id}')">
+              <option value="">inherit</option><option value="high">high</option><option value="medium">medium</option><option value="low">low</option>
+            </select>
+          </div>
+          <div class="fo-row">
+            <span class="fo-label">Mode</span>
+            <select data-field="compression_mode" onchange="setFileOverride('${f.id}')">
+              <option value="">inherit</option><option value="standard">standard</option><option value="lossless">lossless</option><option value="resize_only">resize only</option>
+            </select>
+          </div>
+          <div class="fo-row">
+            <span class="fo-label">Width</span>
+            <input type="number" min="0" data-field="max_width" placeholder="inherit" oninput="setFileOverride('${f.id}')">
+          </div>
+        </div>
       </div>
     `;
   }
@@ -958,6 +1007,41 @@ function toggleFile(id) {
   const all = fileGrid.querySelectorAll('.file-card');
   const sel = fileGrid.querySelectorAll('.file-card.selected');
   selectAll.checked = all.length === sel.length;
+}
+
+// Per-file override UI: clicking the gear toggles a small panel where the
+// user sets quality/mode/width for just this file. Empty/"inherit" values
+// are dropped, so STATE.fileOverrides only holds files with at least one
+// non-default field — exactly the "only override files the user manually
+// expanded" rule from the review. The whole map is sent on Start; the
+// server ignores entries for unselected ids.
+function toggleFileOverride(id, gearBtn) {
+  const card = fileGrid.querySelector(`.file-card[data-id="${id}"]`);
+  if (!card) return;
+  const panel = card.querySelector('.file-override');
+  const willShow = panel.hasAttribute('hidden');
+  if (willShow) panel.removeAttribute('hidden'); else panel.setAttribute('hidden', '');
+  // Pre-fill the panel from any existing override for this file.
+  const ov = STATE.fileOverrides[id] || {};
+  card.querySelectorAll('.file-override [data-field]').forEach(el => {
+    el.value = ov[el.dataset.field] != null ? ov[el.dataset.field] : '';
+  });
+}
+function setFileOverride(id) {
+  const card = fileGrid.querySelector(`.file-card[data-id="${id}"]`);
+  if (!card) return;
+  const ov = {};
+  card.querySelectorAll('.file-override [data-field]').forEach(el => {
+    const v = el.value.trim();
+    if (v !== '') ov[el.dataset.field] = el.dataset.field === 'max_width' ? parseInt(v) : v;
+  });
+  if (Object.keys(ov).length) {
+    STATE.fileOverrides[id] = ov;
+    card.classList.add('has-override');
+  } else {
+    delete STATE.fileOverrides[id];
+    card.classList.remove('has-override');
+  }
 }
 
 selectAll.addEventListener('change', () => {
@@ -1075,6 +1159,7 @@ async function runOptimize(ids, opts) {
         compression_mode: compressionMode, protected_colors: protectedColors, dithering, retry,
         skip_existing: $('skip-existing').checked,
         keep_exif: $('keep-exif').checked,
+        overrides: STATE.fileOverrides,
       }),
     });
     const d = await r.json();
