@@ -15,7 +15,7 @@ from typing import Any, Awaitable, Callable, List, Optional
 from zipfile import ZipFile
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from PIL import Image
 
 if __package__ is None:
@@ -1209,6 +1209,102 @@ async def get_progress(
         "result_total": len(state.results),
         "log_total": len(state.logs),
     })
+
+
+def _sse_format(event_type: str, data, eid: Optional[str]) -> str:
+    """Format one SSE message. `id` (when given) encodes the cumulative
+    (result, log) cursor as `r{R}:l{L}` so a client can reattach via
+    Last-Event-ID and replay only the tail — same cursor semantics the
+    polling /api/progress endpoint uses with since_result/since_log."""
+    import json as _json
+    parts = []
+    if eid is not None:
+        parts.append(f"id: {eid}")
+    parts.append(f"event: {event_type}")
+    parts.append(f"data: {_json.dumps(data)}")
+    return "\n".join(parts) + "\n\n"
+
+
+@app.get("/api/events")
+async def events(request: Request, state: AppState = Depends(get_session)):
+    """SSE progress transport — the streaming counterpart to /api/progress.
+
+    Emits `result`, `log`, and `done` events. Each carries an `id` of the
+    form `r{R}:l{L}` (results seen : logs seen), so a client that drops and
+    reconnects sends `Last-Event-ID` and the server replays only the tail —
+    reattach for a page refresh. The HTTP polling endpoint stays as the
+    automatic fallback (SSE can be buffered/dropped by some proxies); the
+    two read the same state so they always agree.
+
+    No app-token requirement (mirrors /api/progress — both are read-only,
+    and EventSource can't send custom headers anyway). Session-scoped via
+    the cookie EventSource sends same-origin.
+
+    A `: keepalive` comment is emitted every few idle seconds so
+    intermediate proxies don't time out an open but quiet connection."""
+    last_id = request.headers.get("last-event-id", "")
+    r_cur, l_cur = 0, 0
+    if last_id:
+        for part in last_id.split(":"):
+            if part.startswith("r"):
+                try:
+                    r_cur = max(0, int(part[1:]))
+                except ValueError:
+                    r_cur = 0
+            elif part.startswith("l"):
+                try:
+                    l_cur = max(0, int(part[1:]))
+                except ValueError:
+                    l_cur = 0
+
+    async def event_stream():
+        nonlocal r_cur, l_cur
+        last_emit = time.time()
+        while True:
+            # Emit any new results since the cursor.
+            for res in state.results[r_cur:]:
+                r_cur += 1
+                yield _sse_format("result", res, f"r{r_cur}:l{l_cur}")
+                last_emit = time.time()
+            # Emit any new log lines since the cursor.
+            for line in state.logs[l_cur:]:
+                l_cur += 1
+                yield _sse_format("log", {"line": line}, f"r{r_cur}:l{l_cur}")
+                last_emit = time.time()
+
+            if not state.is_running:
+                # The run's finally block sets is_running=False BEFORE
+                # appending the final "Done!" summary log, so sleep a beat
+                # and drain once more to catch it, then close with `done`.
+                await asyncio.sleep(0.05)
+                for res in state.results[r_cur:]:
+                    r_cur += 1
+                    yield _sse_format("result", res, f"r{r_cur}:l{l_cur}")
+                for line in state.logs[l_cur:]:
+                    l_cur += 1
+                    yield _sse_format("log", {"line": line}, f"r{r_cur}:l{l_cur}")
+                yield _sse_format("done", {
+                    "running": False,
+                    "paused": state.paused,
+                    "current": state.current,
+                    "total": state.total,
+                    "result_total": len(state.results),
+                    "log_total": len(state.logs),
+                }, f"r{r_cur}:l{l_cur}")
+                return
+
+            # Heartbeat: if nothing was emitted for a while, send a comment
+            # so proxies buffering idle connections don't drop the stream.
+            if time.time() - last_emit > 5:
+                yield ": keepalive\n\n"
+                last_emit = time.time()
+            await asyncio.sleep(0.1)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
 
 
 @app.post("/api/cancel")

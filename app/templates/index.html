@@ -1184,6 +1184,7 @@ async function runOptimize(ids, opts) {
 
   STATE.isRunning = true;
   STATE.runStartTime = Date.now();
+  STATE.total = ids.length;
   if (!retry) STATE.results = [];
   // Incremental-poll cursors always restart at 0 for a new run: the server's
   // state.results is the source of truth (on retry it already holds the
@@ -1192,6 +1193,9 @@ async function runOptimize(ids, opts) {
   STATE.resultCursor = 0;
   STATE.logCursor = 0;
   STATE.logLines = [];
+  // Clean up any transport left over from a previous run before starting fresh.
+  if (STATE.pollTimer) { clearInterval(STATE.pollTimer); STATE.pollTimer = null; }
+  stopSSE();
 
   dismissPersistentNotice();
 
@@ -1232,8 +1236,9 @@ async function runOptimize(ids, opts) {
     }
     if (d.warning) showNotice(d.warning, 'info');
 
-    // Poll progress
-    STATE.pollTimer = setInterval(pollProgress, 400);
+    // Stream progress over SSE (primary); falls back to polling
+    // automatically on connect failure or sustained silence.
+    startSSE();
     loadRecentPaths();
   } catch(e) {
     showNotice((retry ? 'Retry failed: ' : 'Start failed: ') + e.message, 'err');
@@ -1276,65 +1281,81 @@ async function pollProgress() {
     }
     if (typeof d.result_total === 'number') STATE.resultCursor = d.result_total;
 
-    // Update progress bar
-    const pct = d.total > 0 ? Math.round(d.current / d.total * 100) : 0;
-    progressFill.style.width = pct + '%';
-    let txt = d.running ? `Processing ${d.current}/${d.total}` : `${d.current}/${d.total}`;
-    // Speed + ETA from the average rate since this run started (current/elapsed).
-    // A running average is steadier than an instantaneous per-poll delta and
-    // needs no extra server data. Only shown once at least one file is done.
-    if (d.running && d.current > 0 && STATE.runStartTime) {
-      const elapsed = (Date.now() - STATE.runStartTime) / 1000;
-      if (elapsed > 0) {
-        const rate = d.current / elapsed;
-        const remaining = Math.max(0, d.total - d.current);
-        const eta = rate > 0 ? remaining / rate : 0;
-        txt += `  \u00b7  ${rate.toFixed(1)} img/s \u00b7 ~${fmtDuration(eta)} left`;
-      }
-    }
-    progressText.textContent = txt;
-    
-    // Update logs (incremental). Accumulate the new tail into STATE.logLines,
-    // cap the buffer so a multi-thousand-file run can't grow the DOM without
-    // bound, then re-render. escHtml on every line: log lines embed file
-    // names, and a name like "<img src=x onerror=...>.png" (legal on Linux)
-    // must render as text, not execute.
+    renderProgressBar(d.running, d.paused, d.current, d.total);
     if (d.logs && d.logs.length) {
       for (const l of d.logs) STATE.logLines.push(l);
-      if (STATE.logLines.length > 500) STATE.logLines = STATE.logLines.slice(-500);
-      logBox.innerHTML = STATE.logLines.map(l => {
-        let c = 'log-entry';
-        if (l.indexOf('OK ') !== -1 || l.indexOf('\u2713') !== -1) c += ' ok';
-        else if (l.indexOf('FAILED') !== -1 || l.indexOf('\u2717') !== -1) c += ' err';
-        else if (l.startsWith('  ')) c += ' info';
-        return `<div class="${c}">${escHtml(l)}</div>`;
-      }).join('');
-      logBox.scrollTop = logBox.scrollHeight;
+      renderLogs();
     }
     if (typeof d.log_total === 'number') STATE.logCursor = d.log_total;
-    
-    // Check if done
+
     if (!d.running) {
-      clearInterval(STATE.pollTimer);
-      cancelBtn.style.display = 'none';
-      if (STATE.results.length > 0) {
-        STATE.wsName = STATE.files[0]?.thumbnail?.split('/')[3] || '';
-        showResults();
-        showPersistentNotice(`Compression complete! ${STATE.results.filter(r => r.success).length}/${STATE.results.length} files optimized.`, 'ok');
-      } else {
-        // e.g. cancelled before any file finished — nothing to show, but
-        // Start still needs to become clickable again.
-        updateStartButtonState();
-      }
+      finalizeRun();
     }
   } catch(e) {
     // ignore poll errors
   }
 }
 
-// Pause/Resume button visibility. Called from pollProgress on every poll:
-// running → Cancel + Pause; paused → Resume; idle → nothing. The SSE
-// transport (when enabled) drives the same function from its events.
+// --- SSE transport (primary) with polling fallback ---
+// EventSource streams result/log/done events; if it errors or goes silent
+// for several seconds (proxy buffering, paused run), we drop to the polling
+// path above automatically. Both read the same server state, so the user
+// sees consistent progress either way. See OPTIMIZATION_PLAN.md §5.
+let sseSource = null, sseWatchdog = null, sseLastMsg = 0, usingSSE = false;
+const SSE_SILENCE_MS = 8000;
+
+function startSSE() {
+  usingSSE = true;
+  sseLastMsg = Date.now();
+  try {
+    sseSource = new EventSource('/api/events');
+  } catch (e) {
+    fallbackToPolling();
+    return;
+  }
+  sseSource.addEventListener('result', e => {
+    sseLastMsg = Date.now();
+    try { STATE.results.push(JSON.parse(e.data)); } catch (_) {}
+    setRunButtons(true, false);
+    renderProgressBar(true, false, STATE.results.length, STATE.total);
+  });
+  sseSource.addEventListener('log', e => {
+    sseLastMsg = Date.now();
+    try { STATE.logLines.push(JSON.parse(e.data).line); } catch (_) {}
+    renderLogs();
+  });
+  sseSource.addEventListener('done', e => {
+    sseLastMsg = Date.now();
+    let d = {};
+    try { d = JSON.parse(e.data); } catch (_) {}
+    STATE.isRunning = false;
+    stopSSE();
+    renderProgressBar(false, false, d.current != null ? d.current : STATE.results.length, d.total != null ? d.total : STATE.total);
+    finalizeRun();
+  });
+  sseSource.onerror = () => { fallbackToPolling(); };
+  // Watchdog: silent too long → a proxy may be buffering the stream, or the
+  // run is paused (SSE sends only heartbeats then). Polling reports the full
+  // state (including paused) so fall back rather than look frozen.
+  sseWatchdog = setInterval(() => {
+    if (usingSSE && Date.now() - sseLastMsg > SSE_SILENCE_MS) fallbackToPolling();
+  }, 2000);
+}
+
+function stopSSE() {
+  usingSSE = false;
+  if (sseSource) { sseSource.close(); sseSource = null; }
+  if (sseWatchdog) { clearInterval(sseWatchdog); sseWatchdog = null; }
+}
+
+function fallbackToPolling() {
+  stopSSE();
+  if (!STATE.pollTimer && STATE.isRunning) {
+    STATE.pollTimer = setInterval(pollProgress, 400);
+  }
+}
+
+// Shared render helpers used by both the SSE path and the polling fallback.
 function setRunButtons(running, paused) {
   if (running) {
     cancelBtn.style.display = '';
@@ -1344,6 +1365,51 @@ function setRunButtons(running, paused) {
     cancelBtn.style.display = 'none';
     pauseBtn.style.display = 'none';
     resumeBtn.style.display = 'none';
+  }
+}
+
+function renderProgressBar(running, paused, current, total) {
+  const pct = total > 0 ? Math.round(current / total * 100) : 0;
+  progressFill.style.width = pct + '%';
+  let txt = running ? (paused ? `Paused ${current}/${total}` : `Processing ${current}/${total}`) : `${current}/${total}`;
+  if (running && !paused && current > 0 && STATE.runStartTime) {
+    const elapsed = (Date.now() - STATE.runStartTime) / 1000;
+    if (elapsed > 0) {
+      const rate = current / elapsed;
+      const remaining = Math.max(0, total - current);
+      const eta = rate > 0 ? remaining / rate : 0;
+      txt += `  \u00b7  ${rate.toFixed(1)} img/s \u00b7 ~${fmtDuration(eta)} left`;
+    }
+  }
+  progressText.textContent = txt;
+}
+
+function renderLogs() {
+  if (STATE.logLines.length > 500) STATE.logLines = STATE.logLines.slice(-500);
+  // escHtml on every line: log lines embed file names, and a name like
+  // "<img src=x onerror=...>.png" (legal on Linux) must render as text.
+  logBox.innerHTML = STATE.logLines.map(l => {
+    let c = 'log-entry';
+    if (l.indexOf('OK ') !== -1 || l.indexOf('\u2713') !== -1) c += ' ok';
+    else if (l.indexOf('FAILED') !== -1 || l.indexOf('\u2717') !== -1) c += ' err';
+    else if (l.startsWith('  ')) c += ' info';
+    return `<div class="${c}">${escHtml(l)}</div>`;
+  }).join('');
+  logBox.scrollTop = logBox.scrollHeight;
+}
+
+function finalizeRun() {
+  if (STATE.pollTimer) { clearInterval(STATE.pollTimer); STATE.pollTimer = null; }
+  stopSSE();
+  setRunButtons(false, false);
+  if (STATE.results.length > 0) {
+    STATE.wsName = STATE.files[0]?.thumbnail?.split('/')[3] || '';
+    showResults();
+    showPersistentNotice(`Compression complete! ${STATE.results.filter(r => r.success).length}/${STATE.results.length} files optimized.`, 'ok');
+  } else {
+    // e.g. cancelled before any file finished — nothing to show, but
+    // Start still needs to become clickable again.
+    updateStartButtonState();
   }
 }
 
@@ -1533,7 +1599,10 @@ async function restoreState() {
       STATE.logLines = [];
       cancelBtn.style.display = '';
       updateStartButtonState();
-      STATE.pollTimer = setInterval(pollProgress, 400);
+      // Reattach via SSE (primary): a fresh EventSource replays from r0:l0
+      // so the client re-syncs everything accumulated so far, then continues
+      // live. Falls back to polling on failure/silence.
+      startSSE();
     } else if (d.results && d.results.length) {
       STATE.results = d.results;
       showResults();
