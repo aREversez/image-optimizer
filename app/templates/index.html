@@ -989,15 +989,17 @@ function renderFiles() {
   for (const f of files) {
     html += `
       <div class="file-card selected" data-id="${f.id}" onclick="toggleFile('${f.id}')">
-        <img class="thumb" src="${f.thumbnail}" alt="${escHtml(f.name)}" loading="lazy" />
-        <div class="fname" title="${escHtml(f.name)}">${escHtml(f.name)}</div>
-        <div class="fsize">${fmtSize(f.size)}</div>
-        <div class="check">✓</div>
-        <button class="card-gear" type="button" title="Per-file settings (override the global quality/mode for just this file)"
-          onclick="event.stopPropagation(); toggleFileOverride('${f.id}', this)">⚙</button>
-        <button class="preview-btn" type="button"
-          title="Run a single-file dry run with the current settings to project the compressed size. Does not affect results or the download ZIP."
-          onclick="event.stopPropagation(); previewFile('${f.id}', this)">Preview</button>
+        <div class="fc-main">
+          <img class="thumb" src="${f.thumbnail}" alt="${escHtml(f.name)}" loading="lazy" />
+          <div class="fname" title="${escHtml(f.name)}">${escHtml(f.name)}</div>
+          <div class="fsize">${fmtSize(f.size)}</div>
+          <div class="check">✓</div>
+          <button class="card-gear" type="button" title="Per-file settings (override the global quality/mode for just this file)"
+            onclick="event.stopPropagation(); toggleFileOverride('${f.id}', this)">⚙</button>
+          <button class="preview-btn" type="button"
+            title="Run a single-file dry run with the current settings to project the compressed size. Does not affect results or the download ZIP."
+            onclick="event.stopPropagation(); previewFile('${f.id}', this)">Preview</button>
+        </div>
         <div class="file-override" data-id="${f.id}" hidden onclick="event.stopPropagation()">
           <div class="fo-row">
             <span class="fo-label">Quality</span>
@@ -1204,6 +1206,7 @@ async function runOptimize(ids, opts) {
   STATE.resultCursor = 0;
   STATE.logCursor = 0;
   STATE.logLines = [];
+  STATE.isPaused = false;
   // Clean up any transport left over from a previous run before starting fresh.
   if (STATE.pollTimer) { clearInterval(STATE.pollTimer); STATE.pollTimer = null; }
   stopSSE();
@@ -1324,11 +1327,24 @@ function startSSE() {
     fallbackToPolling();
     return;
   }
+  sseSource.addEventListener('status', e => {
+    sseLastMsg = Date.now();
+    let d = {};
+    try { d = JSON.parse(e.data); } catch (_) {}
+    STATE.isPaused = !!d.paused;
+    setRunButtons(true, STATE.isPaused);
+    renderProgressBar(true, STATE.isPaused, d.current != null ? d.current : STATE.results.length, d.total != null ? d.total : STATE.total);
+  });
   sseSource.addEventListener('result', e => {
     sseLastMsg = Date.now();
     try { STATE.results.push(JSON.parse(e.data)); } catch (_) {}
-    setRunButtons(true, false);
-    renderProgressBar(true, false, STATE.results.length, STATE.total);
+    // A result can arrive just after Pause was clicked — it's a file that
+    // was already mid-compression when the run paused, finishing up on its
+    // own (see /api/pause docstring). Keep reflecting the real paused state
+    // here rather than assuming "a result came in, so we must be running
+    // normally" — that assumption is what made Pause look broken.
+    setRunButtons(true, STATE.isPaused);
+    renderProgressBar(true, STATE.isPaused, STATE.results.length, STATE.total);
   });
   sseSource.addEventListener('log', e => {
     sseLastMsg = Date.now();

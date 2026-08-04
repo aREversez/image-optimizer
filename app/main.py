@@ -1260,7 +1260,24 @@ async def events(request: Request, state: AppState = Depends(get_session)):
     async def event_stream():
         nonlocal r_cur, l_cur
         last_emit = time.time()
+        # A pause/resume can happen with no new results/logs to piggyback
+        # on (the whole point of "soft pause" is new work stops getting
+        # scheduled), so paused-state changes get their own event rather
+        # than waiting for the next result/log — otherwise a client has no
+        # way to learn about it until the run's `done` event, which for a
+        # long pause could be a very long wait.
+        last_paused_sent = state.paused
+        yield _sse_format("status", {
+            "paused": state.paused, "current": state.current, "total": state.total,
+        }, f"r{r_cur}:l{l_cur}")
         while True:
+            if state.paused != last_paused_sent:
+                last_paused_sent = state.paused
+                yield _sse_format("status", {
+                    "paused": state.paused, "current": state.current, "total": state.total,
+                }, f"r{r_cur}:l{l_cur}")
+                last_emit = time.time()
+
             # Emit any new results since the cursor.
             for res in state.results[r_cur:]:
                 r_cur += 1
