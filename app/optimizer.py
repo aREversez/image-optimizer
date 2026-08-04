@@ -236,6 +236,30 @@ class Optimizer:
         return bytes(out)
 
     @staticmethod
+    def _find_png_chunk_offset(data: bytes, chunk_type: bytes) -> Optional[int]:
+        """Walk the PNG chunk stream (the same structural walk
+        `_strip_png_chunks` does) and return the byte offset of the first
+        chunk of `chunk_type` — pointing at its 4-byte length field — or
+        None if it isn't found or the stream is malformed/truncated.
+
+        Unlike a raw `bytes.find(b"IEND")`, this can't be fooled by those
+        four bytes appearing inside another chunk's *data* (e.g. a stray
+        tEXt/iTXt comment that happens to contain the literal text
+        "IEND") — it only matches an actual chunk header."""
+        pos = 8
+        n = len(data)
+        while pos + 8 <= n:
+            length = int.from_bytes(data[pos:pos + 4], "big")
+            ctype = data[pos + 4:pos + 8]
+            total = 8 + length + 4
+            if pos + total > n:
+                return None  # malformed/truncated
+            if ctype == chunk_type:
+                return pos
+            pos += total
+        return None
+
+    @staticmethod
     def _finalize_png_exif(png_path: Path, exif_bytes: bytes) -> None:
         """Attach cleaned EXIF to a finished PNG by inserting a single
         eXIf chunk before IEND. Any pre-existing eXIf chunks are removed
@@ -254,10 +278,9 @@ class Optimizer:
             chunk_body = exif_bytes
             chunk = struct.pack(">I", len(chunk_body)) + b"eXIf" + chunk_body
             chunk += struct.pack(">I", zlib.crc32(b"eXIf" + chunk_body) & 0xFFFFFFFF)
-            iend = data.find(b"IEND")
-            if iend < 8:
+            iend_start = Optimizer._find_png_chunk_offset(data, b"IEND")
+            if iend_start is None:
                 return
-            iend_start = iend - 4  # back up over IEND's 4-byte length field
             png_path.write_bytes(data[:iend_start] + chunk + data[iend_start:])
         except Exception:
             pass
