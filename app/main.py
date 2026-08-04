@@ -434,6 +434,29 @@ def _fmt_size(b: int) -> str:
     return f"{b / (1024 * 1024):.2f} MB"
 
 
+def _is_valid_reusable_output(path: Path, expected_format: str) -> bool:
+    """Best-effort corruption check for a skip_existing reuse candidate.
+
+    A non-empty file isn't strong enough evidence that it's safe to reuse:
+    if pngquant/oxipng was killed mid-write on a previous run (crash, OOM
+    kill, power loss), it can leave behind a file that's non-empty but
+    truncated or structurally broken. Reusing that file would silently
+    hand the user a corrupt "optimized" image instead of recompressing it.
+
+    Uses Pillow's verify() (structural/header check, doesn't decode full
+    pixel data — cheap) and confirms the format actually matches what
+    this run expects, so e.g. a stray same-named file from a different
+    output_format never gets reused by mistake."""
+    try:
+        with Image.open(path) as img:
+            img.verify()
+            fmt = (img.format or "").upper()
+    except Exception:
+        return False
+    expected = "PNG" if expected_format == "png" else "WEBP"
+    return fmt == expected
+
+
 async def _run_worker_pool(
     items: list,
     process_item: Callable[[Any], Awaitable[None]],
@@ -1045,12 +1068,15 @@ async def _process_files(
         # Compare/preview (/api/result) and the download ZIP keep working — the
         # copy is cheap next to a re-compress. No-op without output_dir (the
         # temp workspace is wiped/empty each fresh run, nothing to reuse).
+        # _is_valid_reusable_output guards against reusing a truncated/corrupt
+        # leftover from a previous run that was interrupted mid-write — a
+        # non-empty file alone isn't proof it's complete.
         # Note: a skipped file is NOT recompressed, so per-file overrides are
         # intentionally ignored on the skip path (the existing output stands).
         if skip_existing and output_dir:
             rel = out_path.relative_to(opt_output_dir)
             dest = Path(output_dir) / rel
-            if dest.exists() and dest.stat().st_size > 0:
+            if dest.exists() and dest.stat().st_size > 0 and _is_valid_reusable_output(dest, eff_output_format):
                 shutil.copy2(dest, out_path)
                 orig_size = input_path.stat().st_size if input_path.exists() else 0
                 comp_size = dest.stat().st_size
