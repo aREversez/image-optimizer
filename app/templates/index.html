@@ -192,14 +192,20 @@ header h1 span { color: var(--accent); }
 .file-stats { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; font-size: 13px; color: var(--text2); }
 .file-grid {
   display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px;
-  max-height: 360px; overflow-y: auto;
+  max-height: 360px; overflow-y: auto; align-items: start;
 }
 .file-card {
   background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
-  padding: 8px; cursor: pointer; transition: all .2s; position: relative;
+  padding: 8px; cursor: pointer; transition: all .2s;
 }
 .file-card:hover { border-color: var(--accent); }
 .file-card.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+/* .fc-main wraps everything that isn't the (optional) override panel, and
+   is the positioning context for the check/gear/preview-btn overlays —
+   scoping them here (instead of to .file-card) means opening the override
+   panel below can never cover them, since they're absolutely positioned
+   relative to this box, not the taller card. */
+.file-card .fc-main { position: relative; }
 .file-card .thumb {
   width: 100%; aspect-ratio: 16/10; object-fit: cover; border-radius: 4px;
   background: #222; display: block;
@@ -236,10 +242,12 @@ header h1 span { color: var(--accent); }
 .file-card:hover .card-gear { opacity: .85; }
 .file-card .card-gear:hover { opacity: 1; color: var(--accent); border-color: var(--accent); }
 .file-card.has-override .card-gear { opacity: 1; color: var(--accent); border-color: var(--accent); }
+/* Normal-flow block below .fc-main (not an absolute overlay) — opening it
+   grows the card's own height instead of covering fsize/preview-btn, which
+   both live inside .fc-main above it. */
 .file-card .file-override {
-  position: absolute; left: 0; right: 0; bottom: 0; z-index: 2;
-  background: var(--card); border-top: 1px solid var(--border);
-  padding: 4px 6px; font-size: 10px; display: flex; flex-direction: column; gap: 2px;
+  margin-top: 6px; border-top: 1px solid var(--border);
+  padding-top: 4px; font-size: 10px; display: flex; flex-direction: column; gap: 2px;
 }
 .file-card .fo-row { display: flex; align-items: center; gap: 4px; }
 .file-card .fo-label { width: 42px; color: var(--text2); flex-shrink: 0; }
@@ -535,6 +543,9 @@ const STATE = {
   results: [],
   wsName: '',
   isRunning: false,
+  isPaused: false,      // authoritative pause flag; SSE's result/log events don't carry it
+                         // (only 'status' and 'done' do), so result/log handlers read this
+                         // instead of assuming "not paused" — see startSSE().
   pollTimer: null,
   runStartTime: 0,      // ms timestamp when the current run began (for ETA)
   resultSort: 'default',
