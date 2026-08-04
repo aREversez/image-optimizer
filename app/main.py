@@ -1341,6 +1341,17 @@ async def events(request: Request, state: AppState = Depends(get_session)):
             if time.time() - last_emit > 5:
                 yield ": keepalive\n\n"
                 last_emit = time.time()
+
+            # Detect a client that's gone away (tab closed, navigated off,
+            # network drop) explicitly rather than relying solely on the
+            # ASGI layer to raise GeneratorExit into us on the next yield —
+            # that's the common case, but this loop spends most of its time
+            # in asyncio.sleep() rather than yielding, so a disconnect could
+            # otherwise go unnoticed for a while and leave the generator
+            # (and its reference to `state`) alive longer than it should be.
+            if await request.is_disconnected():
+                return
+
             await asyncio.sleep(0.1)
 
     return StreamingResponse(
