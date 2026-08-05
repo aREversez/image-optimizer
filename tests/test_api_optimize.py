@@ -332,6 +332,39 @@ class TestSkipExisting:
         # No persistent output folder -> nothing to reuse -> normal compression.
         assert not any(res.get("skipped") for res in d["results"])
 
+    def test_skip_existing_recompresses_when_source_changed(self, client, auth_headers, tmp_path):
+        """Regression: same filename, different content (e.g. a screenshot
+        re-taken under the same name) must NOT be silently reused just
+        because the output folder already has a file at that path."""
+        from PIL import Image
+
+        src = tmp_path / "src"
+        src.mkdir()
+        out_dir = tmp_path / "out"
+        img_path = src / "a.png"
+        Image.new("RGB", (10, 10), (255, 0, 0)).save(img_path)
+
+        scan_and_wait(client, auth_headers, src)
+        r, d = optimize_and_wait(client, auth_headers, output_dir=str(out_dir))
+        assert r.status_code == 200 and not d["results"][0].get("skipped")
+        out_file = out_dir / "a.png"
+
+        # Re-save under the same name with different content, mtime
+        # strictly newer (some filesystems have 1s mtime granularity).
+        import time
+        time.sleep(1.1)
+        Image.new("RGB", (10, 10), (0, 255, 0)).save(img_path)
+
+        scan_and_wait(client, auth_headers, src)
+        r, d = optimize_and_wait(client, auth_headers, output_dir=str(out_dir), skip_existing=True)
+        assert r.status_code == 200
+        assert not d["results"][0].get("skipped"), "changed source was wrongly reused instead of recompressed"
+
+        with Image.open(out_file) as final:
+            assert final.convert("RGB").getpixel((0, 0)) == (0, 255, 0), (
+                "output still holds the stale pre-change pixel data"
+            )
+
     def test_normal_subset_run_with_skip_existing_wipes_stale_outputs(self, client, auth_headers, test_images, tmp_path):
         """Regression: skip_existing must NOT suppress the ws/output wipe on a
         normal (non-retry) run. The wipe is per-batch and only retry should

@@ -1071,12 +1071,33 @@ async def _process_files(
         # _is_valid_reusable_output guards against reusing a truncated/corrupt
         # leftover from a previous run that was interrupted mid-write — a
         # non-empty file alone isn't proof it's complete.
+        # Staleness: reuse is only valid if the *source* hasn't changed since
+        # the existing output was produced. Same filename doesn't mean same
+        # content — e.g. a screenshot re-taken under the same name. There's no
+        # manifest recording "this output came from source hash X" (and we
+        # deliberately don't want to write sidecar files into the user's real
+        # output folder), so this uses the same mtime-newer-than-target check
+        # every incremental build tool uses (make, rsync -u, ...): if the
+        # source's mtime is more recent than the existing output's, treat it
+        # as changed and recompress instead of reusing. For the upload flow
+        # specifically, input_path is a fresh workspace-local copy made at
+        # upload time, so its mtime is always "now" — re-uploading an
+        # unchanged file will (safely, if unnecessarily) recompress rather
+        # than reuse; that's the conservative direction to fail in.
         # Note: a skipped file is NOT recompressed, so per-file overrides are
         # intentionally ignored on the skip path (the existing output stands).
         if skip_existing and output_dir:
             rel = out_path.relative_to(opt_output_dir)
             dest = Path(output_dir) / rel
-            if dest.exists() and dest.stat().st_size > 0 and _is_valid_reusable_output(dest, eff_output_format):
+            source_unchanged = (
+                input_path.exists() and dest.exists()
+                and input_path.stat().st_mtime <= dest.stat().st_mtime
+            )
+            if (
+                source_unchanged
+                and dest.stat().st_size > 0
+                and _is_valid_reusable_output(dest, eff_output_format)
+            ):
                 shutil.copy2(dest, out_path)
                 orig_size = input_path.stat().st_size if input_path.exists() else 0
                 comp_size = dest.stat().st_size
