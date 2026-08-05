@@ -214,7 +214,16 @@ header h1 span { color: var(--accent); }
   font-size: 12px; margin-top: 6px; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap;
 }
-.file-card .fsize { font-size: 11px; color: var(--text2); }
+/* fsize + preview-btn share one row so the button can never ride up over
+   .fname above it (it did when it was absolutely positioned off the
+   bottom of .fc-main, which floated at a fixed offset regardless of how
+   tall the content above actually was) — same line, same baseline, always
+   bottom-aligned with the size text by construction. */
+.file-card .fmeta { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-top: 2px; }
+.file-card .fsize {
+  font-size: 11px; color: var(--text2); flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .file-card .check {
   position: absolute; top: 4px; right: 4px; width: 18px; height: 18px;
   border-radius: 50%; background: rgba(0,0,0,.6); border: 2px solid rgba(255,255,255,.3);
@@ -223,11 +232,9 @@ header h1 span { color: var(--accent); }
 }
 .file-card.selected .check { background: var(--accent); border-color: var(--accent); color: #000; }
 .file-card .preview-btn {
-  position: absolute; bottom: 4px; right: 4px;
-  font-size: 10px; padding: 2px 6px; border-radius: 4px;
+  font-size: 10px; padding: 2px 6px; border-radius: 4px; flex-shrink: 0;
   border: 1px solid var(--border); background: var(--card); color: var(--text2);
-  cursor: pointer; white-space: nowrap; max-width: calc(100% - 12px);
-  overflow: hidden; text-overflow: ellipsis; transition: opacity .15s;
+  cursor: pointer; white-space: nowrap; transition: opacity .15s;
   opacity: 0;
 }
 .file-card:hover .preview-btn, .file-card .preview-btn:not(:disabled) { opacity: .9; }
@@ -995,13 +1002,15 @@ function renderFiles() {
         <div class="fc-main">
           <img class="thumb" src="${f.thumbnail}" alt="${escHtml(f.name)}" loading="lazy" />
           <div class="fname" title="${escHtml(f.name)}">${escHtml(f.name)}</div>
-          <div class="fsize">${fmtSize(f.size)}</div>
+          <div class="fmeta">
+            <span class="fsize" title="${fmtSize(f.size)}">${fmtSize(f.size)}</span>
+            <button class="preview-btn" type="button"
+              title="Run a single-file dry run with the current settings to project the compressed size. Does not affect results or the download ZIP."
+              onclick="event.stopPropagation(); previewFile('${f.id}', this)">Preview</button>
+          </div>
           <div class="check">✓</div>
           <button class="card-gear" type="button" title="Per-file settings (override the global quality/mode for just this file)"
             onclick="event.stopPropagation(); toggleFileOverride('${f.id}', this)">⚙</button>
-          <button class="preview-btn" type="button"
-            title="Run a single-file dry run with the current settings to project the compressed size. Does not affect results or the download ZIP."
-            onclick="event.stopPropagation(); previewFile('${f.id}', this)">Preview</button>
         </div>
         <div class="file-override" data-id="${f.id}" hidden onclick="event.stopPropagation()">
           <div class="fo-row">
