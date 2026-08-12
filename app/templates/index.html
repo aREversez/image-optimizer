@@ -370,6 +370,15 @@ header h1 span { color: var(--accent); }
 
 <div id="notice-container"></div>
 
+<!-- Batch resume banner -->
+<div id="batch-resume-banner" style="display:none;background:#fff3cd;border:1px solid #ffc107;border-radius:8px;padding:12px 20px;margin:0 24px;display:none;align-items:center;gap:12px;font-size:14px">
+  <span id="batch-resume-text"></span>
+  <div style="margin-left:auto;display:flex;gap:8px">
+    <button class="btn btn-primary btn-sm" id="batch-resume-btn" style="padding:4px 16px;font-size:13px">Resume</button>
+    <button class="btn btn-secondary btn-sm" id="batch-dismiss-btn" style="padding:4px 12px;font-size:13px">Dismiss</button>
+  </div>
+</div>
+
 <div class="container">
 
   <div class="app-sidebar">
@@ -1900,6 +1909,62 @@ async function checkWatchStatus() {
   } catch(e) { /* fresh session or server unreachable */ }
 }
 
+// --- Batch resume ---
+const resumeBanner = $('batch-resume-banner');
+const resumeText = $('batch-resume-text');
+const batchResumeBtn = $('batch-resume-btn');
+const batchDismissBtn = $('batch-dismiss-btn');
+let _savedBatchState = null;  // remember params from the banner to send on Resume
+
+async function checkBatchState() {
+  try {
+    const r = await fetch('/api/batch-state');
+    const d = await r.json();
+    if (!d.has_batch) return;
+    _savedBatchState = d;
+    resumeText.textContent = `Found unfinished batch: ${d.done}/${d.total} completed (${d.failed} failed). Resume?`;
+    resumeBanner.style.display = 'flex';
+  } catch(e) { /* no batch or server error */ }
+}
+
+batchResumeBtn.addEventListener('click', async () => {
+  if (!_savedBatchState) return;
+  resumeBanner.style.display = 'none';
+  // Pre-fill the output dir from the saved batch so the UI is consistent
+  if (_savedBatchState.output_dir) {
+    outputDir.value = _savedBatchState.output_dir;
+  }
+  try {
+    const r = await apiFetch('/api/optimize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        resume: true,
+        output_dir: _savedBatchState.output_dir,
+        output_format: _savedBatchState.output_format,
+        quality: _savedBatchState.quality,
+        compression_mode: _savedBatchState.compression_mode,
+      }),
+    });
+    const d = await r.json();
+    if (!r.ok) { showNotice(d.error || 'Resume failed', 'err'); return; }
+    STATE.isRunning = true;
+    STATE.runStartTime = Date.now();
+    STATE.resultCursor = 0;
+    STATE.logCursor = 0;
+    cancelBtn.style.display = '';
+    updateStartButtonState();
+    startSSE();
+  } catch(e) {
+    showNotice('Resume failed: ' + e.message, 'err');
+  }
+});
+
+batchDismissBtn.addEventListener('click', () => {
+  resumeBanner.style.display = 'none';
+  _savedBatchState = null;
+});
+
 // Init
 applyStoredTheme();
 loadConfig();
@@ -1917,6 +1982,7 @@ if (autoDir) {
   restoreState();
 }
 checkWatchStatus();
+checkBatchState();
 </script>
 </body>
 </html>

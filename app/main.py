@@ -246,6 +246,37 @@ def _recent_file() -> Path:
     return _config_dir() / "recent.json"
 
 
+def _batch_state_file() -> Path:
+    return _config_dir() / "batch_state.json"
+
+
+def _load_batch_state() -> Optional[dict]:
+    """Load persisted batch state from ~/.image-optimizer/batch_state.json.
+    Returns None if the file doesn't exist or is corrupt."""
+    try:
+        return json.loads(_batch_state_file().read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+
+def _save_batch_state(bs: dict):
+    """Persist batch state to disk. Called after each file completes so a
+    crash / server restart can pick up where it left off."""
+    try:
+        bs["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        _batch_state_file().write_text(json.dumps(bs, indent=2, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass  # best-effort — a write failure here mustn't crash the batch
+
+
+def _clear_batch_state():
+    """Remove the batch state file — called when a batch completes fully."""
+    try:
+        _batch_state_file().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 # Defaults for everything a config.json can override. CLI flags (where they
 # exist) take priority over the config file, which takes priority over
 # these. Keep this in sync with README's config.json documentation.
@@ -852,10 +883,65 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
     if state.watch_running:
         return JSONResponse({"error": "Watch mode is running, stop it first"}, status_code=400)
 
-    files_to_process = state.files
-    if data.file_ids is not None:
-        ids = set(data.file_ids)
-        files_to_process = [f for f in state.files if f["id"] in ids]
+    # --- Resume flow ---
+    # When resume=True, reconstruct state from batch_state.json. The server
+    # may have restarted, so state.files is empty — we rebuild it from the
+    # persisted batch state and only process files that weren't completed.
+    batch_state = None
+    previous_results = []
+    if data.resume:
+        bs = _load_batch_state()
+        if bs is None:
+            return JSONResponse(
+                {"error": "No resumable batch state found"},
+                status_code=400,
+            )
+        # Validate dirs match — the user can't resume into a different output folder
+        if bs.get("output_dir", "") != data.output_dir:
+            return JSONResponse(
+                {"error": "Output directory doesn't match the saved batch"},
+                status_code=400,
+            )
+        # Reconstruct state.files from batch_state (server may have restarted)
+        state.files = [
+            {"id": f.get("id", secrets.token_urlsafe(8)), "name": f["name"], "path": f["path"],
+             "size": f.get("size", 0), "thumbnail": ""}
+            for f in bs.get("files", [])
+            if Path(f["path"]).exists()
+        ]
+        if not state.files:
+            return JSONResponse(
+                {"error": "Source files no longer available for resume"},
+                status_code=400,
+            )
+        # Filter to pending/failed only
+        pending_paths = {
+            f["path"] for f in bs.get("files", [])
+            if f["status"] in ("pending", "failed")
+        }
+        files_to_process = [
+            f for f in state.files if f["path"] in pending_paths
+        ]
+        if not files_to_process:
+            return JSONResponse(
+                {"error": "No pending files to resume"},
+                status_code=400,
+            )
+        # Restore previous results for the UI (compare, progress display)
+        previous_results = bs.get("results", [])
+        batch_state = bs
+        # Create a workspace for this session (the old one is gone if the
+        # server restarted — _process_files needs one for its output dir).
+        if state.workspace is None:
+            state.new_workspace()
+        # Skip the normal file selection — resume uses its own filtered list
+        # (fall through to the validation/override checks below with
+        # files_to_process already set)
+    else:
+        files_to_process = state.files
+        if data.file_ids is not None:
+            ids = set(data.file_ids)
+            files_to_process = [f for f in state.files if f["id"] in ids]
 
     if not files_to_process:
         return JSONResponse({"error": "No files to process"}, status_code=400)
@@ -877,7 +963,11 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
     state.logs = []
     state.cancelled = False
     state.paused = False
-    if data.retry:
+    if data.resume:
+        # Restore previous results from the batch so the UI shows the full
+        # picture (earlier successes + new ones as they complete).
+        state.results = list(previous_results)
+    elif data.retry:
         # Retry re-runs only the previously-failed files. Keep every result
         # that isn't being retried (the earlier successes and their outputs
         # on disk stay intact) and drop just the stale entries for the ids
@@ -887,6 +977,28 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
         state.results = [r for r in state.results if r.get("id") not in retry_ids]
     else:
         state.results = []
+
+    # Create batch state for normal runs with a persistent output_dir —
+    # this is what enables resume after a crash / server restart. Runs
+    # without output_dir use a temp workspace that disappears anyway, so
+    # there's nothing to resume into.
+    if not data.resume and data.output_dir:
+        batch_state = {
+            "session_id": secrets.token_urlsafe(12),
+            "input_dir": str(Path(state.files[0]["path"]).parent) if state.files else "",
+            "output_dir": data.output_dir,
+            "output_format": data.output_format,
+            "quality": data.quality,
+            "compression_mode": data.compression_mode,
+            "files": [
+                {"id": f["id"], "path": f["path"], "name": f["name"], "size": f.get("size", 0), "status": "pending"}
+                for f in files_to_process
+            ],
+            "results": [],
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        _save_batch_state(batch_state)
 
     # Surface degraded capability up front instead of only as a per-file
     # log line: PNG+standard without pngquant still runs, but silently
@@ -923,6 +1035,7 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
             skip_existing=data.skip_existing,
             keep_exif=data.keep_exif,
             overrides=data.overrides,
+            batch_state=batch_state,
         )
     )
 
@@ -1006,6 +1119,7 @@ async def _process_files(
     skip_existing: bool = False,
     keep_exif: bool = False,
     overrides: Optional[dict] = None,
+    batch_state: Optional[dict] = None,
 ):
     if optimizer is None:
         state.logs.append("Optimizer not initialized")
@@ -1013,6 +1127,14 @@ async def _process_files(
         return
 
     overrides = overrides or {}
+
+    # Build a path→entry lookup for batch state persistence — O(1) per file
+    # instead of scanning the whole list each time. Only populated when a
+    # batch_state was provided (resume flow).
+    _bs_lookup: dict[str, dict] = {}
+    if batch_state:
+        for _f in batch_state.get("files", []):
+            _bs_lookup[_f["path"]] = _f
 
     ws = state.workspace
     opt_output_dir = ws / "output"
@@ -1152,6 +1274,11 @@ async def _process_files(
                 }
                 state.logs.append(f"  SKIP {file_info['name']} (already optimized)")
                 state.results.append(skipped_result)
+                # Persist to batch state — a skipped file is "done"
+                if file_info["path"] in _bs_lookup:
+                    _bs_lookup[file_info["path"]]["status"] = "done"
+                    batch_state.setdefault("results", []).append(skipped_result)
+                    _save_batch_state(batch_state)
                 return
 
         state.logs.append(f"Processing: {file_info['name']}")
@@ -1210,6 +1337,15 @@ async def _process_files(
         # have no `await` between them, so no other worker interleaves).
         state.results.append(result)
 
+        # Persist per-file status to batch_state.json — this is what lets
+        # a crashed / restarted server pick up where it left off. Written
+        # inside process_one (not on_item_done) because the result dict
+        # with success/failure lives here; on_item_done only bumps the counter.
+        if file_info["path"] in _bs_lookup:
+            _bs_lookup[file_info["path"]]["status"] = "done" if result.get("success") else "failed"
+            batch_state.setdefault("results", []).append(result)
+            _save_batch_state(batch_state)
+
     def on_item_error(file_info, e):
         # Anything process_one doesn't already catch internally (optimize_png
         # has its own try/except, but e.g. mkdir permission errors or a
@@ -1226,6 +1362,10 @@ async def _process_files(
             "original_size": 0,
             "compressed_size": 0,
         })
+        # Persist failure to batch state so resume picks it up
+        if file_info.get("path") in _bs_lookup:
+            _bs_lookup[file_info["path"]]["status"] = "failed"
+            _save_batch_state(batch_state)
 
     def on_item_done(_file_info):
         state.current += 1
@@ -1264,6 +1404,13 @@ async def _process_files(
         )
         if output_dir:
             state.logs.append(f"  Output saved to: {Path(output_dir).resolve()}")
+        # Batch state: clear only when every file is done (no resume needed).
+        # If some are still pending/failed (cancel, crash, partial failure),
+        # leave the file on disk so the frontend can offer a Resume button.
+        if batch_state:
+            remaining = [f for f in batch_state.get("files", []) if f["status"] in ("pending", "failed")]
+            if not remaining:
+                _clear_batch_state()
 
 
 @app.get("/api/progress")
@@ -1859,6 +2006,31 @@ async def get_state(state: AppState = Depends(get_session)):
         "is_running": state.is_running,
         "current": state.current,
         "total": state.total,
+    })
+
+
+@app.get("/api/batch-state")
+async def get_batch_state(state: AppState = Depends(get_session)):
+    """Return whether there's an unfinished batch that can be resumed.
+    Called on page load so the frontend can show a 'Resume?' prompt."""
+    bs = _load_batch_state()
+    if bs is None:
+        return JSONResponse({"has_batch": False})
+    total = len(bs.get("files", []))
+    done = sum(1 for f in bs.get("files", []) if f["status"] == "done")
+    failed = sum(1 for f in bs.get("files", []) if f["status"] == "failed")
+    pending = total - done - failed
+    return JSONResponse({
+        "has_batch": True,
+        "total": total,
+        "done": done,
+        "failed": failed,
+        "pending": pending,
+        "output_dir": bs.get("output_dir", ""),
+        "output_format": bs.get("output_format", "png"),
+        "quality": bs.get("quality", "medium"),
+        "compression_mode": bs.get("compression_mode", "standard"),
+        "created_at": bs.get("created_at", ""),
     })
 
 

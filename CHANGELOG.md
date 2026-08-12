@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Batch resume** (`GET /api/batch-state`, `POST /api/optimize` with
+  `resume: true`). Progress is persisted to
+  `~/.image-optimizer/batch_state.json` after each file completes. If the
+  server crashes or the user cancels mid-batch, the frontend shows a
+  banner on reload ("Found unfinished batch: X/Y completed") with a
+  Resume button that re-processes only the pending/failed files into the
+  same output directory. Batch state is auto-cleared when every file
+  finishes successfully. Runs without a persistent output_dir don't
+  create batch state (the temp workspace disappears anyway).
 - **Watch mode** (`POST /api/watch/start`, `/stop`, `/status`, `/events`).
   Monitor a folder and auto-optimize new or changed images as they appear.
   `FolderWatcher` polls on a timer, diffs by (mtime, size), and fires a
