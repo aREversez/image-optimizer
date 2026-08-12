@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **True JPEG optimization** (`output_format: "jpg"`). Selecting JPG for a
+  batch of `.jpg` files now genuinely re-compresses them lossily with
+  mozjpeg's `cjpeg` while *keeping the JPEG format* — previously JPEG/BMP/
+  TIFF/WebP sources were silently transcoded to PNG or WebP, so "just make
+  this batch of JPEGs smaller, same format" wasn't possible. Pillow decodes
+  (EXIF orientation baked in, alpha composited onto white, optional resize)
+  to a PPM intermediate, then `cjpeg -quality N -progressive -optimize`
+  re-encodes. `keep_exif` works too: cleaned EXIF is re-injected as an APP1
+  segment after SOI. `cjpeg`/`cjpeg-static` is auto-detected in `bin/` or
+  PATH; without it the `(jpg, *)` modes drop out of `available_modes()` and
+  Start warns up front. "Lossless"/"Resize Only" for JPEG map to the highest
+  cjpeg quality (95) — JPEG is inherently lossy, and the UI says so.
+
+## [August 2026 review batch]
+
 Six features from the August 2026 project review. Each shipped test-first
 with a regression test that exposes its cross-cutting interaction with the
 existing batch state machine (`skip_existing` / `retry` / narrowed

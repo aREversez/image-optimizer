@@ -193,6 +193,101 @@ class TestWebP:
         assert result["success"] is True
 
 
+class TestJPEG:
+    """JPEG output goes through mozjpeg's cjpeg (a genuine lossy re-encode
+    that keeps the JPEG format), a separate code path from the pngquant/
+    oxipng PNG pipeline and the Pillow WebP encoder. The fake cjpeg in
+    conftest decodes the PPM intermediate Pillow writes and re-saves it as a
+    real JPEG — so tests can open results with Pillow, unlike the byte-copy
+    pngquant/oxipng stand-ins."""
+
+    def test_standard_lossy_jpg_keeps_jpeg_format(self, tmp_path, optimizer):
+        src = tmp_path / "photo.jpg"
+        Image.new("RGB", (100, 100), (200, 100, 50)).save(src, format="JPEG")
+        out = tmp_path / "photo.jpg"
+
+        result = asyncio.run(optimizer.optimize_png(
+            src, out, output_format="jpg", compression_mode="standard", quality="high",
+        ))
+        assert result["success"] is True
+        with Image.open(out) as img:
+            assert img.format == "JPEG", "output must stay a real JPEG, not a renamed PNG"
+
+    def test_lossless_jpg_still_returns_jpeg(self, tmp_path, optimizer):
+        src = tmp_path / "src.jpg"
+        Image.new("RGB", (60, 60)).save(src, format="JPEG")
+
+        logs = []
+
+        async def log(msg):
+            logs.append(msg)
+
+        out = tmp_path / "out.jpg"
+        result = asyncio.run(optimizer.optimize_png(
+            src, out, output_format="jpg", compression_mode="lossless", progress_callback=log,
+        ))
+        assert result["success"] is True
+        with Image.open(out) as img:
+            assert img.format == "JPEG"
+        assert any("encoding JPEG via mozjpeg" in m for m in logs)
+
+    def test_resize_only_jpg_actually_resizes(self, tmp_path, optimizer):
+        src = tmp_path / "src.jpg"
+        Image.new("RGB", (200, 200), (10, 200, 10)).save(src, format="JPEG")
+        out = tmp_path / "out.jpg"
+
+        result = asyncio.run(optimizer.optimize_png(
+            src, out, output_format="jpg", max_width=80, compression_mode="resize_only",
+        ))
+        assert result["success"] is True
+        with Image.open(out) as img:
+            assert img.format == "JPEG"
+            assert img.size == (80, 80)
+
+    def test_png_source_can_be_encoded_to_jpg(self, tmp_path, optimizer):
+        """Format normalization in the other direction: a PNG source with an
+        output_format of jpg is decoded and re-encoded by cjpeg — the two
+        are independent axes."""
+        src = tmp_path / "src.png"
+        Image.new("RGB", (50, 50), (123, 45, 67)).save(src, format="PNG")
+        out = tmp_path / "out.jpg"
+
+        result = asyncio.run(optimizer.optimize_png(
+            src, out, output_format="jpg", compression_mode="standard",
+        ))
+        assert result["success"] is True
+        with Image.open(out) as img:
+            assert img.format == "JPEG"
+
+    def test_jpeg_requires_cjpeg(self, tmp_path):
+        from app.optimizer import Optimizer
+        opt = Optimizer(bin_dir=tmp_path / "nonexistent_bin_dir")
+        assert opt.cjpeg_path is None
+
+        src = tmp_path / "src.jpg"
+        Image.new("RGB", (30, 30)).save(src, format="JPEG")
+        out = tmp_path / "out.jpg"
+        result = asyncio.run(opt.optimize_png(src, out, output_format="jpg"))
+        assert result["success"] is False
+        assert "cjpeg" in result["error"]
+
+    def test_rgba_source_composited_for_jpeg(self, tmp_path, optimizer):
+        """JPEG has no alpha channel — a transparent PNG must be composited
+        onto white rather than crashing cjpeg with an unsupported color
+        mode."""
+        src = tmp_path / "transparent.png"
+        Image.new("RGBA", (40, 40), (200, 0, 0, 128)).save(src, format="PNG")
+        out = tmp_path / "out.jpg"
+
+        result = asyncio.run(optimizer.optimize_png(
+            src, out, output_format="jpg",
+        ))
+        assert result["success"] is True
+        with Image.open(out) as img:
+            assert img.format == "JPEG"
+            assert img.mode in ("RGB", "L")
+
+
 class TestAvailableModes:
     """`ready` predates WebP / lossless / resize_only and only described the
     Standard-mode PNG path — so it returns False on a build that can still
@@ -202,29 +297,35 @@ class TestAvailableModes:
     process, given which binaries it auto-detected."""
 
     def test_both_binaries_all_modes_available(self, fake_bin_dir, optimizer):
-        # `optimizer` fixture already points pngquant_path/oxipng_path at
-        # the .bat wrappers in fake_bin_dir — auto-detection deliberately
-        # bypassed (see conftest.py: same reason every other test here does
-        # the same, instead of relying on Optimizer's OS-specific path
-        # search).
+        # `optimizer` fixture already points pngquant_path/oxipng_path (and
+        # cjpeg_path) at the .bat wrappers in fake_bin_dir — auto-detection
+        # deliberately bypassed (see conftest.py: same reason every other
+        # test here does the same, instead of relying on Optimizer's
+        # OS-specific path search).
         opt = optimizer
         assert opt.pngquant_path is not None
         assert opt.oxipng_path is not None
+        assert opt.cjpeg_path is not None
         modes = opt.available_modes()
         assert {("png", "standard"), ("png", "lossless"), ("png", "resize_only"),
-                ("webp", "standard"), ("webp", "lossless"), ("webp", "resize_only")} == modes
+                ("webp", "standard"), ("webp", "lossless"), ("webp", "resize_only"),
+                ("jpg", "standard"), ("jpg", "lossless"), ("jpg", "resize_only")} == modes
 
-    def test_no_pngquant_drops_only_standard_png(self, tmp_path):
+    def test_no_binaries_drops_standard_png_and_all_jpeg(self, tmp_path):
         from app.optimizer import Optimizer
-        # No binaries found in bin_dir → both paths None.
+        # No binaries found in bin_dir → all paths None.
         opt = Optimizer(bin_dir=tmp_path / "nonexistent_bin_dir")
         assert opt.pngquant_path is None
         assert opt.oxipng_path is None
+        assert opt.cjpeg_path is None
 
         modes = opt.available_modes()
         # PNG standard — the one mode that actually needs pngquant for its
         # lossy color quantization step — is dropped.
         assert ("png", "standard") not in modes
+        # JPEG needs cjpeg for every mode (it's a genuine JPEG re-encode),
+        # so without it the whole (jpg, *) family disappears.
+        assert not any(fmt == "jpg" for fmt, _ in modes)
         # Everything else still works: lossless/resize_only PNG just uses
         # Pillow's PNG encoder (oxipng only shrinks further), and WebP is
         # Pillow-encoder-only.

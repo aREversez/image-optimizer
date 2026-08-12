@@ -435,6 +435,10 @@ header h1 span { color: var(--accent); }
         <label>Output Format</label>
         <div class="radio-group" id="format-group">
           <input type="radio" name="format" id="fmt-png" value="png" checked><label for="fmt-png">PNG</label>
+          <input type="radio" name="format" id="fmt-jpg" value="jpg"
+            title="Re-compresses images with mozjpeg's cjpeg while KEEPING the JPEG format — the way to shrink a batch of JPGs without converting them. Quality applies in Standard mode; 'Lossless' maps to the highest mozjpeg quality (~95) since JPEG is inherently lossy. Requires cjpeg in the bin/ directory.">
+          <label for="fmt-jpg"
+            title="Re-compresses images with mozjpeg's cjpeg while KEEPING the JPEG format — the way to shrink a batch of JPGs without converting them. Quality applies in Standard mode; 'Lossless' maps to the highest mozjpeg quality (~95) since JPEG is inherently lossy. Requires cjpeg in the bin/ directory.">JPG</label>
           <input type="radio" name="format" id="fmt-webp" value="webp"
             title="WebP typically produces smaller files than PNG at similar visual quality. Uses its own encoder (not pngquant/oxipng) — Quality/Protect Colors/Dithering don't apply, only Compression Mode's lossy-vs-lossless choice does.">
           <label for="fmt-webp"
@@ -472,6 +476,7 @@ header h1 span { color: var(--accent); }
       </div>
     </div>
     <div id="mode-hint" style="display:none;font-size:12px;color:var(--red);margin:-8px 0 16px"></div>
+    <div id="mode-note" style="display:none;font-size:12px;color:var(--yellow);margin:-8px 0 16px"></div>
     <div class="action-bar">
       <div class="spacer"></div>
       <span style="font-size:13px;color:var(--text2)" id="file-count-info"></span>
@@ -761,7 +766,9 @@ async function checkHealth() {
     else tools.push('pngquant ✗');
     if (d.oxipng) tools.push('oxipng ✓');
     else tools.push('oxipng ✗');
-    const allOk = d.pngquant && d.oxipng;
+    if (d.cjpeg) tools.push('cjpeg ✓');
+    else tools.push('cjpeg ✗');
+    const allOk = d.pngquant && d.oxipng && d.cjpeg;
     healthStatus.innerHTML =
       `<span class="status-dot ${allOk ? 'ok' : 'warn'}"></span>${tools.join(' ')}`;
     // NOTE: deliberately no startBtn touching here — missing binaries only
@@ -1029,6 +1036,12 @@ function renderFiles() {
             <span class="fo-label">Width</span>
             <input type="number" min="0" data-field="max_width" placeholder="inherit" oninput="setFileOverride('${f.id}')">
           </div>
+          <div class="fo-row">
+            <span class="fo-label">Format</span>
+            <select data-field="output_format" onchange="setFileOverride('${f.id}')">
+              <option value="">inherit</option><option value="png">png</option><option value="webp">webp</option><option value="jpg">jpg</option>
+            </select>
+          </div>
         </div>
       </div>
     `;
@@ -1156,12 +1169,25 @@ function updateModeDependentControls() {
   protectColorsGroup.classList.toggle('disabled-group', !pngquantApplies);
   ditheringGroup.classList.toggle('disabled-group', !pngquantApplies);
 
-  // Quality: relevant for Standard-mode PNG (pngquant target) and for
-  // Standard-mode WebP (Pillow's own quality parameter) — only meaningless
-  // when compression mode isn't Standard (Lossless/Resize Only skip
-  // quality entirely for both formats).
+  // Quality: relevant for Standard-mode PNG (pngquant target), Standard-mode
+  // WebP/AVIF (Pillow's/avifenc's own quality parameter), and Standard-mode
+  // JPEG (cjpeg -quality) — only meaningless when compression mode isn't
+  // Standard (Lossless/Resize Only skip quality entirely for every format).
   document.querySelectorAll('input[name="quality"]').forEach(r => r.disabled = !isStandard);
   document.getElementById('quality-group').classList.toggle('disabled-group', !isStandard);
+
+  // JPEG is an inherently lossy codec — there's no true lossless pass, so
+  // 'Lossless'/'Resize Only' for JPG just encodes at mozjpeg's highest
+  // quality (~95) with no palette change. Tell the user that up front
+  // instead of implying pixel-perfect output.
+  const modeNote = $('mode-note');
+  if (format === 'jpg' && !isStandard) {
+    modeNote.textContent =
+      'JPEG is inherently lossy — "Lossless" and "Resize Only" use mozjpeg\u2019s highest quality (~95) with no palette changes.';
+    modeNote.style.display = 'block';
+  } else {
+    modeNote.style.display = 'none';
+  }
 
   // Max Width is intentionally NOT tied to compression mode or format —
   // resizing is orthogonal to how colors/encoding are handled. You can

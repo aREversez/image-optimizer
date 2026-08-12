@@ -129,7 +129,7 @@ class TestPreviewOptimize:
     def test_preview_supports_keep_exif_and_formats(self, client, auth_headers, test_images):
         scanned = scan_and_wait(client, auth_headers, test_images)
         file_id = scanned["files"][0]["id"]
-        for fmt in ("png", "webp"):
+        for fmt in ("png", "webp", "jpg"):
             r = client.post(
                 "/api/preview-optimize",
                 json={"file_id": file_id, "output_format": fmt, "keep_exif": True},

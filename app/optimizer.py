@@ -37,6 +37,7 @@ class Optimizer:
             self.bin_dir = Path(__file__).resolve().parent.parent / "bin"
         self.pngquant_path: Optional[Path] = None
         self.oxipng_path: Optional[Path] = None
+        self.cjpeg_path: Optional[Path] = None
         self._detect_binaries()
         self._semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
@@ -76,11 +77,17 @@ class Optimizer:
         whether to enable a particular (format, mode) option in the UI or
         accept it on the server side.
         """
+        modes = {("webp", "standard"), ("webp", "lossless"), ("webp", "resize_only")}
         if self.pngquant_path is not None:
-            return {("png", "standard"), ("png", "lossless"), ("png", "resize_only"),
-                    ("webp", "standard"), ("webp", "lossless"), ("webp", "resize_only")}
-        return {("png", "lossless"), ("png", "resize_only"),
-                ("webp", "standard"), ("webp", "lossless"), ("webp", "resize_only")}
+            modes |= {("png", "standard"), ("png", "lossless"), ("png", "resize_only")}
+        else:
+            modes |= {("png", "lossless"), ("png", "resize_only")}
+        # JPEG output needs mozjpeg's cjpeg — every JPEG mode is a lossy
+        # re-encode (JPEG is an inherently lossy codec; "lossless" maps to
+        # the highest quality pass, see _optimize_jpeg). No cjpeg → no JPG.
+        if self.cjpeg_path is not None:
+            modes |= {("jpg", "standard"), ("jpg", "lossless"), ("jpg", "resize_only")}
+        return modes
 
     def _find_binary(self, name: str) -> Optional[Path]:
         try:
@@ -102,6 +109,17 @@ class Optimizer:
     def _detect_binaries(self):
         self.pngquant_path = self._find_binary("pngquant")
         self.oxipng_path = self._find_binary("oxipng")
+        # mozjpeg releases/prebuilt zip files name the encoder either
+        # `cjpeg` or `cjpeg-static` (the static variant shipped by several
+        # Windows/AiZ builds) — try both spellings so either is picked up.
+        self.cjpeg_path = self._find_binary_any(["cjpeg", "cjpeg-static"])
+
+    def _find_binary_any(self, names: list[str]) -> Optional[Path]:
+        for name in names:
+            path = self._find_binary(name)
+            if path is not None:
+                return path
+        return None
 
     @staticmethod
     def _is_png(path: Path) -> bool:
@@ -312,6 +330,12 @@ class Optimizer:
 
         if output_format == "webp":
             return await self._optimize_webp(
+                input_path, output_path, quality, max_width, compression_mode,
+                progress_callback, keep_exif=keep_exif, cleaned_exif=cleaned_exif,
+            )
+
+        if output_format in ("jpg", "jpeg"):
+            return await self._optimize_jpeg(
                 input_path, output_path, quality, max_width, compression_mode,
                 progress_callback, keep_exif=keep_exif, cleaned_exif=cleaned_exif,
             )
@@ -540,3 +564,168 @@ class Optimizer:
             result["error"] = str(e)
 
         return result
+
+    async def _optimize_jpeg(
+        self,
+        input_path: Path,
+        output_path: Path,
+        quality: str,
+        max_width: int,
+        compression_mode: str,
+        progress_callback: Optional[Callable],
+        *,
+        keep_exif: bool = False,
+        cleaned_exif: bytes = b"",
+    ) -> dict:
+        """Lossy JPEG re-encode through mozjpeg's cjpeg, keeping the JPEG
+        format (the output stays a .jpg — no conversion to PNG/WebP).
+
+        Why not pngquant/oxipng? Those only understand PNG input, and the
+        whole point of this path is a *genuine JPEG* compression. The
+        source is decoded with Pillow (EXIF orientation baked in, optional
+        resize, alpha composited onto white since JPEG has no alpha
+        channel), written to a PPM intermediate, then re-encoded by cjpeg
+        — mozjpeg's encoder produces smaller JPEGs than stock libjpeg at
+        equal quality (trellis quantization + tuned progressive output).
+        The PPM detour is deliberate: several common mozjpeg Windows
+        builds ship a cjpeg without the rdpng/rdjpeg readers, so the only
+        input format guaranteed to work on every build is PPM/PGM.
+
+        Mode semantics for JPEG (an inherently lossy codec):
+        - standard    -> cjpeg -quality from the {high, medium, low} map
+        - lossless    -> no true lossless JPEG pass exists; maps to the
+          highest cjpeg quality (95) so the re-encode loses as little as
+          possible. Name kept for consistency with the other formats;
+          the UI/available_modes docs make clear what it actually does.
+        - resize_only -> resize first, then encode at that same high
+          quality so the savings come from the smaller dimensions rather
+          than from dropping image quality.
+        """
+        original_size = os.path.getsize(input_path)
+        result = {
+            "success": False,
+            "original_size": original_size,
+            "compressed_size": original_size,
+            "error": None,
+            "warning": None,
+        }
+        if self.cjpeg_path is None:
+            result["error"] = "cjpeg (mozjpeg) not found — cannot produce JPEG output"
+            return result
+
+        quality_map = {"high": 85, "medium": 75, "low": 60}
+        if compression_mode in ("lossless", "resize_only"):
+            q = 95
+        else:
+            q = quality_map.get(quality, 75)
+
+        temp_files: list = []
+        try:
+            loop = asyncio.get_running_loop()
+            ppm_path = output_path.with_suffix(".src.ppm")
+            tmp_jpg = output_path.with_suffix(".cjpeg.jpg")
+            temp_files = [ppm_path, tmp_jpg]
+
+            def _prepare_ppm():
+                with Image.open(input_path) as opened:
+                    # Same orientation bake-in as _ensure_png / _optimize_webp
+                    # — a portrait phone JPEG must not come out sideways.
+                    img = ImageOps.exif_transpose(opened)
+                    if img.mode == "CMYK":
+                        img = img.convert("RGB")
+                    elif img.mode not in ("RGB", "L", "I;16"):
+                        # RGBA/LA/PA/P carry an alpha channel JPEG can't
+                        # hold — composite transparency onto white instead
+                        # of a bare convert("RGB"), which renders it black.
+                        rgba = img.convert("RGBA")
+                        bg = Image.new("RGB", rgba.size, (255, 255, 255))
+                        bg.paste(rgba, mask=rgba.getchannel("A"))
+                        img = bg
+
+                    if max_width > 0:
+                        w, h = img.size
+                        if w > max_width:
+                            ratio = max_width / w
+                            img = img.resize((max_width, int(h * ratio)), Image.Resampling.LANCZOS)
+
+                    # cjpeg starts fresh from the PPM so metadata can't
+                    # survive (matches the keep_exif=False strip-everything
+                    # default). When keep_exif=True the cleaned copy is
+                    # re-attached after encoding via _finalize_jpeg_exif.
+                    img.info.pop("exif", None)
+                    img.save(ppm_path, format="PPM")
+
+            if progress_callback:
+                mode_desc = "near-lossless" if compression_mode in ("lossless", "resize_only") else f"quality={q}"
+                await progress_callback(f"encoding JPEG via mozjpeg ({mode_desc})...")
+            await loop.run_in_executor(None, _prepare_ppm)
+
+            async with self._semaphore:
+                proc = await asyncio.create_subprocess_exec(
+                    str(self.cjpeg_path),
+                    "-quality", str(q),
+                    "-progressive",
+                    "-optimize",
+                    "-outfile", str(tmp_jpg),
+                    str(ppm_path),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr = await proc.communicate()
+
+            if tmp_jpg.exists():
+                if keep_exif and cleaned_exif:
+                    self._finalize_jpeg_exif(tmp_jpg, cleaned_exif)
+                tmp_jpg.replace(output_path)
+            else:
+                msg = stderr.decode().strip()
+                if progress_callback:
+                    await progress_callback(f"cjpeg: {msg} (skipped)")
+                result["warning"] = msg or "cjpeg produced no output"
+                result["error"] = "cjpeg did not produce an output file"
+                return result
+
+            if output_path.exists():
+                result["compressed_size"] = os.path.getsize(output_path)
+                result["success"] = True
+            else:
+                result["error"] = "output file not generated"
+        except Exception as e:
+            result["success"] = False
+            result["error"] = str(e)
+        finally:
+            for f in temp_files:
+                try:
+                    if f.exists() and f != output_path:
+                        f.unlink()
+                except Exception:
+                    pass
+
+        return result
+
+    @staticmethod
+    def _finalize_jpeg_exif(jpg_path: Path, exif_bytes: bytes) -> None:
+        """Attach cleaned EXIF to a finished JPEG by inserting a single APP1
+        'Exif' segment right after the SOI marker.
+
+        cjpeg writes metadata-free output from the PPM intermediate, so the
+        finished .jpg only ever carries the EXIF we inject here (preserving
+        the keep_exif=False strip-everything default). JPEG APP1 Exif
+        payloads are `Exif\\x00\\x00` followed by raw TIFF; cleaned_exif
+        from _capture_cleaned_exif is already the raw TIFF (prefix
+        stripped), so the prefix is re-added here. Best-effort — never
+        raises: a failed metadata attach must not turn a successful
+        compression into a failure."""
+        if not exif_bytes:
+            return
+        if exif_bytes[:1] not in (b"I", b"M"):
+            return
+        try:
+            data = jpg_path.read_bytes()
+            if data[:2] != b"\xff\xd8":  # not a JPEG (no SOI marker) — bail
+                return
+            payload = b"Exif\x00\x00" + exif_bytes
+            segment = b"\xff\xe1" + struct.pack(">H", len(payload) + 2) + payload
+            jpg_path.write_bytes(data[:2] + segment + data[2:])
+        except Exception:
+            pass

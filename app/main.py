@@ -351,10 +351,12 @@ async def lifespan(app: FastAPI):
         tools.append(f"pngquant: {optimizer.pngquant_path}")
     if optimizer.oxipng_path:
         tools.append(f"oxipng: {optimizer.oxipng_path}")
+    if optimizer.cjpeg_path:
+        tools.append(f"cjpeg: {optimizer.cjpeg_path}")
     if tools:
         print(f"[Startup] Detected: {', '.join(tools)}")
     else:
-        print("[Startup] pngquant/oxipng not found — place binaries in the bin/ directory")
+        print("[Startup] pngquant/oxipng/cjpeg not found — place binaries in the bin/ directory")
     sweep_task = asyncio.create_task(_sweep_stale_sessions())
     yield
     sweep_task.cancel()
@@ -453,7 +455,12 @@ def _is_valid_reusable_output(path: Path, expected_format: str) -> bool:
             fmt = (img.format or "").upper()
     except Exception:
         return False
-    expected = "PNG" if expected_format == "png" else "WEBP"
+    expected = {
+        "png": "PNG",
+        "webp": "WEBP",
+        "jpg": "JPEG",
+        "jpeg": "JPEG",
+    }.get(expected_format, "PNG")
     return fmt == expected
 
 
@@ -619,8 +626,10 @@ async def health():
     return JSONResponse({
         "pngquant": optimizer.pngquant_path is not None,
         "oxipng": optimizer.oxipng_path is not None,
+        "cjpeg": optimizer.cjpeg_path is not None,
         "pngquant_path": str(optimizer.pngquant_path) if optimizer.pngquant_path else None,
         "oxipng_path": str(optimizer.oxipng_path) if optimizer.oxipng_path else None,
+        "cjpeg_path": str(optimizer.cjpeg_path) if optimizer.cjpeg_path else None,
     })
 
 
@@ -806,12 +815,12 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
             {"error": f"Invalid quality: {data.quality!r}. Supported: 'high', 'medium', 'low'."},
             status_code=400,
         )
-    if data.output_format not in ("png", "webp"):
-        # The pipeline only ever produces real PNG or WebP bytes — accepting
-        # anything else here would silently produce a file whose extension
-        # lies about its actual content.
+    if data.output_format not in ("png", "webp", "jpg"):
+        # The pipeline only ever produces real PNG, WebP, or JPEG bytes —
+        # accepting anything else here would silently produce a file whose
+        # extension lies about its actual content.
         return JSONResponse(
-            {"error": f"Unsupported output_format: {data.output_format!r}. Supported: 'png', 'webp'."},
+            {"error": f"Unsupported output_format: {data.output_format!r}. Supported: 'png', 'webp', 'jpg'."},
             status_code=400,
         )
     if data.compression_mode == "resize_only" and data.max_width <= 0:
@@ -864,13 +873,21 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
     # Surface degraded capability up front instead of only as a per-file
     # log line: PNG+standard without pngquant still runs, but silently
     # downgrades to lossless-only compression — the user should know why
-    # their files barely shrank. available_modes() is the source of truth.
+    # their files barely shrank. JPEG without cjpeg fails outright per-file,
+    # so warn before any work starts. available_modes() is the source of
+    # truth.
     warning = None
     if optimizer is not None and (data.output_format, data.compression_mode) not in optimizer.available_modes():
-        warning = (
-            "pngquant not found — Standard mode PNG output falls back to lossless-only "
-            "compression (larger files). Place pngquant in the bin/ directory for full compression."
-        )
+        if data.output_format in ("jpg", "jpeg"):
+            warning = (
+                "cjpeg (mozjpeg) not found — JPEG output isn't possible. Place cjpeg in the "
+                "bin/ directory (or PATH) to compress JPEGs while keeping the JPEG format."
+            )
+        else:
+            warning = (
+                "pngquant not found — Standard mode PNG output falls back to lossless-only "
+                "compression (larger files). Place pngquant in the bin/ directory for full compression."
+            )
         state.logs.append(f"[Warning] {warning}")
 
     asyncio.create_task(
@@ -935,7 +952,7 @@ def _validate_overrides(overrides: dict, selected_ids: set, top_mode: str, top_w
             return f"Invalid quality in override for file {fid!r}: {ov['quality']!r}"
         if "compression_mode" in ov and ov["compression_mode"] not in ("standard", "lossless", "resize_only"):
             return f"Invalid compression_mode in override for file {fid!r}: {ov['compression_mode']!r}"
-        if "output_format" in ov and ov["output_format"] not in ("png", "webp"):
+        if "output_format" in ov and ov["output_format"] not in ("png", "webp", "jpg"):
             return f"Invalid output_format in override for file {fid!r}: {ov['output_format']!r}"
         if "max_width" in ov and (not isinstance(ov["max_width"], int) or isinstance(ov["max_width"], bool) or ov["max_width"] < 0):
             return f"Invalid max_width in override for file {fid!r}: {ov['max_width']!r}"
@@ -1434,9 +1451,9 @@ async def preview_optimize(data: PreviewRequest, state: AppState = Depends(get_s
             {"error": f"Invalid quality: {data.quality!r}. Supported: 'high', 'medium', 'low'."},
             status_code=400,
         )
-    if data.output_format not in ("png", "webp"):
+    if data.output_format not in ("png", "webp", "jpg"):
         return JSONResponse(
-            {"error": f"Unsupported output_format: {data.output_format!r}. Supported: 'png', 'webp'."},
+            {"error": f"Unsupported output_format: {data.output_format!r}. Supported: 'png', 'webp', 'jpg'."},
             status_code=400,
         )
     if data.compression_mode == "resize_only" and data.max_width <= 0:

@@ -51,6 +51,23 @@ else:
     sys.exit(1)
 '''
 
+# Unlike the pngquant/oxipng stand-ins (which copy bytes through — suitable
+# because the optimizer only checks existence/size afterward), cjpeg's output
+# is expected to be a *real JPEG* by tests that open the result with Pillow.
+# So this one decodes the PPM/PGM intermediate Pillow wrote and re-saves it
+# as a genuine JPEG, mirroring what a real mozjpeg cjpeg produces well
+# enough for the pipeline to be exercised end-to-end.
+CJPEG_IMPL = '''#!/usr/bin/env python3
+import sys
+from PIL import Image
+args = sys.argv[1:]
+out_path = args[args.index("-outfile") + 1]
+in_path = args[-1]
+img = Image.open(in_path)
+img.save(out_path, "JPEG", quality=90)
+sys.exit(0)
+'''
+
 
 @pytest.fixture
 def fake_bin_dir(tmp_path: Path) -> Path:
@@ -58,8 +75,10 @@ def fake_bin_dir(tmp_path: Path) -> Path:
     bin_dir.mkdir()
     pngquant_impl = bin_dir / "pngquant_impl.py"
     oxipng_impl = bin_dir / "oxipng_impl.py"
+    cjpeg_impl = bin_dir / "cjpeg_impl.py"
     pngquant_impl.write_text(PNGQUANT_IMPL)
     oxipng_impl.write_text(OXIPNG_IMPL)
+    cjpeg_impl.write_text(CJPEG_IMPL)
 
     if sys.platform == "win32":
         # Optimizer._find_binary only looks for a literal *.exe on
@@ -72,15 +91,20 @@ def fake_bin_dir(tmp_path: Path) -> Path:
         # Python logic used on every other platform.
         pngquant = bin_dir / "pngquant.bat"
         oxipng = bin_dir / "oxipng.bat"
+        cjpeg = bin_dir / "cjpeg.bat"
         pngquant.write_text(f'@echo off\r\n"{sys.executable}" "{pngquant_impl}" %*\r\n')
         oxipng.write_text(f'@echo off\r\n"{sys.executable}" "{oxipng_impl}" %*\r\n')
+        cjpeg.write_text(f'@echo off\r\n"{sys.executable}" "{cjpeg_impl}" %*\r\n')
     else:
         pngquant = bin_dir / "pngquant"
         oxipng = bin_dir / "oxipng"
+        cjpeg = bin_dir / "cjpeg"
         pngquant.write_text(f'#!/usr/bin/env python3\nimport subprocess, sys\nsys.exit(subprocess.call([{sys.executable!r}, {str(pngquant_impl)!r}, *sys.argv[1:]]))\n')
         oxipng.write_text(f'#!/usr/bin/env python3\nimport subprocess, sys\nsys.exit(subprocess.call([{sys.executable!r}, {str(oxipng_impl)!r}, *sys.argv[1:]]))\n')
+        cjpeg.write_text(f'#!/usr/bin/env python3\nimport subprocess, sys\nsys.exit(subprocess.call([{sys.executable!r}, {str(cjpeg_impl)!r}, *sys.argv[1:]]))\n')
         pngquant.chmod(pngquant.stat().st_mode | stat.S_IEXEC)
         oxipng.chmod(oxipng.stat().st_mode | stat.S_IEXEC)
+        cjpeg.chmod(cjpeg.stat().st_mode | stat.S_IEXEC)
     return bin_dir
 
 
@@ -94,6 +118,7 @@ def optimizer(fake_bin_dir: Path):
     ext = ".bat" if sys.platform == "win32" else ""
     opt.pngquant_path = fake_bin_dir / f"pngquant{ext}"
     opt.oxipng_path = fake_bin_dir / f"oxipng{ext}"
+    opt.cjpeg_path = fake_bin_dir / f"cjpeg{ext}"
     return opt
 
 
@@ -126,9 +151,18 @@ def app_module(optimizer):
 
 
 @pytest.fixture
-def client(app_module):
+def client(app_module, optimizer):
+    import app.main as m
     from fastapi.testclient import TestClient
     with TestClient(app_module.app) as c:
+        # TestClient.__enter__ runs the lifespan, and the lifespan re-creates
+        # the module-global `optimizer` from auto-detection (`Optimizer(...)`)
+        # — clobbering the fixture's fake-binary assignment done in app_module.
+        # Re-point the global at the fixture's fake binaries now that startup
+        # is done, so every request during the test deterministically routes
+        # through them (in CI there are no real binaries, so without this the
+        # API tests would silently run with a half-configured optimizer).
+        m.optimizer = optimizer
         yield c
 
 

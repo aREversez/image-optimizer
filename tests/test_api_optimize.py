@@ -199,19 +199,38 @@ class TestValidation:
         assert r.status_code == 200
 
     def test_unsupported_output_format_rejected(self, client, auth_headers, test_images):
-        """Bug: output_format had no whitelist, so requesting e.g. 'jpg'
-        produced a file literally named .jpg containing real PNG bytes —
+        """Bug: output_format had no whitelist, so requesting e.g. 'gif'
+        produced a file literally named .gif containing real PNG bytes —
         a mislabeled, broken file reported as a success."""
         scan_and_wait(client, auth_headers, test_images)
-        r, _ = optimize_and_wait(client, auth_headers, output_format="jpg")
+        r, _ = optimize_and_wait(client, auth_headers, output_format="gif")
         assert r.status_code == 400
 
-    def test_png_and_webp_output_formats_accepted(self, client, auth_headers, test_images):
-        for fmt in ("png", "webp"):
+    def test_png_webp_jpg_output_formats_accepted(self, client, auth_headers, test_images):
+        for fmt in ("png", "webp", "jpg"):
             scan_and_wait(client, auth_headers, test_images)
             r, d = optimize_and_wait(client, auth_headers, output_format=fmt)
             assert r.status_code == 200, fmt
             assert all(res["success"] for res in d["results"]), fmt
+
+    def test_jpg_output_keeps_jpeg_format_end_to_end(self, client, auth_headers, test_images):
+        """The headline JPEG behavior through the full API: a batch of JPGs
+        compressed with output_format='jpg' comes back as *real* JPEGs
+        (re-encoded by cjpeg), not PNG-converted files wearing .jpg names."""
+        from PIL import Image
+
+        scan_and_wait(client, auth_headers, test_images)
+        r, d = optimize_and_wait(client, auth_headers, output_format="jpg")
+        assert r.status_code == 200
+        jpg_result = next(res for res in d["results"] if res["name"].endswith(".jpg"))
+        assert jpg_result["success"] is True
+
+        import app.main as m
+        ws = m.SESSIONS[client.cookies.get("imgopt_session")].workspace
+        out_file = ws / "output" / "photo.jpg"
+        assert out_file.exists()
+        with Image.open(out_file) as img:
+            assert img.format == "JPEG"
 
 
 class TestNonPngInputNormalization:
