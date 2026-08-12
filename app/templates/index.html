@@ -340,6 +340,14 @@ header h1 span { color: var(--accent); }
 .action-bar .btn { flex-shrink: 0; }
 .action-bar .spacer { flex: 1; }
 
+/* Watch Mode */
+.watch-status { font-size: 13px; color: var(--text2); padding: 4px 0; }
+.watch-log-box {
+  background: var(--bg); border-radius: var(--radius); padding: 10px 14px;
+  max-height: 180px; overflow-y: auto; font-family: "Cascadia Code", "Fira Code", monospace;
+  font-size: 12px; line-height: 1.7; margin-top: 8px;
+}
+
 /* Responsive */
 @media (max-width: 640px) {
   .container { padding: 12px; }
@@ -484,6 +492,38 @@ header h1 span { color: var(--accent); }
     </div>
   </div>
 
+  <!-- Watch Mode -->
+  <div class="card" id="watch-section">
+    <div class="card-title">Watch Mode</div>
+    <div style="font-size:12px;color:var(--text2);margin-bottom:10px">
+      Monitor a folder and auto-optimize new or changed images as they appear.
+    </div>
+    <div class="input-row" style="margin-bottom:8px">
+      <input type="text" id="watch-dir" placeholder="Watch directory" style="flex:1" />
+      <button class="btn btn-secondary" id="watch-browse-dir-btn" style="white-space:nowrap">Browse...</button>
+    </div>
+    <div class="input-row" style="margin-bottom:8px">
+      <input type="text" id="watch-output-dir" placeholder="Output directory (required)" style="flex:1" />
+      <button class="btn btn-secondary" id="watch-browse-output-btn" style="white-space:nowrap">Browse...</button>
+    </div>
+    <div style="display:flex;gap:12px;margin-bottom:10px">
+      <label style="font-size:13px;cursor:pointer;user-select:none;display:flex;align-items:center;gap:4px">
+        <input type="checkbox" id="watch-recursive" checked /> Include subfolders
+      </label>
+      <label style="font-size:13px;cursor:pointer;user-select:none;display:flex;align-items:center;gap:4px">
+        <input type="checkbox" id="watch-process-existing" /> Process existing files
+      </label>
+    </div>
+    <div class="watch-status" id="watch-status">Idle</div>
+    <div class="action-bar" style="margin-top:8px">
+      <button class="btn btn-primary" id="watch-start-btn">Start Watching</button>
+      <button class="btn btn-danger" id="watch-stop-btn" style="display:none">Stop</button>
+      <div class="spacer"></div>
+      <span style="font-size:12px;color:var(--text2)" id="watch-stats"></span>
+    </div>
+    <div class="watch-log-box" id="watch-log-box" style="display:none"></div>
+  </div>
+
   </div>
 
   <div class="app-main">
@@ -558,17 +598,22 @@ const STATE = {
   results: [],
   wsName: '',
   isRunning: false,
-  isPaused: false,      // authoritative pause flag; SSE's result/log events don't carry it
-                         // (only 'status' and 'done' do), so result/log handlers read this
-                         // instead of assuming "not paused" — see startSSE().
+  isPaused: false,
   pollTimer: null,
-  runStartTime: 0,      // ms timestamp when the current run began (for ETA)
+  runStartTime: 0,
   resultSort: 'default',
   resultFilter: 'all',
-  resultCursor: 0,      // # of results already pulled (incremental /api/progress)
-  logCursor: 0,         // # of log lines already pulled
-  logLines: [],         // accumulated log lines (capped for display)
-  fileOverrides: {},    // {file_id: {field: value}} — per-file settings that override the globals; only files the user expanded get an entry
+  resultCursor: 0,
+  logCursor: 0,
+  logLines: [],
+  fileOverrides: {},
+  watchRunning: false,
+  watchProcessed: 0,
+  watchErrors: 0,
+  watchLogs: [],
+  watchLogCursor: 0,
+  watchSSE: null,
+  watchPollTimer: null,
 };
 
 // DOM refs
@@ -1677,6 +1722,184 @@ async function restoreState() {
   }
 }
 
+// --- Watch mode ---
+const watchDir = $('watch-dir'),
+      watchOutputDir = $('watch-output-dir'),
+      watchRecursive = $('watch-recursive'),
+      watchProcessExisting = $('watch-process-existing'),
+      watchStartBtn = $('watch-start-btn'),
+      watchStopBtn = $('watch-stop-btn'),
+      watchStatusEl = $('watch-status'),
+      watchLogBox = $('watch-log-box'),
+      watchStatsEl = $('watch-stats');
+
+async function startWatch() {
+  const dir = watchDir.value.trim();
+  const outputDir = watchOutputDir.value.trim();
+  if (!dir) { showNotice('Please enter a watch directory', 'err'); return; }
+  if (!outputDir) { showNotice('Please enter an output directory', 'err'); return; }
+
+  const quality = document.querySelector('input[name="quality"]:checked').value;
+  const maxWidth = parseInt($('max-width').value);
+  const format = document.querySelector('input[name="format"]:checked').value;
+  const compressionMode = document.querySelector('input[name="mode"]:checked').value;
+  const protectedColors = protectColorsInput.value.split(',').map(s => s.trim()).filter(Boolean);
+  const dithering = ditheringInput.checked;
+  const keepExif = $('keep-exif').checked;
+
+  try {
+    const r = await apiFetch('/api/watch/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        directory: dir, recursive: watchRecursive.checked,
+        process_existing: watchProcessExisting.checked,
+        quality, max_width: maxWidth, output_format: format,
+        compression_mode: compressionMode, protected_colors: protectedColors,
+        dithering, keep_exif: keepExif, output_dir: outputDir,
+      }),
+    });
+    const d = await r.json();
+    if (d.error) { showNotice(d.error, 'err'); return; }
+    if (d.warning) showNotice(d.warning, 'info');
+    STATE.watchRunning = true;
+    STATE.watchLogs = [];
+    STATE.watchLogCursor = 0;
+    updateWatchUI();
+    startWatchSSE();
+  } catch(e) {
+    showNotice('Watch start failed: ' + e.message, 'err');
+  }
+}
+
+async function stopWatch() {
+  try {
+    const r = await apiFetch('/api/watch/stop', { method: 'POST' });
+    const d = await r.json();
+    if (d.error) showNotice(d.error, 'err');
+  } catch(e) { /* best-effort */ }
+  STATE.watchRunning = false;
+  stopWatchSSE();
+  updateWatchUI();
+}
+
+let watchSSESource = null, watchSSEWatchdog = null, watchSSELastMsg = 0;
+const WATCH_SSE_SILENCE_MS = 10000;
+
+function startWatchSSE() {
+  watchSSELastMsg = Date.now();
+  try {
+    watchSSESource = new EventSource('/api/watch/events');
+  } catch (e) { fallbackWatchToPolling(); return; }
+  watchSSESource.addEventListener('watch_log', e => {
+    watchSSELastMsg = Date.now();
+    try { STATE.watchLogs.push(JSON.parse(e.data).line); } catch (_) {}
+    renderWatchLog();
+  });
+  watchSSESource.addEventListener('watch_status', e => {
+    watchSSELastMsg = Date.now();
+    try {
+      const d = JSON.parse(e.data);
+      STATE.watchRunning = d.running;
+      STATE.watchProcessed = d.processed;
+      STATE.watchErrors = d.errors;
+    } catch (_) {}
+    updateWatchUI();
+    if (!STATE.watchRunning) stopWatchSSE();
+  });
+  watchSSESource.onerror = () => { fallbackWatchToPolling(); };
+  watchSSEWatchdog = setInterval(() => {
+    if (watchSSESource && Date.now() - watchSSELastMsg > WATCH_SSE_SILENCE_MS) fallbackWatchToPolling();
+  }, 3000);
+}
+
+function stopWatchSSE() {
+  if (watchSSESource) { watchSSESource.close(); watchSSESource = null; }
+  if (watchSSEWatchdog) { clearInterval(watchSSEWatchdog); watchSSEWatchdog = null; }
+  if (STATE.watchPollTimer) { clearInterval(STATE.watchPollTimer); STATE.watchPollTimer = null; }
+}
+
+function fallbackWatchToPolling() {
+  stopWatchSSE();
+  if (!STATE.watchPollTimer && STATE.watchRunning) {
+    STATE.watchPollTimer = setInterval(pollWatchStatus, 2000);
+  }
+}
+
+async function pollWatchStatus() {
+  try {
+    const r = await fetch('/api/watch/status');
+    const d = await r.json();
+    STATE.watchRunning = d.running;
+    STATE.watchProcessed = d.processed;
+    STATE.watchErrors = d.errors;
+    if (d.logs && d.logs.length > STATE.watchLogCursor) {
+      for (let i = STATE.watchLogCursor; i < d.logs.length; i++) STATE.watchLogs.push(d.logs[i]);
+      STATE.watchLogCursor = d.logs.length;
+      renderWatchLog();
+    }
+    updateWatchUI();
+    if (!STATE.watchRunning) stopWatchSSE();
+  } catch(e) { /* ignore */ }
+}
+
+function updateWatchUI() {
+  if (STATE.watchRunning) {
+    watchStartBtn.style.display = 'none';
+    watchStopBtn.style.display = '';
+    watchStatusEl.innerHTML = '<span class="status-dot ok"></span>Watching\u2026';
+    watchLogBox.style.display = '';
+  } else {
+    watchStartBtn.style.display = '';
+    watchStopBtn.style.display = 'none';
+    watchStatusEl.textContent = 'Idle';
+    watchLogBox.style.display = 'none';
+  }
+  watchStatsEl.textContent = STATE.watchProcessed || STATE.watchErrors
+    ? `Processed: ${STATE.watchProcessed} | Errors: ${STATE.watchErrors}`
+    : '';
+}
+
+function renderWatchLog() {
+  if (STATE.watchLogs.length > 300) STATE.watchLogs = STATE.watchLogs.slice(-300);
+  watchLogBox.innerHTML = STATE.watchLogs.map(l => {
+    let c = 'log-entry';
+    if (l.indexOf('OK ') !== -1) c += ' ok';
+    else if (l.indexOf('FAIL') !== -1 || l.indexOf('ERROR') !== -1) c += ' err';
+    else if (l.startsWith('  ')) c += ' info';
+    return `<div class="${c}">${escHtml(l)}</div>`;
+  }).join('');
+  watchLogBox.scrollTop = watchLogBox.scrollHeight;
+}
+
+watchStartBtn.addEventListener('click', startWatch);
+watchStopBtn.addEventListener('click', stopWatch);
+$('watch-browse-dir-btn').addEventListener('click', async () => {
+  const path = await pickFolder();
+  if (path) watchDir.value = path;
+});
+$('watch-browse-output-btn').addEventListener('click', async () => {
+  const path = await pickFolder();
+  if (path) watchOutputDir.value = path;
+});
+
+async function checkWatchStatus() {
+  try {
+    const r = await fetch('/api/watch/status');
+    const d = await r.json();
+    if (d.running) {
+      STATE.watchRunning = true;
+      STATE.watchProcessed = d.processed;
+      STATE.watchErrors = d.errors;
+      STATE.watchLogs = d.logs || [];
+      STATE.watchLogCursor = STATE.watchLogs.length;
+      updateWatchUI();
+      renderWatchLog();
+      startWatchSSE();
+    }
+  } catch(e) { /* fresh session or server unreachable */ }
+}
+
 // Init
 applyStoredTheme();
 loadConfig();
@@ -1693,6 +1916,7 @@ if (autoDir) {
 } else {
   restoreState();
 }
+checkWatchStatus();
 </script>
 </body>
 </html>

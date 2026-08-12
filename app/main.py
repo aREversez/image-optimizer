@@ -21,8 +21,9 @@ from PIL import Image
 if __package__ is None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.models import OptimizeRequest, PreviewRequest, RecentClearRequest, RecentRemoveRequest, ScanRequest
+from app.models import OptimizeRequest, PreviewRequest, RecentClearRequest, RecentRemoveRequest, ScanRequest, WatchRequest
 from app.optimizer import HEX_COLOR_RE, Optimizer
+from app.watcher import FolderWatcher
 
 if getattr(sys, "frozen", False):
     BASE_DIR = Path(sys._MEIPASS) / "app"
@@ -100,6 +101,20 @@ class AppState:
         # when nothing changed since the last archive.
         self.output_version = 0
         self.zip_built_version = -1
+        # Watch mode (auto-optimize): a per-session background task that
+        # polls a directory and compresses new/changed images as they
+        # appear. Independent of state.files/results/workspace — it writes
+        # straight into the user's chosen output_dir. Name has no leading
+        # underscore unlike most sibling fields because it's manipulated
+        # from endpoints and helpers, not just this class.
+        self.watch_running = False
+        self.watch_dir: Optional[str] = None
+        self.watch_output_dir: Optional[str] = None
+        self.watch_task: Optional[asyncio.Task] = None
+        self.watch_watcher: Optional[FolderWatcher] = None
+        self.watch_processed = 0
+        self.watch_errors = 0
+        self.watch_logs: list = []
 
     def reset(self):
         self.files = []
@@ -833,6 +848,9 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
             {"error": f"Invalid color(s) in Protect Colors: {', '.join(bad_colors)}. Use hex format like #2ecc71."},
             status_code=400,
         )
+
+    if state.watch_running:
+        return JSONResponse({"error": "Watch mode is running, stop it first"}, status_code=400)
 
     files_to_process = state.files
     if data.file_ids is not None:
@@ -1859,6 +1877,241 @@ async def reset_session(state: AppState = Depends(get_session), _auth: None = De
         state.workspace = None
     state.reset()
     return JSONResponse({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Watch mode
+# ---------------------------------------------------------------------------
+
+async def _watch_loop(state: AppState, req: WatchRequest):
+    """Background task for Watch mode — monitors a directory and auto-
+    optimizes every new/changed image using the same compression pipeline
+    as the batch optimizer. Each file is independent: an error on one
+    doesn't stop the rest (logged to state.watch_errors instead)."""
+    if optimizer is None:
+        state.watch_logs.append("[Error] Optimizer not initialized")
+        state.watch_running = False
+        return
+
+    directory = Path(req.directory)
+    output_dir = Path(req.output_dir) if req.output_dir else None
+
+    quality_map = {"high": 85, "medium": 75, "low": 60}
+    used_names: set[str] = set()
+
+    async def on_change(rel_path: str, abs_path: Path):
+        if optimizer is None:
+            return
+        try:
+            if output_dir:
+                out_path = output_dir / Path(rel_path).with_suffix(f".{req.output_format}")
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                # Collision guard: same filename from different subdirs
+                key = str(out_path).lower()
+                if key in used_names:
+                    n = 2
+                    while key in used_names:
+                        out_path = output_dir / Path(rel_path).with_name(
+                            f"{Path(rel_path).stem}_{n}.{req.output_format}"
+                        )
+                        key = str(out_path).lower()
+                        n += 1
+                used_names.add(key)
+            else:
+                return
+
+            state.watch_logs.append(f"Detected: {rel_path}")
+
+            q = quality_map.get(req.quality, 75)
+            if req.compression_mode in ("lossless", "resize_only"):
+                q = 95
+
+            result = await optimizer.optimize_png(
+                input_path=abs_path,
+                output_path=out_path,
+                quality=req.quality,
+                max_width=req.max_width,
+                compression_mode=req.compression_mode,
+                protected_colors=req.protected_colors,
+                dithering=req.dithering,
+                output_format=req.output_format,
+                keep_exif=req.keep_exif,
+            )
+
+            state.watch_processed += 1
+            if result.get("success"):
+                savings = result["original_size"] - result["compressed_size"]
+                pct = round(savings / result["original_size"] * 100, 1) if result["original_size"] > 0 else 0
+                state.watch_logs.append(
+                    f"  OK {rel_path}: {_fmt_size(result['original_size'])} -> "
+                    f"{_fmt_size(result['compressed_size'])} (saved {pct}%)"
+                )
+            else:
+                state.watch_errors += 1
+                state.watch_logs.append(f"  FAIL {rel_path}: {result.get('error', 'unknown')}")
+        except Exception as e:
+            state.watch_errors += 1
+            state.watch_logs.append(f"  ERROR {rel_path}: {e}")
+
+    watcher = FolderWatcher(
+        directory=directory,
+        recursive=req.recursive,
+        process_existing=req.process_existing,
+        on_change=on_change,
+    )
+    state.watch_watcher = watcher
+    try:
+        await watcher.run()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        state.watch_running = False
+        state.watch_logs.append("Watch mode stopped")
+
+
+@app.post("/api/watch/start")
+async def watch_start(
+    data: WatchRequest,
+    state: AppState = Depends(get_session),
+    _auth: None = Depends(require_token),
+):
+    """Start watching a directory for image changes and auto-optimize
+    every new/changed file into output_dir. Uses the same compression
+    pipeline as the batch optimizer. Watch and batch-optimize are
+    mutually exclusive per session — both write files and mutate
+    overlapping state, so running them concurrently would be unsafe."""
+    if optimizer is None:
+        return JSONResponse({"error": "Optimizer not initialized"}, status_code=503)
+    if state.is_running:
+        return JSONResponse({"error": "Optimization in progress, please wait"}, status_code=400)
+    if state.scan_running:
+        return JSONResponse({"error": "A scan is in progress, please wait"}, status_code=400)
+    if state.watch_running:
+        return JSONResponse({"error": "Watch mode is already running"}, status_code=400)
+
+    directory = Path(data.directory)
+    if not directory.exists() or not directory.is_dir():
+        return JSONResponse({"error": "Directory does not exist"}, status_code=400)
+    if data.output_dir:
+        od = Path(data.output_dir)
+        if not od.exists():
+            return JSONResponse({"error": "Output directory does not exist"}, status_code=400)
+
+    if data.compression_mode not in ("standard", "lossless", "resize_only"):
+        return JSONResponse({"error": "Invalid compression_mode"}, status_code=400)
+    if data.quality not in ("high", "medium", "low"):
+        return JSONResponse({"error": f"Invalid quality: {data.quality!r}"}, status_code=400)
+
+    warning = None
+    if (data.output_format, data.compression_mode) not in optimizer.available_modes():
+        warning = (
+            f"Format {data.output_format!r} in {data.compression_mode} mode isn't available — "
+            f"output may fail. Check the health indicator for missing binaries."
+        )
+
+    state.watch_running = True
+    state.watch_dir = str(directory.resolve())
+    state.watch_output_dir = data.output_dir or ""
+    state.watch_processed = 0
+    state.watch_errors = 0
+    state.watch_logs = []
+    state.watch_task = asyncio.create_task(_watch_loop(state, data))
+
+    return JSONResponse({
+        "ok": True,
+        "watch_running": True,
+        "watch_dir": state.watch_dir,
+        "warning": warning,
+    })
+
+
+@app.post("/api/watch/stop")
+async def watch_stop(
+    state: AppState = Depends(get_session),
+    _auth: None = Depends(require_token),
+):
+    """Stop watch mode. Cooperative: the watcher finishes its current
+    poll sleep, then exits. Already-queued file events are lost (watch
+    is meant to be persistent, not transactional)."""
+    if not state.watch_running:
+        return JSONResponse({"error": "Watch mode is not running"}, status_code=400)
+    if state.watch_watcher:
+        state.watch_watcher.stop()
+    if state.watch_task:
+        state.watch_task.cancel()
+        try:
+            await state.watch_task
+        except asyncio.CancelledError:
+            pass
+    state.watch_running = False
+    state.watch_watcher = None
+    state.watch_task = None
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/watch/status")
+async def watch_status(state: AppState = Depends(get_session)):
+    return JSONResponse({
+        "running": state.watch_running,
+        "dir": state.watch_dir,
+        "output_dir": state.watch_output_dir,
+        "processed": state.watch_processed,
+        "errors": state.watch_errors,
+        "logs": state.watch_logs,
+    })
+
+
+@app.get("/api/watch/events")
+async def watch_events(request: Request, state: AppState = Depends(get_session)):
+    """SSE transport for watch mode — mirrors the batch /api/events
+    pattern. Emits `watch_result` (one per processed file), `watch_log`
+    (status messages), and `watch_status` (periodic counters). A client
+    that drops and reconnects gets the full current state via the first
+    `watch_status` event, then incremental updates from there."""
+    log_cursor = 0
+
+    async def event_stream():
+        nonlocal log_cursor
+        last_emit = time.time()
+
+        yield _sse_format("watch_status", {
+            "running": state.watch_running,
+            "processed": state.watch_processed,
+            "errors": state.watch_errors,
+        }, None)
+
+        while True:
+            for line in state.watch_logs[log_cursor:]:
+                log_cursor += 1
+                yield _sse_format("watch_log", {"line": line}, None)
+                last_emit = time.time()
+
+            if not state.watch_running:
+                await asyncio.sleep(0.05)
+                for line in state.watch_logs[log_cursor:]:
+                    log_cursor += 1
+                    yield _sse_format("watch_log", {"line": line}, None)
+                yield _sse_format("watch_status", {
+                    "running": False,
+                    "processed": state.watch_processed,
+                    "errors": state.watch_errors,
+                }, None)
+                return
+
+            if await request.is_disconnected():
+                return
+
+            if time.time() - last_emit > 5:
+                yield ": keepalive\n\n"
+                last_emit = time.time()
+
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
 
 
 def main():

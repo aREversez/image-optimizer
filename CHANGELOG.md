@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Watch mode** (`POST /api/watch/start`, `/stop`, `/status`, `/events`).
+  Monitor a folder and auto-optimize new or changed images as they appear.
+  `FolderWatcher` polls on a timer, diffs by (mtime, size), and fires a
+  per-file handler that runs the full optimizer pipeline into a chosen
+  output directory. SSE endpoint streams live logs and status updates;
+  the frontend falls back to polling when SSE is unavailable. Watch mode
+  and batch optimize are mutually exclusive per session (400 guard).
+  Options: recursive, process-existing, quality/mode/format reuse the
+  global settings card. Errors on individual files are logged but never
+  stop the watcher.
 - **True JPEG optimization** (`output_format: "jpg"`). Selecting JPG for a
   batch of `.jpg` files now genuinely re-compresses them lossily with
   mozjpeg's `cjpeg` while *keeping the JPEG format* — previously JPEG/BMP/

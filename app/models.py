@@ -107,3 +107,27 @@ class PreviewRequest(BaseModel):
     protected_colors: list[str] = []
     dithering: bool = True
     keep_exif: bool = False
+
+
+class WatchRequest(BaseModel):
+    """Parameters for Watch mode: watch a directory and auto-optimize every
+    image that appears (or changes) in it, writing results into output_dir.
+    Carries the same compression parameters as OptimizeRequest, minus the
+    batch-specific controls (file_ids / retry / skip_existing / overrides) —
+    Watch uses one global setting set for everything it picks up.
+
+    output_dir is required: Watch has no temp-workspace/ZIP flow, it is
+    inherently "optimize into a persistent folder"."""
+    directory: str
+    recursive: bool = True
+    # Optimize files already present when watching starts, not just ones
+    # that appear afterwards.
+    process_existing: bool = False
+    quality: str = "medium"
+    max_width: int = 0
+    output_format: str = "png"
+    compression_mode: str = "standard"
+    protected_colors: list[str] = []
+    dithering: bool = True
+    keep_exif: bool = False
+    output_dir: str = ""
