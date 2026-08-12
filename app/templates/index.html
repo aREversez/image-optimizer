@@ -348,6 +348,36 @@ header h1 span { color: var(--accent); }
   font-size: 12px; line-height: 1.7; margin-top: 8px;
 }
 
+/* Settings panel */
+.settings-btn {
+  background: var(--bg); border: 1px solid var(--border); color: var(--text2);
+  border-radius: var(--radius); cursor: pointer; padding: 6px 10px; font-size: 15px;
+  line-height: 1; transition: all .15s;
+}
+.settings-btn:hover { border-color: var(--accent); color: var(--text); }
+.settings-overlay {
+  display: none; position: fixed; inset: 0; background: rgba(0,0,0,.35);
+  z-index: 900; align-items: center; justify-content: center;
+}
+.settings-overlay.open { display: flex; }
+.settings-panel {
+  background: var(--surface); border-radius: var(--radius); box-shadow: 0 8px 30px rgba(0,0,0,.18);
+  width: 420px; max-width: 92vw; max-height: 85vh; overflow-y: auto; padding: 24px;
+}
+.settings-panel h2 { font-size: 16px; font-weight: 700; margin-bottom: 16px; display: flex; align-items: center; justify-content: space-between; }
+.settings-panel h2 button { background: none; border: none; font-size: 18px; cursor: pointer; color: var(--text2); padding: 2px 6px; }
+.settings-panel h2 button:hover { color: var(--text); }
+.settings-field { margin-bottom: 14px; }
+.settings-field label { display: block; font-size: 12px; font-weight: 600; color: var(--text2); margin-bottom: 4px; }
+.settings-field input {
+  width: 100%; padding: 7px 10px; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--bg); color: var(--text); font-size: 13px;
+}
+.settings-field input:focus { outline: none; border-color: var(--accent); }
+.settings-field .field-hint { font-size: 11px; color: var(--text2); margin-top: 2px; }
+.settings-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 18px; }
+.settings-actions .btn { padding: 7px 18px; font-size: 13px; }
+
 /* Responsive */
 @media (max-width: 640px) {
   .container { padding: 12px; }
@@ -364,9 +394,49 @@ header h1 span { color: var(--accent); }
   <div class="header-right">
     <span id="health-status"><span class="status-dot warn"></span>Checking...</span>
     <span id="workspace-info"></span>
+    <button class="settings-btn" id="settings-btn" title="Settings" aria-label="Open settings">&#9881;</button>
     <button class="theme-toggle" id="theme-toggle" title="Toggle light / dark theme" aria-label="Toggle theme"></button>
   </div>
 </header>
+
+<!-- Settings modal -->
+<div class="settings-overlay" id="settings-overlay">
+  <div class="settings-panel">
+    <h2>Settings <button id="settings-close" aria-label="Close settings">&times;</button></h2>
+    <div class="settings-field">
+      <label for="setting-host">Host</label>
+      <input type="text" id="setting-host" placeholder="127.0.0.1">
+      <div class="field-hint">Requires restart to take effect</div>
+    </div>
+    <div class="settings-field">
+      <label for="setting-port">Port</label>
+      <input type="number" id="setting-port" min="1" max="65535" placeholder="8090">
+      <div class="field-hint">Requires restart to take effect</div>
+    </div>
+    <div class="settings-field">
+      <label for="setting-concurrent-workers">Concurrent Workers</label>
+      <input type="number" id="setting-concurrent-workers" min="1" placeholder="4">
+      <div class="field-hint">Number of images compressed in parallel. Requires restart</div>
+    </div>
+    <div class="settings-field">
+      <label for="setting-thumbnail-workers">Thumbnail Workers</label>
+      <input type="number" id="setting-thumbnail-workers" min="1" placeholder="4">
+      <div class="field-hint">Number of thumbnails generated in parallel. Requires restart</div>
+    </div>
+    <div class="settings-field">
+      <label for="setting-cleanup-delay">Workspace Cleanup Delay (seconds)</label>
+      <input type="number" id="setting-cleanup-delay" min="0" step="0.5" placeholder="10">
+    </div>
+    <div class="settings-field">
+      <label for="setting-idle-timeout">Session Idle Timeout (hours)</label>
+      <input type="number" id="setting-idle-timeout" min="0" step="0.5" placeholder="4">
+    </div>
+    <div class="settings-actions">
+      <button class="btn" id="settings-cancel" style="background:var(--surface2)">Cancel</button>
+      <button class="btn" id="settings-save" style="background:var(--accent);color:#fff">Save</button>
+    </div>
+  </div>
+</div>
 
 <div id="notice-container"></div>
 
@@ -1969,6 +2039,75 @@ batchResumeBtn.addEventListener('click', async () => {
 batchDismissBtn.addEventListener('click', () => {
   resumeBanner.style.display = 'none';
   _savedBatchState = null;
+});
+
+// --- Settings panel ---
+const settingsOverlay = $('settings-overlay');
+const settingsBtn = $('settings-btn');
+const settingsClose = $('settings-close');
+const settingsCancel = $('settings-cancel');
+const settingsSave = $('settings-save');
+const settingHost = $('setting-host');
+const settingPort = $('setting-port');
+const settingConcurrentWorkers = $('setting-concurrent-workers');
+const settingThumbnailWorkers = $('setting-thumbnail-workers');
+const settingCleanupDelay = $('setting-cleanup-delay');
+const settingIdleTimeout = $('setting-idle-timeout');
+
+function openSettings() {
+  settingsOverlay.classList.add('open');
+  // Load current values
+  apiFetch('/api/settings').then(r => r.json()).then(data => {
+    const s = data.settings || {};
+    settingHost.value = s.host || '';
+    settingPort.value = s.port || '';
+    settingConcurrentWorkers.value = s.concurrent_workers || '';
+    settingThumbnailWorkers.value = s.thumbnail_workers || '';
+    settingCleanupDelay.value = s.workspace_cleanup_delay || '';
+    settingIdleTimeout.value = s.session_idle_timeout_hours || '';
+  }).catch(() => {});
+}
+
+function closeSettings() {
+  settingsOverlay.classList.remove('open');
+}
+
+settingsBtn.addEventListener('click', openSettings);
+settingsClose.addEventListener('click', closeSettings);
+settingsCancel.addEventListener('click', closeSettings);
+settingsOverlay.addEventListener('click', (e) => {
+  if (e.target === settingsOverlay) closeSettings();
+});
+
+settingsSave.addEventListener('click', async () => {
+  const payload = {
+    host: settingHost.value.trim(),
+    port: settingPort.value,
+    concurrent_workers: settingConcurrentWorkers.value,
+    thumbnail_workers: settingThumbnailWorkers.value,
+    workspace_cleanup_delay: settingCleanupDelay.value,
+    session_idle_timeout_hours: settingIdleTimeout.value,
+  };
+  try {
+    const r = await apiFetch('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      showNotice(data.error || 'Failed to save settings', 'err');
+      return;
+    }
+    let msg = 'Settings saved.';
+    if (data.requires_restart && data.requires_restart.length > 0) {
+      msg += ' Some changes require a restart to take effect.';
+    }
+    showNotice(msg, 'ok');
+    closeSettings();
+  } catch (e) {
+    showNotice('Failed to save settings: ' + e.message, 'err');
+  }
 });
 
 // Init

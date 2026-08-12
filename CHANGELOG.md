@@ -44,6 +44,13 @@ All notable changes to this project will be documented in this file.
   PATH; without it the `(jpg, *)` modes drop out of `available_modes()` and
   Start warns up front. "Lossless"/"Resize Only" for JPEG map to the highest
   cjpeg quality (95) — JPEG is inherently lossy, and the UI says so.
+- **In-app settings panel** (`GET /api/settings`, `PUT /api/settings`).
+  Gear icon in the header opens a modal with Host, Port, Concurrent
+  Workers, Thumbnail Workers, Workspace Cleanup Delay, and Session Idle
+  Timeout fields. PUT accepts partial updates, validates each field, and
+  persists to `~/.image-optimizer/config.json`. Keys that require a
+  server restart (host, port, workers) are flagged in the response so
+  the UI can inform the user.
 
 ## [August 2026 review batch]
 

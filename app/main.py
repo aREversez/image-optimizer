@@ -2038,6 +2038,124 @@ async def get_batch_state(state: AppState = Depends(get_session)):
     })
 
 
+# Keys that require a server restart to take effect. Changing them via
+# PUT /api/settings succeeds (the new value is persisted to config.json)
+# but the response flags requires_restart so the UI can tell the user.
+_RESTART_REQUIRED_KEYS = {"host", "port", "concurrent_workers", "thumbnail_workers"}
+
+
+@app.get("/api/settings")
+async def get_settings():
+    """Return the current config (merged with defaults) for the settings panel."""
+    cfg = _load_app_config()
+    return JSONResponse({
+        "settings": cfg,
+        "defaults": dict(DEFAULT_CONFIG),
+    })
+
+
+@app.put("/api/settings")
+async def put_settings(
+    body: Request,
+    _auth: None = Depends(require_token),
+):
+    """Accept a partial or full config update, validate, and persist to config.json.
+    Returns which keys require a restart to take effect."""
+    try:
+        data = await body.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    if not isinstance(data, dict):
+        return JSONResponse({"error": "Request body must be a JSON object"}, status_code=400)
+
+    # Load current config as the base, then overlay the submitted changes
+    cfg = _load_app_config()
+    requires_restart = []
+
+    for key, value in data.items():
+        if key not in DEFAULT_CONFIG:
+            return JSONResponse(
+                {"error": f"Unknown setting: {key!r}. Known: {list(DEFAULT_CONFIG.keys())}"},
+                status_code=400,
+            )
+        # Type/value validation per key
+        if key == "port":
+            try:
+                port = int(value)
+                if not (1 <= port <= 65535):
+                    raise ValueError()
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"error": f"Invalid port: {value!r}. Must be an integer 1-65535."},
+                    status_code=400,
+                )
+            cfg["port"] = port
+        elif key in ("concurrent_workers", "thumbnail_workers"):
+            try:
+                n = int(value)
+                if n < 1:
+                    raise ValueError()
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"error": f"Invalid {key}: {value!r}. Must be a positive integer."},
+                    status_code=400,
+                )
+            cfg[key] = n
+        elif key == "workspace_cleanup_delay":
+            try:
+                d = float(value)
+                if d < 0:
+                    raise ValueError()
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"error": f"Invalid {key}: {value!r}. Must be a non-negative number."},
+                    status_code=400,
+                )
+            cfg[key] = d
+        elif key == "session_idle_timeout_hours":
+            try:
+                h = float(value)
+                if h < 0:
+                    raise ValueError()
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"error": f"Invalid {key}: {value!r}. Must be a non-negative number."},
+                    status_code=400,
+                )
+            cfg[key] = h
+        elif key == "host":
+            if not isinstance(value, str) or not value.strip():
+                return JSONResponse(
+                    {"error": f"Invalid host: {value!r}. Must be a non-empty string."},
+                    status_code=400,
+                )
+            cfg[key] = value.strip()
+        else:
+            cfg[key] = value
+
+        if key in _RESTART_REQUIRED_KEYS:
+            requires_restart.append(key)
+
+    # Persist to config.json
+    try:
+        _config_file().write_text(
+            json.dumps(cfg, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError as e:
+        return JSONResponse(
+            {"error": f"Failed to write config.json: {e}"},
+            status_code=500,
+        )
+
+    return JSONResponse({
+        "ok": True,
+        "settings": cfg,
+        "requires_restart": requires_restart,
+    })
+
+
 @app.post("/api/reset")
 async def reset_session(state: AppState = Depends(get_session), _auth: None = Depends(require_token)):
     """Clear this session's server-side state (the UI Reset button used to
