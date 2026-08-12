@@ -460,6 +460,10 @@ header h1 span { color: var(--accent); }
             title="WebP typically produces smaller files than PNG at similar visual quality. Uses its own encoder (not pngquant/oxipng) — Quality/Protect Colors/Dithering don't apply, only Compression Mode's lossy-vs-lossless choice does.">
           <label for="fmt-webp"
             title="WebP typically produces smaller files than PNG at similar visual quality. Uses its own encoder (not pngquant/oxipng) — Quality/Protect Colors/Dithering don't apply, only Compression Mode's lossy-vs-lossless choice does.">WebP</label>
+          <input type="radio" name="format" id="fmt-avif" value="avif"
+            title="AVIF is a modern codec that typically produces the smallest files at equivalent quality. Slower encoding than PNG/WebP. Requires avifenc in the bin/ directory or PATH.">
+          <label for="fmt-avif"
+            title="AVIF is a modern codec that typically produces the smallest files at equivalent quality. Slower encoding than PNG/WebP. Requires avifenc in the bin/ directory or PATH.">AVIF</label>
         </div>
       </div>
       <div class="config-group">
@@ -822,6 +826,8 @@ async function checkHealth() {
     else tools.push('oxipng ✗');
     if (d.cjpeg) tools.push('cjpeg ✓');
     else tools.push('cjpeg ✗');
+    if (d.avifenc) tools.push('avifenc ✓');
+    else tools.push('avifenc ✗');
     const allOk = d.pngquant && d.oxipng && d.cjpeg;
     healthStatus.innerHTML =
       `<span class="status-dot ${allOk ? 'ok' : 'warn'}"></span>${tools.join(' ')}`;

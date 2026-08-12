@@ -68,6 +68,25 @@ img.save(out_path, "JPEG", quality=90)
 sys.exit(0)
 '''
 
+# avifenc fake: reads the PPM intermediate Pillow wrote, saves as PNG with
+# .avif extension. Real avifenc produces AVIF, but for tests we just need
+# a non-empty output file that the pipeline can verify exists and has size.
+AVIFENC_IMPL = '''#!/usr/bin/env python3
+import sys
+from PIL import Image
+args = sys.argv[1:]
+try:
+    o_idx = args.index("-o")
+    out_path = args[o_idx + 1]
+except (ValueError, IndexError):
+    sys.stderr.write("avifenc fake: no -o flag found\\n")
+    sys.exit(1)
+in_path = args[-1]
+img = Image.open(in_path)
+img.save(out_path, "PNG")
+sys.exit(0)
+'''
+
 
 @pytest.fixture
 def fake_bin_dir(tmp_path: Path) -> Path:
@@ -76,9 +95,11 @@ def fake_bin_dir(tmp_path: Path) -> Path:
     pngquant_impl = bin_dir / "pngquant_impl.py"
     oxipng_impl = bin_dir / "oxipng_impl.py"
     cjpeg_impl = bin_dir / "cjpeg_impl.py"
+    avifenc_impl = bin_dir / "avifenc_impl.py"
     pngquant_impl.write_text(PNGQUANT_IMPL)
     oxipng_impl.write_text(OXIPNG_IMPL)
     cjpeg_impl.write_text(CJPEG_IMPL)
+    avifenc_impl.write_text(AVIFENC_IMPL)
 
     if sys.platform == "win32":
         # Optimizer._find_binary only looks for a literal *.exe on
@@ -92,19 +113,24 @@ def fake_bin_dir(tmp_path: Path) -> Path:
         pngquant = bin_dir / "pngquant.bat"
         oxipng = bin_dir / "oxipng.bat"
         cjpeg = bin_dir / "cjpeg.bat"
+        avifenc = bin_dir / "avifenc.bat"
         pngquant.write_text(f'@echo off\r\n"{sys.executable}" "{pngquant_impl}" %*\r\n')
         oxipng.write_text(f'@echo off\r\n"{sys.executable}" "{oxipng_impl}" %*\r\n')
         cjpeg.write_text(f'@echo off\r\n"{sys.executable}" "{cjpeg_impl}" %*\r\n')
+        avifenc.write_text(f'@echo off\r\n"{sys.executable}" "{avifenc_impl}" %*\r\n')
     else:
         pngquant = bin_dir / "pngquant"
         oxipng = bin_dir / "oxipng"
         cjpeg = bin_dir / "cjpeg"
+        avifenc = bin_dir / "avifenc"
         pngquant.write_text(f'#!/usr/bin/env python3\nimport subprocess, sys\nsys.exit(subprocess.call([{sys.executable!r}, {str(pngquant_impl)!r}, *sys.argv[1:]]))\n')
         oxipng.write_text(f'#!/usr/bin/env python3\nimport subprocess, sys\nsys.exit(subprocess.call([{sys.executable!r}, {str(oxipng_impl)!r}, *sys.argv[1:]]))\n')
         cjpeg.write_text(f'#!/usr/bin/env python3\nimport subprocess, sys\nsys.exit(subprocess.call([{sys.executable!r}, {str(cjpeg_impl)!r}, *sys.argv[1:]]))\n')
+        avifenc.write_text(f'#!/usr/bin/env python3\nimport subprocess, sys\nsys.exit(subprocess.call([{sys.executable!r}, {str(avifenc_impl)!r}, *sys.argv[1:]]))\n')
         pngquant.chmod(pngquant.stat().st_mode | stat.S_IEXEC)
         oxipng.chmod(oxipng.stat().st_mode | stat.S_IEXEC)
         cjpeg.chmod(cjpeg.stat().st_mode | stat.S_IEXEC)
+        avifenc.chmod(avifenc.stat().st_mode | stat.S_IEXEC)
     return bin_dir
 
 
@@ -119,6 +145,7 @@ def optimizer(fake_bin_dir: Path):
     opt.pngquant_path = fake_bin_dir / f"pngquant{ext}"
     opt.oxipng_path = fake_bin_dir / f"oxipng{ext}"
     opt.cjpeg_path = fake_bin_dir / f"cjpeg{ext}"
+    opt.avifenc_path = fake_bin_dir / f"avifenc{ext}"
     return opt
 
 

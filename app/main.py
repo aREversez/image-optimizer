@@ -467,6 +467,7 @@ _MEDIA_TYPES = {
     ".tif": "image/tiff",
     ".tiff": "image/tiff",
     ".webp": "image/webp",
+    ".avif": "image/avif",
 }
 
 
@@ -506,6 +507,7 @@ def _is_valid_reusable_output(path: Path, expected_format: str) -> bool:
         "webp": "WEBP",
         "jpg": "JPEG",
         "jpeg": "JPEG",
+        "avif": "AVIF",
     }.get(expected_format, "PNG")
     return fmt == expected
 
@@ -673,9 +675,11 @@ async def health():
         "pngquant": optimizer.pngquant_path is not None,
         "oxipng": optimizer.oxipng_path is not None,
         "cjpeg": optimizer.cjpeg_path is not None,
+        "avifenc": optimizer.avifenc_path is not None,
         "pngquant_path": str(optimizer.pngquant_path) if optimizer.pngquant_path else None,
         "oxipng_path": str(optimizer.oxipng_path) if optimizer.oxipng_path else None,
         "cjpeg_path": str(optimizer.cjpeg_path) if optimizer.cjpeg_path else None,
+        "avifenc_path": str(optimizer.avifenc_path) if optimizer.avifenc_path else None,
     })
 
 
@@ -861,12 +865,12 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
             {"error": f"Invalid quality: {data.quality!r}. Supported: 'high', 'medium', 'low'."},
             status_code=400,
         )
-    if data.output_format not in ("png", "webp", "jpg"):
-        # The pipeline only ever produces real PNG, WebP, or JPEG bytes —
+    if data.output_format not in ("png", "webp", "jpg", "avif"):
+        # The pipeline only ever produces real PNG, WebP, JPEG, or AVIF bytes —
         # accepting anything else here would silently produce a file whose
         # extension lies about its actual content.
         return JSONResponse(
-            {"error": f"Unsupported output_format: {data.output_format!r}. Supported: 'png', 'webp', 'jpg'."},
+            {"error": f"Unsupported output_format: {data.output_format!r}. Supported: 'png', 'webp', 'jpg', 'avif'."},
             status_code=400,
         )
     if data.compression_mode == "resize_only" and data.max_width <= 0:
@@ -1083,7 +1087,7 @@ def _validate_overrides(overrides: dict, selected_ids: set, top_mode: str, top_w
             return f"Invalid quality in override for file {fid!r}: {ov['quality']!r}"
         if "compression_mode" in ov and ov["compression_mode"] not in ("standard", "lossless", "resize_only"):
             return f"Invalid compression_mode in override for file {fid!r}: {ov['compression_mode']!r}"
-        if "output_format" in ov and ov["output_format"] not in ("png", "webp", "jpg"):
+        if "output_format" in ov and ov["output_format"] not in ("png", "webp", "jpg", "avif"):
             return f"Invalid output_format in override for file {fid!r}: {ov['output_format']!r}"
         if "max_width" in ov and (not isinstance(ov["max_width"], int) or isinstance(ov["max_width"], bool) or ov["max_width"] < 0):
             return f"Invalid max_width in override for file {fid!r}: {ov['max_width']!r}"
@@ -1616,9 +1620,9 @@ async def preview_optimize(data: PreviewRequest, state: AppState = Depends(get_s
             {"error": f"Invalid quality: {data.quality!r}. Supported: 'high', 'medium', 'low'."},
             status_code=400,
         )
-    if data.output_format not in ("png", "webp", "jpg"):
+    if data.output_format not in ("png", "webp", "jpg", "avif"):
         return JSONResponse(
-            {"error": f"Unsupported output_format: {data.output_format!r}. Supported: 'png', 'webp', 'jpg'."},
+            {"error": f"Unsupported output_format: {data.output_format!r}. Supported: 'png', 'webp', 'jpg', 'avif'."},
             status_code=400,
         )
     if data.compression_mode == "resize_only" and data.max_width <= 0:

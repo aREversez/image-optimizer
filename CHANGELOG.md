@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **AVIF output** (`output_format: "avif"`). Selecting AVIF encodes through
+  `avifenc` (auto-detected in `bin/` or PATH; without it the `(avif, *)`
+  modes drop out of `available_modes()` and the UI warns up front).
+  Pillow decodes the source (EXIF transpose, alpha composited onto white,
+  optional resize), writes a PPM intermediate, then avifenc encodes the
+  final AVIF. `keep_exif` passes cleaned EXIF via avifenc's `--exif`
+  sidecar. Quality map: high=80, medium=60, low=40; lossless uses
+  `--lossless`; resize_only encodes at q=90 after downscaling.
 - **Batch resume** (`GET /api/batch-state`, `POST /api/optimize` with
   `resume: true`). Progress is persisted to
   `~/.image-optimizer/batch_state.json` after each file completes. If the

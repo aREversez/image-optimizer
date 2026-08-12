@@ -306,10 +306,12 @@ class TestAvailableModes:
         assert opt.pngquant_path is not None
         assert opt.oxipng_path is not None
         assert opt.cjpeg_path is not None
+        assert opt.avifenc_path is not None
         modes = opt.available_modes()
         assert {("png", "standard"), ("png", "lossless"), ("png", "resize_only"),
                 ("webp", "standard"), ("webp", "lossless"), ("webp", "resize_only"),
-                ("jpg", "standard"), ("jpg", "lossless"), ("jpg", "resize_only")} == modes
+                ("jpg", "standard"), ("jpg", "lossless"), ("jpg", "resize_only"),
+                ("avif", "standard"), ("avif", "lossless"), ("avif", "resize_only")} == modes
 
     def test_no_binaries_drops_standard_png_and_all_jpeg(self, tmp_path):
         from app.optimizer import Optimizer
@@ -318,6 +320,7 @@ class TestAvailableModes:
         assert opt.pngquant_path is None
         assert opt.oxipng_path is None
         assert opt.cjpeg_path is None
+        assert opt.avifenc_path is None
 
         modes = opt.available_modes()
         # PNG standard — the one mode that actually needs pngquant for its
@@ -326,6 +329,8 @@ class TestAvailableModes:
         # JPEG needs cjpeg for every mode (it's a genuine JPEG re-encode),
         # so without it the whole (jpg, *) family disappears.
         assert not any(fmt == "jpg" for fmt, _ in modes)
+        # AVIF needs avifenc for every mode — same logic.
+        assert not any(fmt == "avif" for fmt, _ in modes)
         # Everything else still works: lossless/resize_only PNG just uses
         # Pillow's PNG encoder (oxipng only shrinks further), and WebP is
         # Pillow-encoder-only.
@@ -342,3 +347,78 @@ class TestAvailableModes:
         # Drop pngquant only; oxipng is irrelevant for `ready`.
         opt.pngquant_path = None
         assert opt.ready is False
+
+
+class TestAVIF:
+    """AVIF output via avifenc external binary."""
+
+    def test_standard_lossy_avif(self, optimizer, tmp_path):
+        src = tmp_path / "input.png"
+        out = tmp_path / "output.avif"
+        Image.new("RGB", (64, 64), (200, 100, 50)).save(src)
+        result = asyncio.run(
+            optimizer.optimize_png(src, out, quality="medium",
+                                   output_format="avif", compression_mode="standard")
+        )
+        assert result["success"] is True
+        assert out.exists()
+        assert out.stat().st_size > 0
+
+    def test_lossless_avif(self, optimizer, tmp_path):
+        src = tmp_path / "input.png"
+        out = tmp_path / "output.avif"
+        Image.new("RGB", (32, 32), (10, 20, 30)).save(src)
+        result = asyncio.run(
+            optimizer.optimize_png(src, out, output_format="avif",
+                                   compression_mode="lossless")
+        )
+        assert result["success"] is True
+        assert out.exists()
+
+    def test_resize_only_avif(self, optimizer, tmp_path):
+        src = tmp_path / "input.png"
+        out = tmp_path / "output.avif"
+        Image.new("RGB", (200, 200), (100, 100, 100)).save(src)
+        result = asyncio.run(
+            optimizer.optimize_png(src, out, max_width=50,
+                                   output_format="avif", compression_mode="resize_only")
+        )
+        assert result["success"] is True
+        assert out.exists()
+
+    def test_avif_requires_avifenc(self, tmp_path):
+        from app.optimizer import Optimizer
+        opt = Optimizer(bin_dir=tmp_path / "nonexistent")
+        src = tmp_path / "input.png"
+        out = tmp_path / "output.avif"
+        Image.new("RGB", (32, 32), (50, 50, 50)).save(src)
+        result = asyncio.run(
+            opt.optimize_png(src, out, output_format="avif")
+        )
+        assert result["success"] is False
+        assert "avifenc" in result["error"]
+
+    def test_png_source_to_avif(self, optimizer, tmp_path):
+        """A real PNG source (not just a renamed file) should work."""
+        src = tmp_path / "real.png"
+        out = tmp_path / "output.avif"
+        Image.new("RGB", (48, 48), (255, 0, 0)).save(src)
+        result = asyncio.run(
+            optimizer.optimize_png(src, out, output_format="avif",
+                                   compression_mode="lossless")
+        )
+        assert result["success"] is True
+        assert out.exists()
+
+    def test_rgba_source_composited_for_avif(self, optimizer, tmp_path):
+        """Transparent PNG should be composited onto white (no crash)."""
+        src = tmp_path / "rgba.png"
+        out = tmp_path / "output.avif"
+        img = Image.new("RGBA", (32, 32), (100, 200, 50, 128))
+        img.save(src)
+        result = asyncio.run(
+            optimizer.optimize_png(src, out, output_format="avif",
+                                   compression_mode="lossless")
+        )
+        assert result["success"] is True
+        assert out.exists()

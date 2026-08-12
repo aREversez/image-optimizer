@@ -38,6 +38,7 @@ class Optimizer:
         self.pngquant_path: Optional[Path] = None
         self.oxipng_path: Optional[Path] = None
         self.cjpeg_path: Optional[Path] = None
+        self.avifenc_path: Optional[Path] = None
         self._detect_binaries()
         self._semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
@@ -87,6 +88,14 @@ class Optimizer:
         # the highest quality pass, see _optimize_jpeg). No cjpeg → no JPG.
         if self.cjpeg_path is not None:
             modes |= {("jpg", "standard"), ("jpg", "lossless"), ("jpg", "resize_only")}
+        # AVIF output needs avifenc — all three modes are available when
+        # the binary is found. AVIF is a modern, efficient codec that
+        # typically produces smaller files than PNG or WebP at equivalent
+        # quality, but encoding is slower. Like JPEG, "lossless" maps to
+        # a very-high-quality pass (AVIF does support true lossless, but
+        # the quality map keeps the UI consistent with other formats).
+        if self.avifenc_path is not None:
+            modes |= {("avif", "standard"), ("avif", "lossless"), ("avif", "resize_only")}
         return modes
 
     def _find_binary(self, name: str) -> Optional[Path]:
@@ -113,6 +122,7 @@ class Optimizer:
         # `cjpeg` or `cjpeg-static` (the static variant shipped by several
         # Windows/AiZ builds) — try both spellings so either is picked up.
         self.cjpeg_path = self._find_binary_any(["cjpeg", "cjpeg-static"])
+        self.avifenc_path = self._find_binary("avifenc")
 
     def _find_binary_any(self, names: list[str]) -> Optional[Path]:
         for name in names:
@@ -336,6 +346,12 @@ class Optimizer:
 
         if output_format in ("jpg", "jpeg"):
             return await self._optimize_jpeg(
+                input_path, output_path, quality, max_width, compression_mode,
+                progress_callback, keep_exif=keep_exif, cleaned_exif=cleaned_exif,
+            )
+
+        if output_format == "avif":
+            return await self._optimize_avif(
                 input_path, output_path, quality, max_width, compression_mode,
                 progress_callback, keep_exif=keep_exif, cleaned_exif=cleaned_exif,
             )
@@ -729,3 +745,135 @@ class Optimizer:
             jpg_path.write_bytes(data[:2] + segment + data[2:])
         except Exception:
             pass
+
+    async def _optimize_avif(
+        self,
+        input_path: Path,
+        output_path: Path,
+        quality: str,
+        max_width: int,
+        compression_mode: str,
+        progress_callback: Optional[Callable],
+        *,
+        keep_exif: bool = False,
+        cleaned_exif: bytes = b"",
+    ) -> dict:
+        """AVIF encode through avifenc. Source is decoded with Pillow (EXIF
+        orientation baked in, alpha composited onto white, optional resize),
+        written to a Y4M intermediate (the most reliable input format for
+        avifenc — several builds lack JPEG/PNG readers), then re-encoded
+        by avifenc.
+
+        Mode semantics:
+        - standard    -> avifenc --quality from the {high, medium, low} map
+        - lossless    -> avifenc --lossless (true lossless AVIF)
+        - resize_only -> resize first, then encode at high quality so savings
+          come from the smaller dimensions.
+        """
+        original_size = os.path.getsize(input_path)
+        result = {
+            "success": False,
+            "original_size": original_size,
+            "compressed_size": original_size,
+            "error": None,
+            "warning": None,
+        }
+        if self.avifenc_path is None:
+            result["error"] = "avifenc not found — cannot produce AVIF output"
+            return result
+
+        quality_map = {"high": 80, "medium": 60, "low": 40}
+        if compression_mode == "lossless":
+            q = 100
+        elif compression_mode == "resize_only":
+            q = 90
+        else:
+            q = quality_map.get(quality, 60)
+
+        temp_files: list = []
+        try:
+            loop = asyncio.get_running_loop()
+            y4m_path = output_path.with_suffix(".src.ppm")
+            tmp_avif = output_path.with_suffix(".avifenc.avif")
+            temp_files = [y4m_path, tmp_avif]
+
+            def _prepare_y4m():
+                with Image.open(input_path) as opened:
+                    img = ImageOps.exif_transpose(opened)
+                    if img.mode == "CMYK":
+                        img = img.convert("RGB")
+                    elif img.mode not in ("RGB", "L"):
+                        # AVIF supports alpha, but avifenc's Y4M input path
+                        # is RGB-only. Composite onto white for consistency
+                        # with the JPEG path.
+                        rgba = img.convert("RGBA")
+                        bg = Image.new("RGB", rgba.size, (255, 255, 255))
+                        bg.paste(rgba, mask=rgba.getchannel("A"))
+                        img = bg
+                    elif img.mode == "L":
+                        img = img.convert("RGB")
+
+                    if max_width > 0:
+                        w, h = img.size
+                        if w > max_width:
+                            ratio = max_width / w
+                            img = img.resize((max_width, int(h * ratio)), Image.Resampling.LANCZOS)
+
+                    img.info.pop("exif", None)
+                    img.save(y4m_path, format="PPM")
+
+            if progress_callback:
+                mode_desc = "lossless" if compression_mode == "lossless" else f"quality={q}"
+                await progress_callback(f"encoding AVIF via avifenc ({mode_desc})...")
+            await loop.run_in_executor(None, _prepare_y4m)
+
+            cmd = [
+                str(self.avifenc_path),
+            ]
+            if compression_mode == "lossless":
+                cmd += ["--lossless"]
+            else:
+                cmd += ["--quality", str(q)]
+            cmd += ["--speed", "6"]
+            if keep_exif and cleaned_exif:
+                exif_path = output_path.with_suffix(".exif")
+                exif_path.write_bytes(cleaned_exif)
+                temp_files.append(exif_path)
+                cmd += ["--exif", str(exif_path)]
+            cmd += ["-o", str(tmp_avif), str(y4m_path)]
+
+            async with self._semaphore:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr = await proc.communicate()
+
+            if tmp_avif.exists() and tmp_avif.stat().st_size > 0:
+                tmp_avif.replace(output_path)
+            else:
+                msg = stderr.decode().strip()
+                if progress_callback:
+                    await progress_callback(f"avifenc: {msg} (skipped)")
+                result["warning"] = msg or "avifenc produced no output"
+                result["error"] = "avifenc did not produce an output file"
+                return result
+
+            if output_path.exists():
+                result["compressed_size"] = os.path.getsize(output_path)
+                result["success"] = True
+            else:
+                result["error"] = "output file not generated"
+        except Exception as e:
+            result["success"] = False
+            result["error"] = str(e)
+        finally:
+            for f in temp_files:
+                try:
+                    if f.exists() and f != output_path:
+                        f.unlink()
+                except Exception:
+                    pass
+
+        return result
