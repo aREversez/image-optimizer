@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import secrets
@@ -246,35 +247,83 @@ def _recent_file() -> Path:
     return _config_dir() / "recent.json"
 
 
-def _batch_state_file() -> Path:
-    return _config_dir() / "batch_state.json"
-
-
-def _load_batch_state() -> Optional[dict]:
-    """Load persisted batch state from ~/.image-optimizer/batch_state.json.
-    Returns None if the file doesn't exist or is corrupt."""
+def _batch_state_dir() -> Path:
+    d = _config_dir() / "batches"
     try:
-        return json.loads(_batch_state_file().read_text(encoding="utf-8"))
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
+def _batch_id_for_output_dir(output_dir: str) -> str:
+    """Stable id for a batch, derived from its output_dir rather than the
+    browser session. Session ids are ephemeral — they're re-issued on every
+    server restart (see get_session), which is exactly when resume needs to
+    work — so keying storage by session would make a crash-restart batch
+    un-resumable. output_dir is what the resume flow already treats as a
+    batch's identity (start_optimization rejects a resume whose output_dir
+    doesn't match), and unlike a session it's stable across restarts and
+    naturally distinct between unrelated batches, so two tabs/processes
+    running different batches can no longer collide on one shared file."""
+    normalized = str(Path(output_dir).resolve())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def _batch_state_file(output_dir: str) -> Path:
+    return _batch_state_dir() / f"{_batch_id_for_output_dir(output_dir)}.json"
+
+
+def _load_batch_state(output_dir: str) -> Optional[dict]:
+    """Load the batch persisted for this output_dir, if any.
+    Returns None if there's no such file or it's corrupt."""
+    try:
+        return json.loads(_batch_state_file(output_dir).read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return None
 
 
 def _save_batch_state(bs: dict):
-    """Persist batch state to disk. Called after each file completes so a
-    crash / server restart can pick up where it left off."""
+    """Persist batch state to disk, scoped to its own output_dir. Called
+    after each file completes so a crash / server restart can pick up
+    where it left off, without touching any other batch's file."""
+    output_dir = bs.get("output_dir")
+    if not output_dir:
+        return  # nothing to scope the file to — shouldn't happen in practice
     try:
         bs["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-        _batch_state_file().write_text(json.dumps(bs, indent=2, ensure_ascii=False), encoding="utf-8")
+        _batch_state_file(output_dir).write_text(
+            json.dumps(bs, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
     except OSError:
         pass  # best-effort — a write failure here mustn't crash the batch
 
 
-def _clear_batch_state():
-    """Remove the batch state file — called when a batch completes fully."""
+def _clear_batch_state(output_dir: str):
+    """Remove one batch's state file — called when that batch completes
+    fully. Only ever touches the file for this specific output_dir, so an
+    unrelated batch finishing elsewhere can't wipe this one's resume data."""
     try:
-        _batch_state_file().unlink(missing_ok=True)
+        _batch_state_file(output_dir).unlink(missing_ok=True)
     except OSError:
         pass
+
+
+def _list_unfinished_batch_states() -> list[dict]:
+    """Every persisted batch that still has pending/failed files, newest
+    first. Used to populate the resume banner without requiring the caller
+    to already know which output_dir to ask about."""
+    out = []
+    for f in _batch_state_dir().glob("*.json"):
+        try:
+            bs = json.loads(f.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        files = bs.get("files", [])
+        if any(item.get("status") in ("pending", "failed") for item in files):
+            out.append(bs)
+    out.sort(key=lambda bs: bs.get("updated_at", ""), reverse=True)
+    return out
 
 
 # Defaults for everything a config.json can override. CLI flags (where they
@@ -894,16 +943,19 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
     batch_state = None
     previous_results = []
     if data.resume:
-        bs = _load_batch_state()
+        if not data.output_dir:
+            return JSONResponse(
+                {"error": "Resume requires output_dir to identify which batch to resume"},
+                status_code=400,
+            )
+        # Batch state is stored per output_dir (see _batch_state_file), so
+        # this already only ever loads *this* batch — no separate mismatch
+        # check needed, and no risk of picking up an unrelated batch that
+        # happens to be saved for a different output_dir.
+        bs = _load_batch_state(data.output_dir)
         if bs is None:
             return JSONResponse(
                 {"error": "No resumable batch state found"},
-                status_code=400,
-            )
-        # Validate dirs match — the user can't resume into a different output folder
-        if bs.get("output_dir", "") != data.output_dir:
-            return JSONResponse(
-                {"error": "Output directory doesn't match the saved batch"},
                 status_code=400,
             )
         # Reconstruct state.files from batch_state (server may have restarted)
@@ -1413,8 +1465,8 @@ async def _process_files(
         # leave the file on disk so the frontend can offer a Resume button.
         if batch_state:
             remaining = [f for f in batch_state.get("files", []) if f["status"] in ("pending", "failed")]
-            if not remaining:
-                _clear_batch_state()
+            if not remaining and batch_state.get("output_dir"):
+                _clear_batch_state(batch_state["output_dir"])
 
 
 @app.get("/api/progress")
@@ -2014,10 +2066,25 @@ async def get_state(state: AppState = Depends(get_session)):
 
 
 @app.get("/api/batch-state")
-async def get_batch_state(state: AppState = Depends(get_session)):
+async def get_batch_state(output_dir: Optional[str] = None, state: AppState = Depends(get_session)):
     """Return whether there's an unfinished batch that can be resumed.
-    Called on page load so the frontend can show a 'Resume?' prompt."""
-    bs = _load_batch_state()
+    Called on page load so the frontend can show a 'Resume?' prompt.
+
+    Batch state is stored one file per output_dir (see _batch_state_file),
+    so this never mixes results from an unrelated batch:
+    - output_dir given: report on that specific batch only.
+    - output_dir omitted (the page-load case, before the user has picked a
+      folder): report the most recently updated batch that still has
+      pending/failed files, out of everything currently on disk. Every
+      candidate here is a real, currently-unfinished batch — finishing an
+      unrelated batch elsewhere can no longer make this list wrong, since
+      that batch's own file is the only one touched when it completes.
+    """
+    if output_dir:
+        bs = _load_batch_state(output_dir)
+    else:
+        candidates = _list_unfinished_batch_states()
+        bs = candidates[0] if candidates else None
     if bs is None:
         return JSONResponse({"has_batch": False})
     total = len(bs.get("files", []))

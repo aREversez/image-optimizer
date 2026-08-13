@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Batch resume state was a single global file shared by every browser
+  tab/session.** `~/.image-optimizer/batch_state.json` didn't distinguish
+  between unrelated batches, even though the rest of the app's state
+  (`state.files`, `state.results`, `state.workspace`) is per-session. Two
+  tabs running batches into different output folders would silently
+  clobber each other's resume data — e.g. tab B finishing a normal batch
+  called the same global `_clear_batch_state()`, wiping out tab A's
+  still-interrupted batch and its resume banner along with it. Batch
+  state is now stored one file per output_dir under
+  `~/.image-optimizer/batches/` (filename derived from a hash of the
+  resolved output_dir), keyed by output_dir rather than session id so
+  resume still survives a server restart (session ids are re-issued on
+  restart; output_dir isn't). `GET /api/batch-state` accepts an optional
+  `?output_dir=` to check one specific batch, or with no query param
+  reports the most recently updated batch that's still unfinished across
+  everything on disk. `POST /api/optimize` with `resume: true` now
+  requires `output_dir` up front (400 if missing) since that's what
+  identifies which saved batch to resume.
+
 ### Added
 - **AVIF output** (`output_format: "avif"`). Selecting AVIF encodes through
   `avifenc` (auto-detected in `bin/` or PATH; without it the `(avif, *)`
@@ -14,14 +34,15 @@ All notable changes to this project will be documented in this file.
   sidecar. Quality map: high=80, medium=60, low=40; lossless uses
   `--lossless`; resize_only encodes at q=90 after downscaling.
 - **Batch resume** (`GET /api/batch-state`, `POST /api/optimize` with
-  `resume: true`). Progress is persisted to
-  `~/.image-optimizer/batch_state.json` after each file completes. If the
-  server crashes or the user cancels mid-batch, the frontend shows a
-  banner on reload ("Found unfinished batch: X/Y completed") with a
-  Resume button that re-processes only the pending/failed files into the
-  same output directory. Batch state is auto-cleared when every file
-  finishes successfully. Runs without a persistent output_dir don't
-  create batch state (the temp workspace disappears anyway).
+  `resume: true`). Progress is persisted (one file per output_dir, under
+  `~/.image-optimizer/batches/` — see Fixed below) after each file
+  completes. If the server crashes or the user cancels mid-batch, the
+  frontend shows a banner on reload ("Found unfinished batch: X/Y
+  completed") with a Resume button that re-processes only the
+  pending/failed files into the same output directory. Batch state is
+  auto-cleared when every file finishes successfully. Runs without a
+  persistent output_dir don't create batch state (the temp workspace
+  disappears anyway).
 - **Watch mode** (`POST /api/watch/start`, `/stop`, `/status`, `/events`).
   Monitor a folder and auto-optimize new or changed images as they appear.
   `FolderWatcher` polls on a timer, diffs by (mtime, size), and fires a

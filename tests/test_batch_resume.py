@@ -1,9 +1,13 @@
 """Tests for batch resume — persist progress to disk and pick up where a
 crashed / cancelled batch left off.
 
-Batch state is saved to ~/.image-optimizer/batch_state.json after each file
-completes. On resume, the backend loads this file, reconstructs state.files,
-and only processes files whose status is "pending" or "failed".
+Batch state is saved one file per output_dir under
+~/.image-optimizer/batches/ (see app.main._batch_state_file) so that two
+unrelated batches — e.g. two browser tabs pointed at different output
+folders — never share, and can't clobber, each other's resume data. On
+resume, the backend loads the file for the requested output_dir,
+reconstructs state.files, and only processes files whose status is
+"pending" or "failed".
 """
 from __future__ import annotations
 
@@ -17,20 +21,20 @@ from .conftest import wait_for
 from .test_api_optimize import scan_and_wait, optimize_and_wait
 
 
-def _batch_state_path():
+def _batch_state_path(output_dir):
     from app.main import _batch_state_file
-    return _batch_state_file()
+    return _batch_state_file(str(output_dir))
 
 
-def _load_batch_state():
-    p = _batch_state_path()
+def _load_batch_state(output_dir):
+    p = _batch_state_path(output_dir)
     if p.exists():
         return json.loads(p.read_text(encoding="utf-8"))
     return None
 
 
 def _save_batch_state(bs):
-    _batch_state_path().write_text(json.dumps(bs, indent=2), encoding="utf-8")
+    _batch_state_path(bs["output_dir"]).write_text(json.dumps(bs, indent=2), encoding="utf-8")
 
 
 class TestBatchStatePersisted:
@@ -48,7 +52,7 @@ class TestBatchStatePersisted:
                           compression_mode="lossless")
 
         # All done → batch state should be cleared
-        bs = _load_batch_state()
+        bs = _load_batch_state(output_dir)
         assert bs is None
 
     def test_batch_state_endpoint_no_batch(self, client, auth_headers):
@@ -133,7 +137,7 @@ class TestResume:
             assert (output_dir / f"resume_{i}.png").exists()
 
         # Batch state should be cleared (all done now)
-        bs = _load_batch_state()
+        bs = _load_batch_state(output_dir)
         assert bs is None
 
     def test_resume_without_batch_state_returns_error(self, client, auth_headers):
@@ -146,7 +150,9 @@ class TestResume:
         assert "No resumable" in r.json()["error"]
 
     def test_resume_wrong_output_dir_returns_error(self, client, auth_headers, test_images, tmp_path):
-        """Resume with a different output_dir than the saved batch should fail."""
+        """Resume with a different output_dir than the saved batch should fail —
+        batch state is stored per output_dir, so asking for a directory with
+        no saved batch simply finds none (rather than finding a mismatched one)."""
         output_dir = tmp_path / "output"
         output_dir.mkdir()
         wrong_dir = tmp_path / "wrong"
@@ -178,7 +184,73 @@ class TestResume:
             "compression_mode": "lossless",
         }, headers=auth_headers)
         assert r.status_code == 400
-        assert "doesn't match" in r.json()["error"]
+        assert "No resumable" in r.json()["error"]
+
+    def test_resume_requires_output_dir(self, client, auth_headers):
+        """Resume with no output_dir at all is rejected before even looking
+        for a batch — there'd be nothing to key the lookup on."""
+        r = client.post("/api/optimize", json={"resume": True}, headers=auth_headers)
+        assert r.status_code == 400
+        assert "output_dir" in r.json()["error"]
+
+    def test_two_batches_in_different_output_dirs_dont_collide(
+        self, client, auth_headers, test_images, tmp_path
+    ):
+        """Regression test: an unrelated batch finishing in one output_dir
+        must not wipe out, or leak into, another batch's still-pending
+        resume state in a different output_dir. This is the scenario two
+        browser tabs pointed at different folders would hit."""
+        out_a = tmp_path / "out_a"
+        out_a.mkdir()
+        out_b = tmp_path / "out_b"
+        out_b.mkdir()
+
+        # Batch A: interrupted, 1 file still pending — should be resumable.
+        img_a0 = test_images / "a0.png"
+        img_a1 = test_images / "a1.png"
+        Image.new("RGB", (32, 32), (10, 10, 10)).save(img_a0)
+        Image.new("RGB", (32, 32), (20, 20, 20)).save(img_a1)
+        bs_a = {
+            "session_id": "tab-a",
+            "input_dir": str(test_images),
+            "output_dir": str(out_a),
+            "output_format": "png",
+            "quality": "medium",
+            "compression_mode": "lossless",
+            "files": [
+                {"id": "a0", "path": str(img_a0), "name": "a0.png", "size": 100, "status": "done"},
+                {"id": "a1", "path": str(img_a1), "name": "a1.png", "size": 100, "status": "pending"},
+            ],
+            "results": [],
+            "created_at": "2026-01-01T00:00:00",
+            "updated_at": "2026-01-01T00:00:00",
+        }
+        _save_batch_state(bs_a)
+
+        # Sanity: batch A is reported as resumable.
+        r = client.get("/api/batch-state", params={"output_dir": str(out_a)}, headers=auth_headers)
+        d = r.json()
+        assert d["has_batch"] is True
+        assert d["pending"] == 1
+
+        # Batch B: a totally unrelated, fresh run into a different
+        # output_dir, allowed to finish completely.
+        img_b = test_images / "b0.png"
+        Image.new("RGB", (32, 32), (30, 30, 30)).save(img_b)
+        scan_and_wait(client, auth_headers, test_images)
+        r, progress = optimize_and_wait(
+            client, auth_headers,
+            output_dir=str(out_b), output_format="png", compression_mode="lossless",
+        )
+        assert r.status_code == 200
+        assert progress is not None and not progress["running"]
+
+        # Batch A's resumable state must be untouched by B's completion.
+        r = client.get("/api/batch-state", params={"output_dir": str(out_a)}, headers=auth_headers)
+        d = r.json()
+        assert d["has_batch"] is True, f"Batch A's resume data was wiped by an unrelated batch: {d}"
+        assert d["pending"] == 1
+        assert d["output_dir"] == str(out_a)
 
     def test_resume_no_pending_files_returns_error(self, client, auth_headers, test_images, tmp_path):
         """Resume when all files are already done should return 400."""
@@ -273,6 +345,8 @@ class TestResume:
                           output_format="png",
                           compression_mode="lossless")
 
-        # No batch state should be created (no output_dir)
-        bs = _load_batch_state()
-        assert bs is None
+        # No batch state should be created (no output_dir) — nothing to
+        # even look up without an output_dir, so just confirm the endpoint
+        # agrees nothing's pending anywhere.
+        r = client.get("/api/batch-state", headers=auth_headers)
+        assert r.json()["has_batch"] is False
