@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "image-optimizer"
-version = "1.0.2"
+version = "1.0.3"
 description = "Batch PNG compression with a local web UI"
 readme = "README.md"
 license = {text = "MIT"}

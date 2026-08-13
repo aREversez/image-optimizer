@@ -7,6 +7,7 @@ import os
 import secrets
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import time
@@ -22,7 +23,7 @@ from PIL import Image
 if __package__ is None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.models import OptimizeRequest, PreviewRequest, RecentClearRequest, RecentRemoveRequest, ScanRequest, WatchRequest
+from app.models import OptimizeRequest, PreviewRequest, RecentClearRequest, RecentRemoveRequest, RevealRequest, ScanRequest, WatchRequest
 from app.optimizer import HEX_COLOR_RE, Optimizer
 from app.watcher import FolderWatcher
 
@@ -84,6 +85,10 @@ class AppState:
         self.files: list = []
         self.results: list = []
         self.input_dir: Optional[str] = None
+        # Persistent output folder of the last run (if any) — recorded by
+        # _process_files so /api/reveal can open it without trusting any
+        # client-supplied path.
+        self.output_dir: Optional[str] = None
         self.workspace: Optional[Path] = None
         self.is_running = False
         self.current = 0
@@ -121,6 +126,7 @@ class AppState:
         self.files = []
         self.results = []
         self.input_dir = None
+        self.output_dir = None
         self.is_running = False
         self.current = 0
         self.total = 0
@@ -760,11 +766,17 @@ async def _scan_and_thumbnail(state: AppState, directory: Path, recursive: bool)
         thumb_path = ws / thumb_rel
         if not thumb_path.exists():
             await asyncio.to_thread(_gen_thumbnail, img_path, thumb_path)
+        st = img_path.stat()
         files[idx] = {
             "id": str(idx),
             "name": rel,
             "path": str(img_path),
-            "size": img_path.stat().st_size,
+            "size": st.st_size,
+            # Powers the Files-grid Sort dropdown: mtime = last modified,
+            # ctime = creation time on Windows (metadata-change time on
+            # POSIX, close enough for "newest first" ordering there).
+            "mtime": st.st_mtime,
+            "ctime": st.st_ctime,
             "thumbnail": f"/api/thumb/{ws.name}/{thumb_rel}",
         }
 
@@ -777,6 +789,8 @@ async def _scan_and_thumbnail(state: AppState, directory: Path, recursive: bool)
             "name": str(img_path),
             "path": str(img_path),
             "size": 0,
+            "mtime": 0,
+            "ctime": 0,
             "thumbnail": "",
             "error": str(e),
         }
@@ -876,11 +890,16 @@ async def upload_files(files: List[UploadFile] = File(...), state: AppState = De
         thumb_path = ws / thumb_rel
         await asyncio.to_thread(_gen_thumbnail, file_path, thumb_path)
 
+        st = file_path.stat()
         result_files.append({
             "id": str(idx),
             "name": name,
             "path": str(file_path),
             "size": size,
+            # Same fields as the scan flow (see process_item above) so the
+            # Files-grid Sort dropdown works for uploads too.
+            "mtime": st.st_mtime,
+            "ctime": st.st_ctime,
             "thumbnail": f"/api/thumb/{state.workspace.name}/{thumb_rel}",
         })
 
@@ -959,12 +978,21 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
                 status_code=400,
             )
         # Reconstruct state.files from batch_state (server may have restarted)
-        state.files = [
-            {"id": f.get("id", secrets.token_urlsafe(8)), "name": f["name"], "path": f["path"],
-             "size": f.get("size", 0), "thumbnail": ""}
-            for f in bs.get("files", [])
-            if Path(f["path"]).exists()
-        ]
+        rebuilt = []
+        for f in bs.get("files", []):
+            p = Path(f["path"])
+            if not p.exists():
+                continue
+            try:
+                st = p.stat()
+                mtime, ctime = st.st_mtime, st.st_ctime
+            except OSError:
+                mtime = ctime = 0
+            rebuilt.append({
+                "id": f.get("id", secrets.token_urlsafe(8)), "name": f["name"], "path": f["path"],
+                "size": f.get("size", 0), "mtime": mtime, "ctime": ctime, "thumbnail": "",
+            })
+        state.files = rebuilt
         if not state.files:
             return JSONResponse(
                 {"error": "Source files no longer available for resume"},
@@ -1184,6 +1212,12 @@ async def _process_files(
 
     overrides = overrides or {}
 
+    # Remember the persistent output folder of this run (if any) so
+    # /api/reveal can open it directly — the endpoint never trusts a
+    # client-supplied folder path, only this server-side record. Cleared
+    # again for temp-workspace-only runs.
+    state.output_dir = str(Path(output_dir).resolve()) if output_dir else None
+
     # Build a path→entry lookup for batch state persistence — O(1) per file
     # instead of scanning the whole list each time. Only populated when a
     # batch_state was provided (resume flow).
@@ -1327,6 +1361,13 @@ async def _process_files(
                     "compressed_size": comp_size,
                     "savings": savings,
                     "savings_percent": round(savings / orig_size * 100, 1) if orig_size > 0 else 0,
+                    # Absolute path to the actual file on disk, so the
+                    # frontend can offer "Reveal in File Explorer" — only
+                    # meaningful when output_dir is a real, persistent
+                    # folder (this whole branch is gated on output_dir
+                    # being set, so dest is always a real path here, not a
+                    # temp workspace file that disappears after cleanup).
+                    "final_output_path": str(dest),
                 }
                 state.logs.append(f"  SKIP {file_info['name']} (already optimized)")
                 state.results.append(skipped_result)
@@ -1382,6 +1423,11 @@ async def _process_files(
                     dest = user_output / rel
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(out_path, dest)
+                    # Same reasoning as the skip_existing branch above:
+                    # only set when there's a real, persistent file on
+                    # disk to reveal (nothing to show when output_dir is
+                    # empty and results live only in the temp workspace).
+                    result["final_output_path"] = str(dest)
                 except Exception as e:
                     state.logs.append(f"  Output copy failed: {e}")
         else:
@@ -2053,6 +2099,154 @@ async def browse_folder(title: str = "Select Folder", _auth: None = Depends(requ
         return JSONResponse({"path": "", "error": str(e)})
 
 
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+
+    def _focus_new_explorer_window(timeout: float = 3.0):
+        """Best-effort: bring the folder window we just asked explorer to
+        open to the foreground.
+
+        Two Windows behaviors work against us here:
+        1. Plain `explorer <dir>` may silently reuse an already-open window
+           for that folder instead of making a new visible one, so the
+           caller launches with /e,/root, (see reveal_in_explorer) which
+           always spawns a fresh CabinetWClass window.
+        2. Foreground lock: this server process sits behind the browser, and
+           Windows refuses to let a window created by a background process
+           steal focus — it opens behind the browser or just flashes in the
+           taskbar. Attaching our input state to the current foreground
+           thread before SetForegroundWindow is the documented workaround.
+
+        Runs in a worker thread (it polls/sleeps) and is purely cosmetic —
+        the window is open regardless of whether focusing succeeds.
+        """
+        try:
+            user32 = ctypes.windll.user32
+            _EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+            def cabinet_windows() -> list:
+                found = []
+
+                def _cb(hwnd, _lparam):
+                    buf = ctypes.create_unicode_buffer(64)
+                    user32.GetClassNameW(hwnd, buf, 64)
+                    # CabinetWClass = an Explorer folder window (the shell
+                    # taskbar/desktop and dialogs use other classes).
+                    if buf.value == "CabinetWClass":
+                        found.append(hwnd)
+                    return True
+
+                user32.EnumWindows(_EnumWindowsProc(_cb), 0)
+                return found
+
+            before = set(cabinet_windows())
+            deadline = time.monotonic() + timeout
+            new_hwnd = None
+            while new_hwnd is None and time.monotonic() < deadline:
+                time.sleep(0.1)
+                for hwnd in cabinet_windows():
+                    if hwnd not in before:
+                        new_hwnd = hwnd
+                        break
+            if new_hwnd is None:
+                return  # window never appeared (or appeared too late) — give up
+
+            fg_hwnd = user32.GetForegroundWindow()
+            fg_tid = user32.GetWindowThreadProcessId(fg_hwnd, None) if fg_hwnd else 0
+            tgt_tid = user32.GetWindowThreadProcessId(new_hwnd, None)
+            attached = bool(
+                fg_tid and tgt_tid and fg_tid != tgt_tid
+                and user32.AttachThreadInput(fg_tid, tgt_tid, True)
+            )
+            try:
+                user32.ShowWindow(new_hwnd, 9)  # SW_RESTORE, in case it's minimized
+                user32.SetForegroundWindow(new_hwnd)
+            finally:
+                if attached:
+                    user32.AttachThreadInput(fg_tid, tgt_tid, False)
+        except Exception:
+            pass  # cosmetic only — never break the reveal itself
+
+
+@app.post("/api/reveal")
+async def reveal_in_explorer(
+    data: RevealRequest, state: AppState = Depends(get_session), _auth: None = Depends(require_token)
+):
+    """Open the OS file explorer — either the run's output folder itself
+    (empty path) or with a specific output file selected.
+
+    Folder mode (data.path empty): opens state.output_dir, the persistent
+    output folder _process_files recorded for this run. The target comes
+    entirely from server-side state, so there is nothing client-supplied
+    to validate. This backs the single "Reveal Output Folder" button in
+    the Results bar (one output folder per run → one button, not one per
+    image).
+
+    File mode: data.path must exactly match one of *this session's*
+    recorded final_output_path values (set on results only when a
+    persistent output_dir was used — see process_one). Without that
+    check, this endpoint would be an arbitrary "launch explorer at any
+    path on disk" oracle driven entirely by client-supplied input;
+    requiring it to be a path this app itself just wrote, for this
+    session, keeps it scoped to "reveal something you just compressed"
+    and nothing else.
+    """
+    if not data.path:
+        if not state.output_dir:
+            return JSONResponse({"error": "No output folder for this session"}, status_code=400)
+        target = Path(state.output_dir)
+        select_file = False
+    else:
+        requested = str(Path(data.path))
+        if not any(r.get("final_output_path") == requested for r in state.results):
+            return JSONResponse({"error": "Not a known output file for this session"}, status_code=400)
+        target = Path(requested)
+        select_file = True
+
+    if not target.exists():
+        return JSONResponse(
+            {"error": "File no longer exists on disk" if select_file else "Folder no longer exists on disk"},
+            status_code=404,
+        )
+
+    try:
+        if select_file:
+            if sys.platform == "win32":
+                # /select, (comma, no space) + the path as one argument is
+                # explorer.exe's documented syntax for "open the containing
+                # folder with this file highlighted". explorer.exe routinely
+                # returns a non-zero exit code even on success, so this is
+                # fire-and-forget rather than awaited/checked.
+                subprocess.Popen(["explorer", f"/select,{target}"])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", "-R", str(target)])
+            else:
+                # No cross-desktop-environment equivalent of "select this
+                # file" on Linux — best effort is opening its containing
+                # folder.
+                subprocess.Popen(["xdg-open", str(target.parent)])
+        else:
+            if sys.platform == "win32":
+                # /e,/root, forces a fresh folder window — a bare
+                # `explorer <dir>` may silently reuse an already-open one.
+                subprocess.Popen(["explorer", f"/e,/root,{target}"])
+                # Then pull that window to the front: this process sits
+                # behind the browser, so Windows' foreground lock would
+                # otherwise leave it hidden (see _focus_new_explorer_window).
+                # Fire-and-forget off the event loop — the response doesn't
+                # need to wait for the animation.
+                asyncio.create_task(asyncio.to_thread(_focus_new_explorer_window))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(target)])
+            else:
+                subprocess.Popen(["xdg-open", str(target)])
+    except OSError as e:
+        return JSONResponse({"error": f"Could not open file explorer: {e}"}, status_code=500)
+
+    return JSONResponse({"success": True})
+
+
 @app.get("/api/state")
 async def get_state(state: AppState = Depends(get_session)):
     return JSONResponse({
@@ -2288,8 +2482,15 @@ async def _watch_loop(state: AppState, req: WatchRequest):
 
     quality_map = {"high": 85, "medium": 75, "low": 60}
     used_names: set[str] = set()
+    # rel_path -> the output file actually written for it, so a detected
+    # rename can find and remove the *old* name's output. A plain set
+    # (used_names) only tells us a filename is taken, not which source it
+    # came from, and the collision guard can shift the actual filename
+    # away from the naive with_suffix() guess (e.g. "_2.png") — this dict
+    # tracks the real path so cleanup targets the right file.
+    output_path_for: dict[str, Path] = {}
 
-    async def on_change(rel_path: str, abs_path: Path):
+    async def on_change(rel_path: str, abs_path: Path, renamed_from: Optional[str] = None):
         if optimizer is None:
             return
         try:
@@ -2309,6 +2510,31 @@ async def _watch_loop(state: AppState, req: WatchRequest):
                 used_names.add(key)
             else:
                 return
+
+            # Rename cleanup: FolderWatcher only sets renamed_from when a
+            # path vanished and this one appeared in the very same scan
+            # with an identical (mtime, size) — a same-content rename, not
+            # an unrelated delete. Remove the old name's output now that a
+            # fresh one is about to be written for the new name, so the
+            # stale copy doesn't sit around forever. A file that's simply
+            # deleted (renamed_from is None for everyone, always) never
+            # reaches this branch — its output is left untouched, since
+            # plenty of people delete the original and keep only the
+            # compressed result.
+            if renamed_from is not None:
+                old_output = output_path_for.pop(renamed_from, None)
+                if old_output is not None and old_output != out_path:
+                    try:
+                        if old_output.exists():
+                            old_output.unlink()
+                        used_names.discard(str(old_output).lower())
+                        state.watch_logs.append(
+                            f"  Renamed: {renamed_from} -> {rel_path} (removed old output {old_output.name})"
+                        )
+                    except OSError as e:
+                        state.watch_logs.append(
+                            f"  WARN: couldn't remove old output for renamed file {renamed_from!r}: {e}"
+                        )
 
             state.watch_logs.append(f"Detected: {rel_path}")
 
@@ -2330,6 +2556,7 @@ async def _watch_loop(state: AppState, req: WatchRequest):
 
             state.watch_processed += 1
             if result.get("success"):
+                output_path_for[rel_path] = out_path
                 savings = result["original_size"] - result["compressed_size"]
                 pct = round(savings / result["original_size"] * 100, 1) if result["original_size"] > 0 else 0
                 state.watch_logs.append(
@@ -2596,11 +2823,14 @@ def main():
                 thumb_path = ws / thumb_rel
                 if not thumb_path.exists():
                     _gen_thumbnail(img_path, thumb_path)
+                st = img_path.stat()
                 prescan.files.append({
                     "id": str(idx),
                     "name": rel,
                     "path": str(img_path),
-                    "size": img_path.stat().st_size,
+                    "size": st.st_size,
+                    "mtime": st.st_mtime,
+                    "ctime": st.st_ctime,
                     "thumbnail": f"/api/thumb/{prescan.workspace.name}/{thumb_rel}",
                 })
             prescan.total = len(prescan.files)

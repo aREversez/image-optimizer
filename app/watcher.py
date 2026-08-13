@@ -12,6 +12,17 @@ Design points:
   incremental build tool uses (make, rsync -u, the app's own skip_existing
   logic). Writing a file atomically (write tmp + rename) produces exactly
   one stat change, so Watch picks it up exactly once.
+- Rename detection: if a path disappears and a different path appears in
+  the *same* poll cycle with an identical (mtime, size), that's treated as
+  a rename of the same content rather than an unrelated delete+create, and
+  the new-path event carries `renamed_from` so the caller can clean up
+  whatever it produced for the old name (e.g. a stale optimized output)
+  instead of leaving an orphan behind. A lone disappearance — nothing
+  reappearing with a matching stat — is never reported at all: the watcher
+  only emits new/changed files, so a plain delete (no matching reappearance)
+  can't be mistaken for something requiring cleanup. This matters because
+  many people delete the original after keeping the compressed output, and
+  that must never cascade into deleting the output too.
 - The scan itself is blocking I/O and runs on a thread executor; new events
   are pushed onto an asyncio.Queue so a slow consumer (lossy encoding of a
   large batch) never stalls the polling loop or misses files arriving
@@ -37,7 +48,7 @@ class FolderWatcher:
         recursive: bool = True,
         interval: float = 2.0,
         process_existing: bool = False,
-        on_change: Optional[Callable[[str, Path], Awaitable[None]]] = None,
+        on_change: Optional[Callable[[str, Path, Optional[str]], Awaitable[None]]] = None,
     ):
         self.directory = directory
         self.recursive = recursive
@@ -79,7 +90,15 @@ class FolderWatcher:
 
         First call (baseline): record everything as already-known so nothing
         pre-existing is treated as new — unless process_existing is set, in
-        which case the existing files are emitted once up front."""
+        which case the existing files are emitted once up front.
+
+        Subsequent calls: a brand-new path whose (mtime, size) exactly
+        matches a path that just disappeared is treated as a rename — the
+        event's renamed_from carries the old relative path so the caller
+        can clean up what it produced for that name. Every other
+        disappearance (no matching reappearance in this same cycle) is
+        simply dropped from the snapshot and never reported — deletions on
+        their own are not the watcher's concern."""
         items = await asyncio.to_thread(self._scan)
         queue = self._queue
         snapshot = {rel: stat for rel, _, stat in items}
@@ -89,21 +108,43 @@ class FolderWatcher:
             if self.process_existing:
                 for rel, _path, _stat in items:
                     self.files_seen += 1
-                    await self._enqueue(queue, (rel, _stat))
+                    await self._enqueue(queue, (rel, _stat, None))
             return
+
+        # Candidates for "renamed from": paths present last snapshot, gone
+        # from this one. Grouped by stat so a same-cycle reappearance with
+        # an identical (mtime, size) can be matched back to the old name.
+        disappeared_by_stat: dict[tuple[float, int], list[str]] = {}
+        for rel, stat in self._known.items():
+            if rel not in snapshot:
+                disappeared_by_stat.setdefault(stat, []).append(rel)
+
         for rel, _path, stat in items:
             prev = self._known.get(rel)
-            if prev is None or prev != stat:
+            if prev is None:
+                renamed_from = None
+                candidates = disappeared_by_stat.get(stat)
+                if candidates:
+                    # FIFO match — good enough for a same-size/same-mtime
+                    # tie-break among multiple simultaneous renames; the
+                    # caller only uses this to clean up an old output, not
+                    # for anything correctness-critical.
+                    renamed_from = candidates.pop(0)
+                    if not candidates:
+                        del disappeared_by_stat[stat]
                 self.files_seen += 1
-                await self._enqueue(queue, (rel, stat))
+                await self._enqueue(queue, (rel, stat, renamed_from))
+            elif prev != stat:
+                self.files_seen += 1
+                await self._enqueue(queue, (rel, stat, None))
         self._known = snapshot
 
     async def _consume(self) -> None:
         queue = self._queue
         while True:
-            rel, _stat = await queue.get()
+            rel, stat, renamed_from = await queue.get()
             try:
-                await self.on_change(rel, Path(self.directory) / rel)
+                await self.on_change(rel, Path(self.directory) / rel, renamed_from)
             finally:
                 queue.task_done()
 

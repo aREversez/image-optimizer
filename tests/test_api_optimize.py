@@ -170,6 +170,139 @@ class TestOutputDirStructure:
         assert len(final_files) == 3
 
 
+class TestRevealInExplorer:
+    """final_output_path is set on results only when a persistent
+    output_dir was used, and /api/reveal only opens a path that matches
+    one of the session's own recorded results."""
+
+    def test_final_output_path_set_when_output_dir_given(self, client, auth_headers, test_images, tmp_path):
+        scan_and_wait(client, auth_headers, test_images)
+        out_dir = tmp_path / "output"
+        r, d = optimize_and_wait(client, auth_headers, output_dir=str(out_dir))
+        assert r.status_code == 200
+        successes = [res for res in d["results"] if res["success"]]
+        assert successes
+        for res in successes:
+            assert res.get("final_output_path"), res
+            assert Path(res["final_output_path"]).exists()
+            assert Path(res["final_output_path"]).parent == out_dir or \
+                out_dir in Path(res["final_output_path"]).parents
+
+    def test_final_output_path_absent_without_output_dir(self, client, auth_headers, test_images):
+        """No persistent output_dir → temp workspace only → nothing to
+        reveal, so the field must be absent (frontend uses its presence
+        to decide whether to render the Reveal button at all)."""
+        scan_and_wait(client, auth_headers, test_images)
+        r, d = optimize_and_wait(client, auth_headers)
+        assert r.status_code == 200
+        for res in d["results"]:
+            assert "final_output_path" not in res or not res["final_output_path"]
+
+    def test_reveal_rejects_path_not_in_this_sessions_results(self, client, auth_headers, tmp_path):
+        """A path that was never recorded as one of this session's own
+        final_output_path values must be rejected — otherwise this
+        endpoint is an arbitrary 'open explorer anywhere' oracle driven
+        by client-supplied input."""
+        somewhere_else = tmp_path / "not_a_real_output" / "file.png"
+        somewhere_else.parent.mkdir(parents=True)
+        somewhere_else.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 20)
+
+        r = client.post("/api/reveal", json={"path": str(somewhere_else)}, headers=auth_headers)
+        assert r.status_code == 400
+        assert "Not a known output file" in r.json()["error"]
+
+    def test_reveal_known_output_path_succeeds(self, client, auth_headers, test_images, tmp_path, monkeypatch):
+        """A path that genuinely is one of this session's final_output_path
+        values should be accepted and attempt to launch the OS file
+        explorer — the subprocess call itself is mocked out since there's
+        no real desktop environment in CI."""
+        scan_and_wait(client, auth_headers, test_images)
+        out_dir = tmp_path / "output"
+        r, d = optimize_and_wait(client, auth_headers, output_dir=str(out_dir))
+        assert r.status_code == 200
+        target = next(res["final_output_path"] for res in d["results"] if res["success"])
+
+        calls = []
+        import app.main as m
+        monkeypatch.setattr(m.subprocess, "Popen", lambda *a, **k: calls.append((a, k)))
+
+        r2 = client.post("/api/reveal", json={"path": target}, headers=auth_headers)
+        assert r2.status_code == 200
+        assert r2.json()["success"] is True
+        assert len(calls) == 1
+
+    def test_reveal_requires_auth(self, client, auth_headers, test_images, tmp_path):
+        scan_and_wait(client, auth_headers, test_images)
+        out_dir = tmp_path / "output"
+        r, d = optimize_and_wait(client, auth_headers, output_dir=str(out_dir))
+        target = next(res["final_output_path"] for res in d["results"] if res["success"])
+
+        r2 = client.post("/api/reveal", json={"path": target})  # no auth header
+        assert r2.status_code in (401, 403)
+
+    def test_reveal_missing_file_returns_404(self, client, auth_headers, test_images, tmp_path):
+        scan_and_wait(client, auth_headers, test_images)
+        out_dir = tmp_path / "output"
+        r, d = optimize_and_wait(client, auth_headers, output_dir=str(out_dir))
+        target = next(res["final_output_path"] for res in d["results"] if res["success"])
+
+        Path(target).unlink()  # simulate the user having deleted it since
+
+        r2 = client.post("/api/reveal", json={"path": target}, headers=auth_headers)
+        assert r2.status_code == 404
+
+    def test_reveal_empty_path_opens_output_folder(self, client, auth_headers, test_images, tmp_path, monkeypatch):
+        """The UI shows one "Reveal Output Folder" button instead of a
+        per-image Reveal link: it posts an empty path, and the backend
+        opens the output_dir it recorded for this run itself
+        (state.output_dir) rather than anything client-supplied."""
+        scan_and_wait(client, auth_headers, test_images)
+        out_dir = tmp_path / "output"
+        r, d = optimize_and_wait(client, auth_headers, output_dir=str(out_dir))
+        assert r.status_code == 200
+
+        calls = []
+        import app.main as m
+        monkeypatch.setattr(m.subprocess, "Popen", lambda *a, **k: calls.append((a, k)))
+        # The win32 focus helper would otherwise poll for a real Explorer
+        # window for up to 3s in CI (and never find one — Popen is mocked).
+        if hasattr(m, "_focus_new_explorer_window"):
+            monkeypatch.setattr(m, "_focus_new_explorer_window", lambda timeout=3.0: None)
+
+        r2 = client.post("/api/reveal", json={"path": ""}, headers=auth_headers)
+        assert r2.status_code == 200
+        assert r2.json()["success"] is True
+        assert len(calls) == 1
+        # The launched target must be the run's output folder itself —
+        # last argv entry on every platform branch (win32 folder mode
+        # wraps it in "/e,/root,<path>" to force a fresh window).
+        last = calls[0][0][0][-1]
+        if last.startswith("/e,/root,"):
+            last = last.split("/e,/root,", 1)[1]
+        assert Path(last).resolve() == out_dir.resolve()
+
+    def test_reveal_empty_path_without_output_dir_rejected(self, client, auth_headers, test_images):
+        """A temp-workspace-only run has no persistent folder to reveal."""
+        scan_and_wait(client, auth_headers, test_images)
+        r, d = optimize_and_wait(client, auth_headers)
+        assert r.status_code == 200
+        r2 = client.post("/api/reveal", json={"path": ""}, headers=auth_headers)
+        assert r2.status_code == 400
+        assert "No output folder" in r2.json()["error"]
+
+    def test_reveal_empty_path_missing_folder_returns_404(self, client, auth_headers, test_images, tmp_path):
+        scan_and_wait(client, auth_headers, test_images)
+        out_dir = tmp_path / "output"
+        r, d = optimize_and_wait(client, auth_headers, output_dir=str(out_dir))
+        assert r.status_code == 200
+
+        import shutil
+        shutil.rmtree(out_dir)  # simulate the user having deleted it since
+
+        r2 = client.post("/api/reveal", json={"path": ""}, headers=auth_headers)
+        assert r2.status_code == 404
+
+
 class TestValidation:
     def test_resize_only_requires_max_width(self, client, auth_headers, test_images):
         scan_and_wait(client, auth_headers, test_images)

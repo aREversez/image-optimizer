@@ -189,7 +189,12 @@ header h1 span { color: var(--accent); }
 }
 
 /* File List */
-.file-stats { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; font-size: 13px; color: var(--text2); }
+.file-stats { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; font-size: 13px; color: var(--text2); gap: 12px; flex-wrap: wrap; }
+.file-stats select {
+  padding: 4px 8px; background: var(--bg); border: 1px solid var(--border);
+  border-radius: var(--radius); color: var(--text); font-size: 12px; outline: none;
+}
+.file-stats select:focus { border-color: var(--accent); }
 .file-grid {
   display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px;
   max-height: 360px; overflow-y: auto; align-items: start;
@@ -496,6 +501,9 @@ header h1 span { color: var(--accent); }
   <!-- Config + Action -->
   <div class="card" id="config-section">
     <div class="card-title">Settings</div>
+    <div id="watch-lock-notice" style="display:none;font-size:12px;color:var(--yellow);background:rgba(230,180,60,0.1);border:1px solid rgba(230,180,60,0.3);border-radius:6px;padding:8px 10px;margin-bottom:12px">
+      Locked while Watch Mode is running — it captured these settings when you clicked "Start Watching" and won't pick up changes. Stop Watch Mode to change them, then start again.
+    </div>
     <div class="config-grid" style="margin-bottom:16px">
       <div class="config-group">
         <label title="Controls how much color detail Standard mode is allowed to sacrifice for size. For UI screenshots with text, High usually costs little extra size since screenshots rarely use many colors to begin with.">Quality</label>
@@ -582,6 +590,9 @@ header h1 span { color: var(--accent); }
       Monitor a folder and auto-optimize new or changed images as they appear.
     </div>
     <div class="input-row" style="margin-bottom:8px">
+      <button class="btn btn-secondary" id="watch-use-current-paths-btn" style="white-space:nowrap">Use Select Images / Output paths</button>
+    </div>
+    <div class="input-row" style="margin-bottom:8px">
       <input type="text" id="watch-dir" placeholder="Watch directory" style="flex:1" />
       <button class="btn btn-secondary" id="watch-browse-dir-btn" style="white-space:nowrap">Browse...</button>
     </div>
@@ -616,9 +627,21 @@ header h1 span { color: var(--accent); }
     <div class="card-title">Files</div>
     <div class="file-stats">
       <span id="file-stats-text"></span>
-      <label style="font-size:13px;cursor:pointer;user-select:none">
-        <input type="checkbox" id="select-all" checked /> Select all
-      </label>
+      <span style="display:flex;align-items:center;gap:10px">
+        <label for="file-sort" style="font-size:12px">Sort</label>
+        <select id="file-sort">
+          <option value="default">Scan order</option>
+          <option value="mtime_desc">Modified (newest first)</option>
+          <option value="mtime_asc">Modified (oldest first)</option>
+          <option value="ctime_desc">Created (newest first)</option>
+          <option value="ctime_asc">Created (oldest first)</option>
+          <option value="size_desc">Size (large to small)</option>
+          <option value="size_asc">Size (small to large)</option>
+        </select>
+        <label style="font-size:13px;cursor:pointer;user-select:none">
+          <input type="checkbox" id="select-all" checked /> Select all
+        </label>
+      </span>
     </div>
     <div id="files-empty" style="font-size:13px;color:var(--text2);padding:0 0 16px">Images will appear here after you scan a folder or add files</div>
     <div class="file-grid" id="file-grid"></div>
@@ -648,6 +671,7 @@ header h1 span { color: var(--accent); }
       <span id="output-path-info" style="font-size:12px;color:var(--text2)"></span>
       <div class="spacer"></div>
       <button class="btn btn-secondary" id="retry-btn" style="display:none">Retry Failed</button>
+      <button class="btn btn-secondary" id="reveal-dir-btn" style="display:none" title="Open the output folder in the OS file explorer">Reveal Output Folder</button>
       <button class="btn btn-primary" id="download-btn" style="display:none">Download All (ZIP)</button>
       <button class="btn btn-secondary" id="reset-btn">Reset</button>
     </div>
@@ -686,6 +710,7 @@ const STATE = {
   runStartTime: 0,
   resultSort: 'default',
   resultFilter: 'all',
+  fileSort: 'default',
   resultCursor: 0,
   logCursor: 0,
   logLines: [],
@@ -759,6 +784,7 @@ const dirPath = $('dir-path'),
       outputBrowseBtn = $('output-browse-btn'),
       fileGrid = $('file-grid'),
       fileStatsText = $('file-stats-text'),
+      fileSortSel = $('file-sort'),
       selectAll = $('select-all'),
       fileCountInfo = $('file-count-info'),
       startBtn = $('start-btn'),
@@ -776,6 +802,7 @@ const dirPath = $('dir-path'),
       resultSummary = $('result-summary'),
       resultGrid = $('result-grid'),
       downloadBtn = $('download-btn'),
+      revealDirBtn = $('reveal-dir-btn'),
       resetBtn = $('reset-btn'),
       healthStatus = $('health-status'),
       configSection = $('config-section'),
@@ -1114,7 +1141,10 @@ async function uploadFiles(files) {
 
 // Render file grid
 function renderFiles() {
-  const files = STATE.files;
+  // Sort a copy — STATE.files must keep its stable scan order (ids are
+  // positional and runOptimize sends file_ids from it untouched); the
+  // dropdown only changes the display order.
+  const files = sortFileList(STATE.files);
   // Drop override entries for ids no longer present (e.g. after a re-scan
   // of a different folder). Keeps STATE.fileOverrides in sync with the
   // current file set without wiping the user's per-file edits on a mere
@@ -1132,10 +1162,16 @@ function renderFiles() {
     return;
   }
   filesEmpty.style.display = 'none';
+  // Remember which cards the user deselected so a re-render triggered by
+  // the Sort dropdown doesn't silently re-select everything.
+  const unselected = new Set(
+    [...fileGrid.querySelectorAll('.file-card:not(.selected)')].map(el => el.dataset.id)
+  );
   let html = '';
   for (const f of files) {
+    const selClass = unselected.has(f.id) ? '' : ' selected';
     html += `
-      <div class="file-card selected" data-id="${f.id}" onclick="toggleFile('${f.id}')">
+      <div class="file-card${selClass}" data-id="${f.id}" onclick="toggleFile('${f.id}')">
         <div class="fc-main">
           <img class="thumb" src="${f.thumbnail}" alt="${escHtml(f.name)}" loading="lazy" />
           <div class="fname" title="${escHtml(f.name)}">${escHtml(f.name)}</div>
@@ -1179,8 +1215,27 @@ function renderFiles() {
   fileGrid.innerHTML = html;
   const total = files.reduce((s, f) => s + f.size, 0);
   fileStatsText.textContent = `${files.length} file(s), ${fmtSize(total)} total`;
-  selectAll.checked = true;
+  selectAll.checked = !fileGrid.querySelector('.file-card:not(.selected)');
 }
+
+// Files-grid Sort dropdown: display-order only (see renderFiles). mtime =
+// last modified, ctime = creation time (Windows); both come from the scan
+// result entries. Missing timestamps (corrupt-file entries) sort as oldest.
+function sortFileList(files) {
+  const arr = files.slice();
+  switch (STATE.fileSort) {
+    case 'mtime_desc': arr.sort((a, b) => (b.mtime || 0) - (a.mtime || 0)); break;
+    case 'mtime_asc': arr.sort((a, b) => (a.mtime || 0) - (b.mtime || 0)); break;
+    case 'ctime_desc': arr.sort((a, b) => (b.ctime || 0) - (a.ctime || 0)); break;
+    case 'ctime_asc': arr.sort((a, b) => (a.ctime || 0) - (b.ctime || 0)); break;
+    case 'size_desc': arr.sort((a, b) => (b.size || 0) - (a.size || 0)); break;
+    case 'size_asc': arr.sort((a, b) => (a.size || 0) - (b.size || 0)); break;
+    default: break; // 'default' keeps scan order
+  }
+  return arr;
+}
+
+fileSortSel.addEventListener('change', () => { STATE.fileSort = fileSortSel.value; renderFiles(); });
 
 function toggleFile(id) {
   const el = fileGrid.querySelector(`[data-id="${id}"]`);
@@ -1669,8 +1724,11 @@ function showResults() {
     $('output-path-info').textContent = '';
   }
 
-  // Enable download (any success) and Retry Failed (any failure).
+  // Enable download (any success), Reveal Output Folder (any result that
+  // actually landed in a persistent output dir — final_output_path is only
+  // set then, see process_one) and Retry Failed (any failure).
   downloadBtn.style.display = success.length > 0 ? 'inline-block' : 'none';
+  revealDirBtn.style.display = success.some(r => r.final_output_path) ? 'inline-block' : 'none';
   retryBtn.style.display = failed.length > 0 ? 'inline-block' : 'none';
   retryBtn.disabled = false;
   updateStartButtonState();
@@ -1722,6 +1780,25 @@ function renderResultGrid() {
   resultCountEl.textContent = shown === total ? `${total} file(s)` : `${shown} of ${total} shown`;
 }
 
+// Reveal the run's output folder in the OS file explorer. One button for
+// the whole folder instead of one per image — there's only ever one
+// output_dir per run. The client sends no path at all: the backend opens
+// the output_dir it recorded itself (state.output_dir), so there is
+// nothing to spoof.
+revealDirBtn.addEventListener('click', async () => {
+  try {
+    const r = await apiFetch('/api/reveal', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: '' }),
+    });
+    const d = await r.json();
+    if (d.error) showNotice(d.error, 'err');
+  } catch (err) {
+    showNotice('Could not open file explorer: ' + err.message, 'err');
+  }
+});
+
 resultSortSel.addEventListener('change', () => { STATE.resultSort = resultSortSel.value; renderResultGrid(); });
 resultFilterSel.addEventListener('change', () => { STATE.resultFilter = resultFilterSel.value; renderResultGrid(); });
 
@@ -1755,6 +1832,7 @@ resetBtn.addEventListener('click', async () => {
   startBtn.disabled = true;
   fileCountInfo.textContent = '';
   downloadBtn.style.display = 'none';
+  revealDirBtn.style.display = 'none';
   retryBtn.style.display = 'none';
   resultToolbar.style.display = 'none';
   resultCountEl.textContent = '';
@@ -1928,6 +2006,31 @@ async function pollWatchStatus() {
   } catch(e) { /* ignore */ }
 }
 
+// Shared Settings controls (quality/format/mode/max-width/protect-colors/
+// dithering/keep-exif) double as Watch Mode's config — startWatch() reads
+// them once at click time and the backend freezes them for the life of
+// that watch run (see _watch_loop). Nothing here re-reads them, so leaving
+// these interactive while Watch Mode is running would silently mislead
+// anyone who changes format/quality mid-watch expecting it to take effect.
+// Lock them visibly instead, and restore the normal mode-dependent
+// disabled state (via updateModeDependentControls) once Watch Mode stops.
+function applyWatchLock(locked) {
+  const notice = $('watch-lock-notice');
+  notice.style.display = locked ? '' : 'none';
+  const inputs = [
+    ...document.querySelectorAll('input[name="quality"]'),
+    ...document.querySelectorAll('input[name="format"]'),
+    ...document.querySelectorAll('input[name="mode"]'),
+    $('max-width'), $('protect-colors'), $('dithering'), $('keep-exif'),
+  ];
+  if (locked) {
+    inputs.forEach(el => { el.disabled = true; });
+  } else {
+    inputs.forEach(el => { el.disabled = false; });
+    updateModeDependentControls(); // reapply the fine-grained mode/format rules
+  }
+}
+
 function updateWatchUI() {
   if (STATE.watchRunning) {
     watchStartBtn.style.display = 'none';
@@ -1940,6 +2043,7 @@ function updateWatchUI() {
     watchStatusEl.textContent = 'Idle';
     watchLogBox.style.display = 'none';
   }
+  applyWatchLock(STATE.watchRunning);
   watchStatsEl.textContent = STATE.watchProcessed || STATE.watchErrors
     ? `Processed: ${STATE.watchProcessed} | Errors: ${STATE.watchErrors}`
     : '';
@@ -1959,6 +2063,20 @@ function renderWatchLog() {
 
 watchStartBtn.addEventListener('click', startWatch);
 watchStopBtn.addEventListener('click', stopWatch);
+$('watch-use-current-paths-btn').addEventListener('click', () => {
+  const src = dirPath.value.trim();
+  const out = outputDir.value.trim();
+  if (!src && !out) {
+    showNotice('Select Images and Output paths are both empty — set them above first.', 'err');
+    return;
+  }
+  if (src) watchDir.value = src;
+  if (out) {
+    watchOutputDir.value = out;
+  } else {
+    showNotice('Copied the folder to watch, but Output path is empty there too — Watch Mode needs an output folder (no temp-folder option), so set one before starting.', 'err');
+  }
+});
 $('watch-browse-dir-btn').addEventListener('click', async () => {
   const path = await pickFolder();
   if (path) watchDir.value = path;

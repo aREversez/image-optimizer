@@ -7,25 +7,33 @@
 
 Batch image compression with a local web UI. Uses **pngquant** (lossy PNG
 quantization) and **oxipng** (lossless strip/optimization) behind a clean
-interface, plus **WebP via Pillow** and — with **mozjpeg's cjpeg** — true
-lossy **JPEG** re-compression that keeps the JPEG format.
+interface, plus **WebP via Pillow**, **AVIF via avifenc**, and — with
+**mozjpeg's cjpeg** — true lossy **JPEG** re-compression that keeps the
+JPEG format.
 
 ## Features
 
 - **Local folder scanning** — select a directory, scan recursively (optional), and pick which files to optimize
+- **File sorting** — sort scanned files by modified/created time (newest/oldest) or size (large/small), handy for grabbing the latest screenshots or targeting the biggest files
+- **Watch Mode** — monitor a folder and auto-optimize new or changed images as they appear, with live logs
+- **Batch resume** — progress is persisted per output folder; an interrupted batch (crash, cancel, server restart) can be resumed where it left off
+- **Pause / Resume / Cancel** mid-batch, plus per-file compression parameter overrides and single-file pre-compression preview
 - **Before/after preview** — overlay and side-by-side compare views
 - **Three compression modes:**
   - `standard` — pngquant + oxipng, best size reduction
   - `lossless` — oxipng only, no color loss
   - `resize only` — scale down, no quantization
-- **Output format** — PNG (via pngquant/oxipng), WebP (via Pillow's built-in encoder, no extra binary needed), or JPG (via mozjpeg's `cjpeg`, keeping JPEG rather than converting)
+- **Output format** — PNG (via pngquant/oxipng), WebP (via Pillow's built-in encoder, no extra binary needed), JPG (via mozjpeg's `cjpeg`, keeping JPEG rather than converting), or AVIF (via `avifenc`)
 - **Keep-format JPEG optimization** — select the JPG output format on a batch of `.jpg` files and they're genuinely re-compressed lossily by mozjpeg while staying JPEG (requires `cjpeg` in `bin/`, see `bin/README.md`)
+- **EXIF retention** (opt-in) — keep a curated EXIF subset (camera, date, exposure; GPS stripped for privacy)
 - **Color protection** — list hex colors to preserve in the palette
 - **Dithering toggle** — smoother gradients (standard mode)
-- **Output directory** — save results to any folder (or use the built-in ZIP download)
+- **Output directory** — save results to any folder (or use the built-in ZIP download), with a Reveal Output Folder button to jump straight to it in the OS file explorer
+- **Skip already optimized** — re-running against the same output folder reuses existing outputs instead of recompressing unchanged files
 - **Recent folder history** — quick-access chips with per-item removal and clear all
-- **Auto-detect binaries** — finds `pngquant`/`oxipng`/`cjpeg` in `bin/` folder or system PATH
-- **Cross-platform** — Windows, macOS, Linux (pre-built exe for Windows; macOS/Linux users need `pngquant`/`oxipng`/`cjpeg` on PATH)
+- **In-app settings** — gear icon opens a settings panel (host, port, workers, timeouts) persisted to `config.json`
+- **Auto-detect binaries** — finds `pngquant`/`oxipng`/`cjpeg`/`avifenc` in `bin/` folder or system PATH
+- **Cross-platform** — Windows, macOS, Linux (pre-built exe for Windows; macOS/Linux users need `pngquant`/`oxipng`/`cjpeg`/`avifenc` on PATH)
 
 ## Quick Start
 
@@ -51,10 +59,12 @@ The first run will auto-detect `pngquant` and `oxipng` in the `bin/` folder and 
 ## Usage
 
 1. **Enter a folder path** — type or browse to select a directory, then click *Scan Folder*
-2. **Review files** — deselect any you want to skip, adjust quality/width/mode
+2. **Review files** — deselect any you want to skip, adjust quality/width/mode (per-file overrides via each card's gear icon)
 3. **Protect colors** (optional) — add hex colors like `#2ecc71` to preserve
 4. **Start** — click *Start* and watch the live progress log
-5. **Compare & download** — click any result's *Compare* button for before/after preview, then download individual files or the full ZIP
+5. **Compare & download** — click any result's *Compare* button for before/after preview, then download the ZIP or click *Reveal Output Folder* (when an output folder is set)
+
+Alternatively, set up **Watch Mode** (sidebar card) to auto-compress new images dropped into a folder, and use *Resume* on page load if a previous batch was interrupted.
 
 ## Configuration
 
@@ -77,13 +87,15 @@ python -m app --host 127.0.0.1 --port 8090 --workers 4 --dir "D:\screenshots"
   scan subfolders too (default `--recursive`, the historical behavior).
   Pass `--no-recursive` to scan only the top level.
 
-For settings you don't want to type every time, create a `config.json` in
-`~/.image-optimizer/` (that's `%USERPROFILE%\.image-optimizer\config.json`
-on Windows, or `~/.image-optimizer/config.json` on macOS/Linux — the same
-folder on every OS, and the same one `recent.json` already lives in). This
-file isn't created automatically and there's no in-app settings screen yet
-— copy [`config.example.json`](config.example.json) there and edit it, or
-start from scratch with:
+For settings you don't want to type every time, either use the **in-app
+settings panel** (gear icon in the header — changes persist to
+`config.json`; host/port/workers changes require a restart) or create a
+`config.json` by hand in `~/.image-optimizer/` (that's
+`%USERPROFILE%\.image-optimizer\config.json` on Windows, or
+`~/.image-optimizer/config.json` on macOS/Linux — the same folder on every
+OS, and the same one `recent.json` already lives in). Copy
+[`config.example.json`](config.example.json) there and edit it, or start
+from scratch with:
 
 ```json
 {
@@ -135,7 +147,8 @@ reading or writing files on your machine through it.
 - **PNG compression:** `pngquant` and `oxipng` (PNG-only modes; JPG/WebP output and lossless
   fallbacks don't need them)
 - **JPG output:** `cjpeg` from mozjpeg (keeps JPEG format instead of converting; see `bin/README.md`)
-- **Standalone EXE:** Windows 10/11 64-bit, no Python required
+- **AVIF output:** `avifenc` from libavif (optional — without it the AVIF format simply isn't offered)
+- **Standalone EXE:** Windows 10/11 64-bit, no Python required (all four encoders bundled)
 
 ## Project Structure
 
@@ -143,11 +156,12 @@ reading or writing files on your machine through it.
 image-optimizer/
 ├── app/              # Python web application
 │   ├── main.py       # FastAPI server & routes
-│   ├── optimizer.py  # pngquant/oxipng/cjpeg orchestration
+│   ├── optimizer.py  # pngquant/oxipng/cjpeg/avifenc orchestration
+│   ├── watcher.py    # Watch Mode directory poller
 │   ├── models.py     # Pydantic request models
 │   └── templates/    # HTML/CSS/JS frontend
 ├── assets/           # Logo, icons, banner images
-├── bin/              # Binary dependencies (pngquant, oxipng, cjpeg)
+├── bin/              # Binary dependencies (pngquant, oxipng, cjpeg, avifenc)
 ├── images/           # Default scan directory (gitignored)
 ├── build_exe.py      # PyInstaller build script
 ├── pyproject.toml    # pip-installable package config

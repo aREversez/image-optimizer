@@ -169,7 +169,7 @@ class TestWatchSelfLoopPrevention:
 
         events = []
 
-        async def on_change(rel, abspath):
+        async def on_change(rel, abspath, renamed_from=None):
             events.append(rel)
             if len(events) > 20:
                 return  # test safety brake — real code has no such brake
@@ -195,6 +195,156 @@ class TestWatchSelfLoopPrevention:
             "(_watch_output_conflicts_with_input) is still what prevents "
             "users from hitting this, not a change here."
         )
+
+
+class TestFolderWatcherRenameDetection:
+    """Unit-level tests for FolderWatcher's rename-vs-delete distinction —
+    the signal _watch_loop's output cleanup depends on."""
+
+    def test_rename_reports_renamed_from(self, tmp_path):
+        import asyncio
+        from app.watcher import FolderWatcher
+
+        watch_dir = tmp_path / "watch"
+        watch_dir.mkdir()
+        events = []
+
+        async def on_change(rel, abspath, renamed_from):
+            events.append((rel, renamed_from))
+
+        async def run_it():
+            w = FolderWatcher(directory=watch_dir, recursive=True, interval=0.15, on_change=on_change)
+            task = asyncio.create_task(w.run())
+            await asyncio.sleep(0.3)
+            img_path = watch_dir / "photo.png"
+            Image.new("RGB", (20, 20), (10, 20, 30)).save(img_path)
+            await asyncio.sleep(0.4)
+            img_path.rename(watch_dir / "photo_renamed.png")
+            await asyncio.sleep(0.4)
+            w.stop()
+            await asyncio.wait_for(task, timeout=2)
+
+        asyncio.run(run_it())
+
+        assert events[0] == ("photo.png", None)
+        assert events[1] == ("photo_renamed.png", "photo.png")
+
+    def test_pure_delete_reports_nothing(self, tmp_path):
+        """A file that's deleted with nothing reappearing to match its
+        stat must never be reported at all — not as a rename, not as
+        anything else. Deletions alone are not the watcher's concern."""
+        import asyncio
+        from app.watcher import FolderWatcher
+
+        watch_dir = tmp_path / "watch"
+        watch_dir.mkdir()
+        events = []
+
+        async def on_change(rel, abspath, renamed_from):
+            events.append((rel, renamed_from))
+
+        async def run_it():
+            w = FolderWatcher(directory=watch_dir, recursive=True, interval=0.15, on_change=on_change)
+            task = asyncio.create_task(w.run())
+            await asyncio.sleep(0.3)
+            img_path = watch_dir / "photo.png"
+            Image.new("RGB", (20, 20), (10, 20, 30)).save(img_path)
+            await asyncio.sleep(0.4)
+            img_path.unlink()
+            await asyncio.sleep(0.4)
+            w.stop()
+            await asyncio.wait_for(task, timeout=2)
+
+        asyncio.run(run_it())
+
+        assert events == [("photo.png", None)]  # only the creation — no delete event of any kind
+
+
+class TestWatchRenameCleanup:
+    """End-to-end: _watch_loop should delete the old output when a source
+    file is renamed (content unchanged), but must never touch the output
+    when a source file is simply deleted — many people delete the
+    original and keep only the compressed result."""
+
+    def test_rename_removes_old_output_and_creates_new_one(self, client, auth_headers, tmp_path):
+        watch_dir = tmp_path / "watch"
+        watch_dir.mkdir()
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        r = client.post("/api/watch/start", json={
+            "directory": str(watch_dir),
+            "output_dir": str(output_dir),
+            "output_format": "png",
+            "compression_mode": "lossless",
+        }, headers=auth_headers)
+        assert r.status_code == 200
+
+        try:
+            time.sleep(0.5)
+            img_path = watch_dir / "original.png"
+            Image.new("RGB", (32, 32), (200, 100, 50)).save(img_path)
+
+            def one_processed():
+                s = client.get("/api/watch/status", headers=auth_headers).json()
+                return s["processed"] >= 1
+            wait_for(one_processed, timeout=15.0)
+            assert (output_dir / "original.png").exists()
+
+            img_path.rename(watch_dir / "renamed.png")
+
+            def two_processed():
+                s = client.get("/api/watch/status", headers=auth_headers).json()
+                return s["processed"] >= 2
+            wait_for(two_processed, timeout=15.0)
+
+            # New output exists, old one was cleaned up.
+            assert (output_dir / "renamed.png").exists()
+            assert not (output_dir / "original.png").exists(), (
+                "Renaming the source should remove the stale output left "
+                "under the old name"
+            )
+        finally:
+            client.post("/api/watch/stop", headers=auth_headers)
+
+    def test_pure_delete_never_touches_output(self, client, auth_headers, tmp_path):
+        """Deleting the source (no rename) must leave the previously
+        produced output alone — this is the whole point of Watch mode for
+        people who keep only the compressed copy."""
+        watch_dir = tmp_path / "watch"
+        watch_dir.mkdir()
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        r = client.post("/api/watch/start", json={
+            "directory": str(watch_dir),
+            "output_dir": str(output_dir),
+            "output_format": "png",
+            "compression_mode": "lossless",
+        }, headers=auth_headers)
+        assert r.status_code == 200
+
+        try:
+            time.sleep(0.5)
+            img_path = watch_dir / "keepsake.png"
+            Image.new("RGB", (32, 32), (10, 200, 10)).save(img_path)
+
+            def one_processed():
+                s = client.get("/api/watch/status", headers=auth_headers).json()
+                return s["processed"] >= 1
+            wait_for(one_processed, timeout=15.0)
+            assert (output_dir / "keepsake.png").exists()
+
+            img_path.unlink()
+            time.sleep(3.0)  # give the watcher several poll cycles to (not) react
+
+            status = client.get("/api/watch/status", headers=auth_headers).json()
+            assert status["processed"] == 1  # no reprocessing of a deletion
+            assert (output_dir / "keepsake.png").exists(), (
+                "Deleting the source must never delete the already-produced output"
+            )
+        finally:
+            client.post("/api/watch/stop", headers=auth_headers)
 
 
 
