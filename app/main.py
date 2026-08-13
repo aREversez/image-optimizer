@@ -2244,6 +2244,35 @@ async def reset_session(state: AppState = Depends(get_session), _auth: None = De
 # Watch mode
 # ---------------------------------------------------------------------------
 
+def _watch_output_conflicts_with_input(directory: Path, output_dir: Path, recursive: bool) -> bool:
+    """True if writing optimized output into output_dir would land back
+    inside the tree Watch mode is scanning — which would make the watcher
+    detect its own output as a new/changed file and reprocess it forever
+    (empirically confirmed: a single dropped-in file gets re-picked-up on
+    every poll interval indefinitely once this happens, silently burning
+    CPU and rewriting the file over and over — see CHANGELOG).
+
+    - output_dir == directory: always a conflict, no matter recursive —
+      the top level is always scanned.
+    - output_dir inside directory, recursive=True: a conflict — the
+      recursive walk would descend into it too.
+    - output_dir inside directory, recursive=False: fine — a non-recursive
+      scan only lists directory's immediate children, so a nested output
+      folder's contents are never re-scanned.
+    """
+    d = directory.resolve()
+    o = output_dir.resolve()
+    if o == d:
+        return True
+    if recursive:
+        try:
+            o.relative_to(d)
+            return True
+        except ValueError:
+            return False
+    return False
+
+
 async def _watch_loop(state: AppState, req: WatchRequest):
     """Background task for Watch mode — monitors a directory and auto-
     optimizes every new/changed image using the same compression pipeline
@@ -2357,6 +2386,18 @@ async def watch_start(
         od = Path(data.output_dir)
         if not od.exists():
             return JSONResponse({"error": "Output directory does not exist"}, status_code=400)
+        if _watch_output_conflicts_with_input(directory, od, data.recursive):
+            return JSONResponse({
+                "error": (
+                    "output_dir can't be the watched directory itself, or a "
+                    "subfolder of it while watching recursively — writing "
+                    "optimized output back into the watched tree makes Watch "
+                    "mode detect its own output as a new/changed file and "
+                    "reprocess it forever. Pick an output folder outside "
+                    "the watched directory (or turn off recursive watching "
+                    "if the output folder must live inside it)."
+                ),
+            }, status_code=400)
 
     if data.compression_mode not in ("standard", "lossless", "resize_only"):
         return JSONResponse({"error": "Invalid compression_mode"}, status_code=400)

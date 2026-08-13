@@ -759,13 +759,22 @@ class Optimizer:
         cleaned_exif: bytes = b"",
     ) -> dict:
         """AVIF encode through avifenc. Source is decoded with Pillow (EXIF
-        orientation baked in, alpha composited onto white, optional resize),
-        written to a Y4M intermediate (the most reliable input format for
-        avifenc — several builds lack JPEG/PNG readers), then re-encoded
-        by avifenc.
+        orientation baked in, optional resize) and written to a PNG
+        intermediate, then re-encoded by avifenc.
+
+        The intermediate used to be a ".ppm" file under the assumption that
+        avifenc needed Y4M/PPM for reliability, but real avifenc builds
+        (verified against the official libavif CLI, v1.3.0) only accept
+        `input.[jpg|jpeg|png|y4m]` — PPM isn't recognized at all, so every
+        AVIF encode failed unconditionally. PNG is lossless (so it doesn't
+        cost any quality versus the old approach) and, unlike a Y4M/PPM
+        intermediate, carries an alpha channel straight through, so alpha
+        is now preserved instead of being composited onto white — AVIF
+        supports transparency natively, so there's no reason to throw it
+        away like the JPEG intermediate has to.
 
         Mode semantics:
-        - standard    -> avifenc --quality from the {high, medium, low} map
+        - standard    -> avifenc -q from the {high, medium, low} map
         - lossless    -> avifenc --lossless (true lossless AVIF)
         - resize_only -> resize first, then encode at high quality so savings
           come from the smaller dimensions.
@@ -793,23 +802,20 @@ class Optimizer:
         temp_files: list = []
         try:
             loop = asyncio.get_running_loop()
-            y4m_path = output_path.with_suffix(".src.ppm")
+            intermediate_path = output_path.with_suffix(".src.png")
             tmp_avif = output_path.with_suffix(".avifenc.avif")
-            temp_files = [y4m_path, tmp_avif]
+            temp_files = [intermediate_path, tmp_avif]
 
-            def _prepare_y4m():
+            def _prepare_intermediate():
                 with Image.open(input_path) as opened:
                     img = ImageOps.exif_transpose(opened)
                     if img.mode == "CMYK":
                         img = img.convert("RGB")
-                    elif img.mode not in ("RGB", "L"):
-                        # AVIF supports alpha, but avifenc's Y4M input path
-                        # is RGB-only. Composite onto white for consistency
-                        # with the JPEG path.
-                        rgba = img.convert("RGBA")
-                        bg = Image.new("RGB", rgba.size, (255, 255, 255))
-                        bg.paste(rgba, mask=rgba.getchannel("A"))
-                        img = bg
+                    elif img.mode not in ("RGB", "RGBA", "L"):
+                        # Anything else (P/palette, LA, etc.) — normalize to
+                        # RGBA so a possible alpha channel survives; avifenc
+                        # reads alpha straight from the PNG.
+                        img = img.convert("RGBA")
                     elif img.mode == "L":
                         img = img.convert("RGB")
 
@@ -820,12 +826,12 @@ class Optimizer:
                             img = img.resize((max_width, int(h * ratio)), Image.Resampling.LANCZOS)
 
                     img.info.pop("exif", None)
-                    img.save(y4m_path, format="PPM")
+                    img.save(intermediate_path, format="PNG")
 
             if progress_callback:
                 mode_desc = "lossless" if compression_mode == "lossless" else f"quality={q}"
                 await progress_callback(f"encoding AVIF via avifenc ({mode_desc})...")
-            await loop.run_in_executor(None, _prepare_y4m)
+            await loop.run_in_executor(None, _prepare_intermediate)
 
             cmd = [
                 str(self.avifenc_path),
@@ -833,14 +839,19 @@ class Optimizer:
             if compression_mode == "lossless":
                 cmd += ["--lossless"]
             else:
-                cmd += ["--quality", str(q)]
+                # avifenc has no long-form "--quality" flag — it's
+                # -q/--qcolor (verified against the official CLI's --help).
+                # The old "--quality" flag was simply unrecognized, so every
+                # non-lossless AVIF encode failed on top of the PPM issue
+                # above.
+                cmd += ["-q", str(q)]
             cmd += ["--speed", "6"]
             if keep_exif and cleaned_exif:
                 exif_path = output_path.with_suffix(".exif")
                 exif_path.write_bytes(cleaned_exif)
                 temp_files.append(exif_path)
                 cmd += ["--exif", str(exif_path)]
-            cmd += ["-o", str(tmp_avif), str(y4m_path)]
+            cmd += ["-o", str(tmp_avif), str(intermediate_path)]
 
             async with self._semaphore:
                 proc = await asyncio.create_subprocess_exec(

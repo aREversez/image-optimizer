@@ -68,13 +68,21 @@ img.save(out_path, "JPEG", quality=90)
 sys.exit(0)
 '''
 
-# avifenc fake: reads the PPM intermediate Pillow wrote, saves as PNG with
-# .avif extension. Real avifenc produces AVIF, but for tests we just need
-# a non-empty output file that the pipeline can verify exists and has size.
+# avifenc fake: mimics real avifenc's argument/input validation closely
+# enough to have caught the two real bugs found by testing against the
+# actual libavif CLI (v1.3.0): (1) avifenc only recognizes
+# input.[jpg|jpeg|png|y4m] — a ".ppm" intermediate is rejected outright,
+# and (2) there is no "--quality" flag, only "-q"/"--qcolor". A fake that
+# accepted anything (as this one used to) can't catch either regression,
+# so it rejects the same way the real binary does before doing the
+# lightweight PNG-with-.avif-extension substitution tests actually need.
 AVIFENC_IMPL = '''#!/usr/bin/env python3
 import sys
 from PIL import Image
 args = sys.argv[1:]
+if "--quality" in args:
+    sys.stderr.write("ERROR: unrecognized option --quality\\n")
+    sys.exit(1)
 try:
     o_idx = args.index("-o")
     out_path = args[o_idx + 1]
@@ -82,6 +90,10 @@ except (ValueError, IndexError):
     sys.stderr.write("avifenc fake: no -o flag found\\n")
     sys.exit(1)
 in_path = args[-1]
+if not in_path.lower().endswith((".jpg", ".jpeg", ".png", ".y4m")):
+    sys.stderr.write(f"Unrecognized file format for input file: {in_path}\\n")
+    sys.stderr.write(f"Cannot read input file: {in_path}\\n")
+    sys.exit(1)
 img = Image.open(in_path)
 img.save(out_path, "PNG")
 sys.exit(0)

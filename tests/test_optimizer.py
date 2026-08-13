@@ -410,8 +410,11 @@ class TestAVIF:
         assert result["success"] is True
         assert out.exists()
 
-    def test_rgba_source_composited_for_avif(self, optimizer, tmp_path):
-        """Transparent PNG should be composited onto white (no crash)."""
+    def test_rgba_source_preserves_alpha_for_avif(self, optimizer, tmp_path):
+        """AVIF supports alpha natively (unlike the JPEG output path, which
+        has to composite onto white). Since the intermediate is PNG rather
+        than the old PPM/Y4M, transparency should now survive the trip
+        instead of being flattened away."""
         src = tmp_path / "rgba.png"
         out = tmp_path / "output.avif"
         img = Image.new("RGBA", (32, 32), (100, 200, 50, 128))
@@ -422,3 +425,47 @@ class TestAVIF:
         )
         assert result["success"] is True
         assert out.exists()
+        # The fake avifenc round-trips whatever Pillow decodes from the
+        # intermediate, so this confirms the intermediate itself still
+        # carries an alpha channel — i.e. optimizer.py isn't compositing
+        # onto white before handing off to avifenc anymore.
+        with Image.open(out) as result_img:
+            assert result_img.mode in ("RGBA", "LA"), (
+                f"alpha channel was lost — encoded as {result_img.mode}"
+            )
+
+    def test_avif_intermediate_is_png_not_ppm(self, optimizer, tmp_path, monkeypatch):
+        """Regression test for the original bug: avifenc only recognizes
+        input.[jpg|jpeg|png|y4m] (verified against the real libavif CLI,
+        v1.3.0) — a .ppm intermediate is rejected outright, and every AVIF
+        encode failed unconditionally until this was fixed. Assert the
+        actual subprocess argv directly so a future change back to PPM (or
+        to a since-removed --quality flag) fails loudly here rather than
+        silently, the way it did before this file's fake avifenc was
+        strengthened to validate like the real one."""
+        captured_cmd = {}
+        real_exec = asyncio.create_subprocess_exec
+
+        async def spy_exec(*args, **kwargs):
+            captured_cmd["argv"] = args
+            return await real_exec(*args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spy_exec)
+
+        src = tmp_path / "input.png"
+        out = tmp_path / "output.avif"
+        Image.new("RGB", (32, 32), (10, 20, 30)).save(src)
+        result = asyncio.run(
+            optimizer.optimize_png(src, out, quality="medium",
+                                   output_format="avif", compression_mode="standard")
+        )
+        assert result["success"] is True
+
+        argv = captured_cmd["argv"]
+        input_file = argv[-1]
+        assert str(input_file).endswith(".png"), (
+            f"avifenc was given a non-PNG intermediate: {input_file}"
+        )
+        assert "--quality" not in argv, "avifenc has no --quality flag — use -q/--qcolor"
+        assert "-q" in argv
+

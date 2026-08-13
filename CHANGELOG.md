@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **AVIF output never actually worked.** Verified against the real
+  libavif CLI (avifenc v1.3.0): (1) the intermediate file was written as
+  `.src.ppm`, but avifenc only recognizes `input.[jpg|jpeg|png|y4m]` — PPM
+  is rejected outright ("Unrecognized file format"), so every single AVIF
+  encode failed regardless of quality/mode. (2) The quality flag was
+  `--quality`, which doesn't exist on avifenc — the real flag is
+  `-q`/`--qcolor`; this alone would have broken every non-lossless AVIF
+  encode even with (1) fixed. Both are now fixed: the intermediate is a
+  PNG (also lossless, so no quality regression versus the old approach),
+  and the CLI invocation uses `-q`. As a side benefit, since PNG (unlike
+  the old PPM path) carries an alpha channel, AVIF output now preserves
+  transparency instead of compositing it onto white — AVIF supports alpha
+  natively, so there was no reason to throw it away. The test suite's
+  fake avifenc previously accepted any input/flags, so it couldn't catch
+  either bug; it now validates the same way the real binary does.
+- **Watch mode could get stuck in an infinite self-reprocessing loop** if
+  `output_dir` was the watched directory itself, or a subfolder of it
+  while watching recursively (e.g. "watch my screenshots folder and
+  shrink new screenshots in place" — a natural thing to want). Writing
+  optimized output back into the watched tree makes the poller detect
+  that output as a new/changed file on the very next scan and reprocess
+  it, forever — confirmed empirically: a single dropped-in file was
+  reprocessed 7 times in 3 seconds with no upper bound. `POST
+  /api/watch/start` now rejects an `output_dir` that would create this
+  overlap, with a message explaining why and how to avoid it.
 - **Batch resume state was a single global file shared by every browser
   tab/session.** `~/.image-optimizer/batch_state.json` didn't distinguish
   between unrelated batches, even though the rest of the app's state

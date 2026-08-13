@@ -97,7 +97,107 @@ class TestWatchStartStop:
         assert "Output directory" in r.json()["error"]
 
 
-class TestWatchProcessing:
+    def test_watch_rejects_output_dir_same_as_watched_directory(self, client, auth_headers, tmp_path):
+        """output_dir == directory would make every optimized file the
+        watcher writes look like a new/changed file to itself, causing an
+        infinite reprocess loop (empirically confirmed via FolderWatcher
+        directly — see TestWatchSelfLoopPrevention). Reject it up front."""
+        watch_dir = tmp_path / "watch"
+        watch_dir.mkdir()
+
+        r = client.post("/api/watch/start", json={
+            "directory": str(watch_dir),
+            "output_dir": str(watch_dir),
+            "output_format": "png",
+        }, headers=auth_headers)
+        assert r.status_code == 400
+        assert "watched directory" in r.json()["error"]
+
+    def test_watch_rejects_output_dir_nested_inside_recursive_watch(self, client, auth_headers, tmp_path):
+        """A subfolder of the watched directory is just as unsafe as the
+        directory itself when watching recursively — the recursive scan
+        would descend into it and re-detect the watcher's own output."""
+        watch_dir = tmp_path / "watch"
+        watch_dir.mkdir()
+        nested_output = watch_dir / "optimized"
+        nested_output.mkdir()
+
+        r = client.post("/api/watch/start", json={
+            "directory": str(watch_dir),
+            "output_dir": str(nested_output),
+            "output_format": "png",
+            "recursive": True,
+        }, headers=auth_headers)
+        assert r.status_code == 400
+        assert "watched directory" in r.json()["error"]
+
+    def test_watch_allows_nested_output_dir_when_non_recursive(self, client, auth_headers, tmp_path):
+        """The same nested output_dir is fine with recursive=False — a
+        non-recursive scan only lists the watched directory's immediate
+        files, so a subfolder's contents are never re-scanned."""
+        watch_dir = tmp_path / "watch"
+        watch_dir.mkdir()
+        nested_output = watch_dir / "optimized"
+        nested_output.mkdir()
+
+        r = client.post("/api/watch/start", json={
+            "directory": str(watch_dir),
+            "output_dir": str(nested_output),
+            "output_format": "png",
+            "recursive": False,
+        }, headers=auth_headers)
+        assert r.status_code == 200
+        client.post("/api/watch/stop", headers=auth_headers)
+
+
+class TestWatchSelfLoopPrevention:
+    """Reproduces, at the FolderWatcher level, the infinite-reprocessing
+    loop that in-place watching (output_dir inside the watched tree) used
+    to cause, to prove _watch_output_conflicts_with_input's rejection is
+    actually necessary and not just a theoretical concern."""
+
+    def test_in_place_output_causes_repeated_reprocessing_without_the_guard(self, tmp_path):
+        """Direct FolderWatcher repro, bypassing the new endpoint guard:
+        writing the 'optimized' output back into the watched directory
+        under the same relative name makes on_change fire repeatedly for
+        the same file, indefinitely, instead of the expected once."""
+        import asyncio
+        from app.watcher import FolderWatcher
+
+        watch_dir = tmp_path / "watch"
+        watch_dir.mkdir()
+
+        events = []
+
+        async def on_change(rel, abspath):
+            events.append(rel)
+            if len(events) > 20:
+                return  # test safety brake — real code has no such brake
+            img = Image.open(abspath)
+            img.save(abspath)  # in-place overwrite: new mtime, same path
+
+        async def run_it():
+            w = FolderWatcher(directory=watch_dir, recursive=True, interval=0.15, on_change=on_change)
+            task = asyncio.create_task(w.run())
+            await asyncio.sleep(0.3)
+            Image.new("RGB", (20, 20), (5, 5, 5)).save(watch_dir / "shot.png")
+            await asyncio.sleep(1.5)
+            w.stop()
+            await asyncio.wait_for(task, timeout=2)
+
+        asyncio.run(run_it())
+
+        assert len(events) > 1, (
+            "Expected the in-place-write pattern to cause repeated "
+            f"reprocessing of the same file — only got {len(events)} event(s). "
+            "If this now fails, something else changed how in-place writes "
+            "are (not) detected; make sure the app-level guard "
+            "(_watch_output_conflicts_with_input) is still what prevents "
+            "users from hitting this, not a change here."
+        )
+
+
+
     """End-to-end: new file appears in watch dir → gets optimized."""
 
     def test_watch_processes_new_file(self, client, auth_headers, tmp_path):
