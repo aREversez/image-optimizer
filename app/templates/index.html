@@ -330,12 +330,6 @@ header h1 span { color: var(--accent); }
   border-radius: 4px; cursor: pointer; text-decoration: none; transition: all .2s;
 }
 .result-card .compare-btn:hover { background: var(--border); }
-.result-card .reveal-btn {
-  display: inline-block; margin-top: 6px; margin-left: 6px; padding: 4px 12px; font-size: 11px;
-  background: var(--surface2); color: var(--text2); border: 1px solid var(--border);
-  border-radius: 4px; cursor: pointer; text-decoration: none; transition: all .2s;
-}
-.result-card .reveal-btn:hover { background: var(--border); color: var(--accent); }
 
 /* Sections visibility */
 .section { display: none; }
@@ -660,6 +654,7 @@ header h1 span { color: var(--accent); }
       <span id="output-path-info" style="font-size:12px;color:var(--text2)"></span>
       <div class="spacer"></div>
       <button class="btn btn-secondary" id="retry-btn" style="display:none">Retry Failed</button>
+      <button class="btn btn-secondary" id="reveal-dir-btn" style="display:none" title="Open the output folder in the OS file explorer">Reveal Output Folder</button>
       <button class="btn btn-primary" id="download-btn" style="display:none">Download All (ZIP)</button>
       <button class="btn btn-secondary" id="reset-btn">Reset</button>
     </div>
@@ -788,6 +783,7 @@ const dirPath = $('dir-path'),
       resultSummary = $('result-summary'),
       resultGrid = $('result-grid'),
       downloadBtn = $('download-btn'),
+      revealDirBtn = $('reveal-dir-btn'),
       resetBtn = $('reset-btn'),
       healthStatus = $('health-status'),
       configSection = $('config-section'),
@@ -1681,8 +1677,11 @@ function showResults() {
     $('output-path-info').textContent = '';
   }
 
-  // Enable download (any success) and Retry Failed (any failure).
+  // Enable download (any success), Reveal Output Folder (any result that
+  // actually landed in a persistent output dir — final_output_path is only
+  // set then, see process_one) and Retry Failed (any failure).
   downloadBtn.style.display = success.length > 0 ? 'inline-block' : 'none';
+  revealDirBtn.style.display = success.some(r => r.final_output_path) ? 'inline-block' : 'none';
   retryBtn.style.display = failed.length > 0 ? 'inline-block' : 'none';
   retryBtn.disabled = false;
   updateStartButtonState();
@@ -1720,18 +1719,12 @@ function renderResultGrid() {
     const savedLine = r.skipped
       ? `<div class="rsaved">Skipped (already optimized)</div>`
       : `<div class="rsaved">Saved ${r.savings_percent}%</div>`;
-    // Only set when this run had a real persistent output_dir (not the
-    // temp workspace) — see final_output_path in process_one.
-    const revealBtn = r.final_output_path
-      ? `<a class="reveal-btn" href="#" data-reveal-path="${escHtml(r.final_output_path)}">Reveal</a>`
-      : '';
     html += `
       <div class="result-card">
         <div class="rname" title="${escHtml(r.name)}">${escHtml(r.name)}</div>
         <div class="rstats">${fmtSize(r.original_size)} → ${fmtSize(r.compressed_size)}</div>
         ${savedLine}
         <a class="compare-btn" href="${previewUrl}" target="_blank">Compare</a>
-        ${revealBtn}
       </div>`;
   }
   resultGrid.innerHTML = html;
@@ -1740,15 +1733,17 @@ function renderResultGrid() {
   resultCountEl.textContent = shown === total ? `${total} file(s)` : `${shown} of ${total} shown`;
 }
 
-resultGrid.addEventListener('click', async (e) => {
-  const btn = e.target.closest('[data-reveal-path]');
-  if (!btn) return;
-  e.preventDefault();
+// Reveal the run's output folder in the OS file explorer. One button for
+// the whole folder instead of one per image — there's only ever one
+// output_dir per run. The client sends no path at all: the backend opens
+// the output_dir it recorded itself (state.output_dir), so there is
+// nothing to spoof.
+revealDirBtn.addEventListener('click', async () => {
   try {
     const r = await apiFetch('/api/reveal', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: btn.dataset.revealPath }),
+      body: JSON.stringify({ path: '' }),
     });
     const d = await r.json();
     if (d.error) showNotice(d.error, 'err');
@@ -1790,6 +1785,7 @@ resetBtn.addEventListener('click', async () => {
   startBtn.disabled = true;
   fileCountInfo.textContent = '';
   downloadBtn.style.display = 'none';
+  revealDirBtn.style.display = 'none';
   retryBtn.style.display = 'none';
   resultToolbar.style.display = 'none';
   resultCountEl.textContent = '';

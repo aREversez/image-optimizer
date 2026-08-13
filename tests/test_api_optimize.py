@@ -251,6 +251,49 @@ class TestRevealInExplorer:
         r2 = client.post("/api/reveal", json={"path": target}, headers=auth_headers)
         assert r2.status_code == 404
 
+    def test_reveal_empty_path_opens_output_folder(self, client, auth_headers, test_images, tmp_path, monkeypatch):
+        """The UI shows one "Reveal Output Folder" button instead of a
+        per-image Reveal link: it posts an empty path, and the backend
+        opens the output_dir it recorded for this run itself
+        (state.output_dir) rather than anything client-supplied."""
+        scan_and_wait(client, auth_headers, test_images)
+        out_dir = tmp_path / "output"
+        r, d = optimize_and_wait(client, auth_headers, output_dir=str(out_dir))
+        assert r.status_code == 200
+
+        calls = []
+        import app.main as m
+        monkeypatch.setattr(m.subprocess, "Popen", lambda *a, **k: calls.append((a, k)))
+
+        r2 = client.post("/api/reveal", json={"path": ""}, headers=auth_headers)
+        assert r2.status_code == 200
+        assert r2.json()["success"] is True
+        assert len(calls) == 1
+        # The launched target must be the run's output folder itself —
+        # last argv entry on every platform branch.
+        assert Path(calls[0][0][0][-1]).resolve() == out_dir.resolve()
+
+    def test_reveal_empty_path_without_output_dir_rejected(self, client, auth_headers, test_images):
+        """A temp-workspace-only run has no persistent folder to reveal."""
+        scan_and_wait(client, auth_headers, test_images)
+        r, d = optimize_and_wait(client, auth_headers)
+        assert r.status_code == 200
+        r2 = client.post("/api/reveal", json={"path": ""}, headers=auth_headers)
+        assert r2.status_code == 400
+        assert "No output folder" in r2.json()["error"]
+
+    def test_reveal_empty_path_missing_folder_returns_404(self, client, auth_headers, test_images, tmp_path):
+        scan_and_wait(client, auth_headers, test_images)
+        out_dir = tmp_path / "output"
+        r, d = optimize_and_wait(client, auth_headers, output_dir=str(out_dir))
+        assert r.status_code == 200
+
+        import shutil
+        shutil.rmtree(out_dir)  # simulate the user having deleted it since
+
+        r2 = client.post("/api/reveal", json={"path": ""}, headers=auth_headers)
+        assert r2.status_code == 404
+
 
 class TestValidation:
     def test_resize_only_requires_max_width(self, client, auth_headers, test_images):

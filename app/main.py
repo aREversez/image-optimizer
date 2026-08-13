@@ -85,6 +85,10 @@ class AppState:
         self.files: list = []
         self.results: list = []
         self.input_dir: Optional[str] = None
+        # Persistent output folder of the last run (if any) — recorded by
+        # _process_files so /api/reveal can open it without trusting any
+        # client-supplied path.
+        self.output_dir: Optional[str] = None
         self.workspace: Optional[Path] = None
         self.is_running = False
         self.current = 0
@@ -122,6 +126,7 @@ class AppState:
         self.files = []
         self.results = []
         self.input_dir = None
+        self.output_dir = None
         self.is_running = False
         self.current = 0
         self.total = 0
@@ -1185,6 +1190,12 @@ async def _process_files(
 
     overrides = overrides or {}
 
+    # Remember the persistent output folder of this run (if any) so
+    # /api/reveal can open it directly — the endpoint never trusts a
+    # client-supplied folder path, only this server-side record. Cleared
+    # again for temp-workspace-only runs.
+    state.output_dir = str(Path(output_dir).resolve()) if output_dir else None
+
     # Build a path→entry lookup for batch state persistence — O(1) per file
     # instead of scanning the whole list each time. Only populated when a
     # batch_state was provided (resume flow).
@@ -2070,38 +2081,66 @@ async def browse_folder(title: str = "Select Folder", _auth: None = Depends(requ
 async def reveal_in_explorer(
     data: RevealRequest, state: AppState = Depends(get_session), _auth: None = Depends(require_token)
 ):
-    """Open the OS file explorer with an optimized output file selected.
+    """Open the OS file explorer — either the run's output folder itself
+    (empty path) or with a specific output file selected.
 
-    data.path must exactly match one of *this session's* recorded
-    final_output_path values (set on results only when a persistent
-    output_dir was used — see process_one). Without that check, this
-    endpoint would be an arbitrary "launch explorer at any path on disk"
-    oracle driven entirely by client-supplied input; requiring it to be a
-    path this app itself just wrote, for this session, keeps it scoped to
-    "reveal something you just compressed" and nothing else.
+    Folder mode (data.path empty): opens state.output_dir, the persistent
+    output folder _process_files recorded for this run. The target comes
+    entirely from server-side state, so there is nothing client-supplied
+    to validate. This backs the single "Reveal Output Folder" button in
+    the Results bar (one output folder per run → one button, not one per
+    image).
+
+    File mode: data.path must exactly match one of *this session's*
+    recorded final_output_path values (set on results only when a
+    persistent output_dir was used — see process_one). Without that
+    check, this endpoint would be an arbitrary "launch explorer at any
+    path on disk" oracle driven entirely by client-supplied input;
+    requiring it to be a path this app itself just wrote, for this
+    session, keeps it scoped to "reveal something you just compressed"
+    and nothing else.
     """
-    requested = str(Path(data.path))
-    if not any(r.get("final_output_path") == requested for r in state.results):
-        return JSONResponse({"error": "Not a known output file for this session"}, status_code=400)
+    if not data.path:
+        if not state.output_dir:
+            return JSONResponse({"error": "No output folder for this session"}, status_code=400)
+        target = Path(state.output_dir)
+        select_file = False
+    else:
+        requested = str(Path(data.path))
+        if not any(r.get("final_output_path") == requested for r in state.results):
+            return JSONResponse({"error": "Not a known output file for this session"}, status_code=400)
+        target = Path(requested)
+        select_file = True
 
-    path = Path(requested)
-    if not path.exists():
-        return JSONResponse({"error": "File no longer exists on disk"}, status_code=404)
+    if not target.exists():
+        return JSONResponse(
+            {"error": "File no longer exists on disk" if select_file else "Folder no longer exists on disk"},
+            status_code=404,
+        )
 
     try:
-        if sys.platform == "win32":
-            # /select, (comma, no space) + the path as one argument is
-            # explorer.exe's documented syntax for "open the containing
-            # folder with this file highlighted". explorer.exe routinely
-            # returns a non-zero exit code even on success, so this is
-            # fire-and-forget rather than awaited/checked.
-            subprocess.Popen(["explorer", f"/select,{path}"])
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", "-R", str(path)])
+        if select_file:
+            if sys.platform == "win32":
+                # /select, (comma, no space) + the path as one argument is
+                # explorer.exe's documented syntax for "open the containing
+                # folder with this file highlighted". explorer.exe routinely
+                # returns a non-zero exit code even on success, so this is
+                # fire-and-forget rather than awaited/checked.
+                subprocess.Popen(["explorer", f"/select,{target}"])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", "-R", str(target)])
+            else:
+                # No cross-desktop-environment equivalent of "select this
+                # file" on Linux — best effort is opening its containing
+                # folder.
+                subprocess.Popen(["xdg-open", str(target.parent)])
         else:
-            # No cross-desktop-environment equivalent of "select this file"
-            # on Linux — best effort is opening its containing folder.
-            subprocess.Popen(["xdg-open", str(path.parent)])
+            if sys.platform == "win32":
+                subprocess.Popen(["explorer", str(target)])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(target)])
+            else:
+                subprocess.Popen(["xdg-open", str(target)])
     except OSError as e:
         return JSONResponse({"error": f"Could not open file explorer: {e}"}, status_code=500)
 

@@ -100,10 +100,12 @@ class RecentClearRequest(BaseModel):
 
 
 class RevealRequest(BaseModel):
-    """Open the OS file explorer with a specific output file selected.
-    path must be one of the current session's own recorded
-    final_output_path values — see /api/reveal for why."""
-    path: str
+    """Open the OS file explorer. An empty path reveals the run's output
+    folder itself (recorded server-side in state.output_dir, nothing
+    client-supplied); a non-empty path must be one of the current
+    session's own recorded final_output_path values — see /api/reveal
+    for why."""
+    path: str = ""
 
 
 class PreviewRequest(BaseModel):
