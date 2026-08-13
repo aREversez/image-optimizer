@@ -5,7 +5,10 @@
 
 # Image Optimizer
 
-Batch PNG compression with a local web UI. Uses **pngquant** (lossy quantization) and **oxipng** (lossless strip/optimization) behind a clean interface.
+Batch image compression with a local web UI. Uses **pngquant** (lossy PNG
+quantization) and **oxipng** (lossless strip/optimization) behind a clean
+interface, plus **WebP via Pillow** and — with **mozjpeg's cjpeg** — true
+lossy **JPEG** re-compression that keeps the JPEG format.
 
 ## Features
 
@@ -15,13 +18,14 @@ Batch PNG compression with a local web UI. Uses **pngquant** (lossy quantization
   - `standard` — pngquant + oxipng, best size reduction
   - `lossless` — oxipng only, no color loss
   - `resize only` — scale down, no quantization
-- **Output format** — PNG (via pngquant/oxipng) or WebP (via Pillow's built-in encoder, no extra binary needed)
+- **Output format** — PNG (via pngquant/oxipng), WebP (via Pillow's built-in encoder, no extra binary needed), or JPG (via mozjpeg's `cjpeg`, keeping JPEG rather than converting)
+- **Keep-format JPEG optimization** — select the JPG output format on a batch of `.jpg` files and they're genuinely re-compressed lossily by mozjpeg while staying JPEG (requires `cjpeg` in `bin/`, see `bin/README.md`)
 - **Color protection** — list hex colors to preserve in the palette
 - **Dithering toggle** — smoother gradients (standard mode)
 - **Output directory** — save results to any folder (or use the built-in ZIP download)
 - **Recent folder history** — quick-access chips with per-item removal and clear all
-- **Auto-detect binaries** — finds `pngquant`/`oxipng` in `bin/` folder or system PATH
-- **Cross-platform** — Windows, macOS, Linux (pre-built exe for Windows; macOS/Linux users need `pngquant`/`oxipng` on PATH)
+- **Auto-detect binaries** — finds `pngquant`/`oxipng`/`cjpeg` in `bin/` folder or system PATH
+- **Cross-platform** — Windows, macOS, Linux (pre-built exe for Windows; macOS/Linux users need `pngquant`/`oxipng`/`cjpeg` on PATH)
 
 ## Quick Start
 
@@ -128,6 +132,9 @@ reading or writing files on your machine through it.
 - **Source install:** Python 3.10+ with `fastapi`, `uvicorn`, `Pillow`, `jinja2`, `python-multipart`
   (`pip install -r requirements.txt`, or `pip install -r requirements.lock` for the exact
   versions this was tested against)
+- **PNG compression:** `pngquant` and `oxipng` (PNG-only modes; JPG/WebP output and lossless
+  fallbacks don't need them)
+- **JPG output:** `cjpeg` from mozjpeg (keeps JPEG format instead of converting; see `bin/README.md`)
 - **Standalone EXE:** Windows 10/11 64-bit, no Python required
 
 ## Project Structure
@@ -136,11 +143,11 @@ reading or writing files on your machine through it.
 image-optimizer/
 ├── app/              # Python web application
 │   ├── main.py       # FastAPI server & routes
-│   ├── optimizer.py  # pngquant/oxipng orchestration
+│   ├── optimizer.py  # pngquant/oxipng/cjpeg orchestration
 │   ├── models.py     # Pydantic request models
 │   └── templates/    # HTML/CSS/JS frontend
 ├── assets/           # Logo, icons, banner images
-├── bin/              # Binary dependencies (pngquant, oxipng)
+├── bin/              # Binary dependencies (pngquant, oxipng, cjpeg)
 ├── images/           # Default scan directory (gitignored)
 ├── build_exe.py      # PyInstaller build script
 ├── pyproject.toml    # pip-installable package config

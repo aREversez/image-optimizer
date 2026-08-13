@@ -54,6 +54,11 @@ class OptimizeRequest(BaseModel):
     # OVERRIDEABLE_FIELDS in main.py) so the request shape can't drift between
     # frontend and backend; unknown fields are rejected with 400.
     overrides: dict[str, dict] = {}
+    # Resume a previously interrupted batch. When True, the backend loads
+    # ~/.image-optimizer/batch_state.json, reconstructs state.files from it,
+    # and only processes files whose status is "pending" or "failed".
+    # Input/output dirs and compression params must match the saved batch.
+    resume: bool = False
 
 
 class FileInfo(BaseModel):
@@ -107,3 +112,27 @@ class PreviewRequest(BaseModel):
     protected_colors: list[str] = []
     dithering: bool = True
     keep_exif: bool = False
+
+
+class WatchRequest(BaseModel):
+    """Parameters for Watch mode: watch a directory and auto-optimize every
+    image that appears (or changes) in it, writing results into output_dir.
+    Carries the same compression parameters as OptimizeRequest, minus the
+    batch-specific controls (file_ids / retry / skip_existing / overrides) —
+    Watch uses one global setting set for everything it picks up.
+
+    output_dir is required: Watch has no temp-workspace/ZIP flow, it is
+    inherently "optimize into a persistent folder"."""
+    directory: str
+    recursive: bool = True
+    # Optimize files already present when watching starts, not just ones
+    # that appear afterwards.
+    process_existing: bool = False
+    quality: str = "medium"
+    max_width: int = 0
+    output_format: str = "png"
+    compression_mode: str = "standard"
+    protected_colors: list[str] = []
+    dithering: bool = True
+    keep_exif: bool = False
+    output_dir: str = ""

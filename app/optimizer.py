@@ -37,6 +37,8 @@ class Optimizer:
             self.bin_dir = Path(__file__).resolve().parent.parent / "bin"
         self.pngquant_path: Optional[Path] = None
         self.oxipng_path: Optional[Path] = None
+        self.cjpeg_path: Optional[Path] = None
+        self.avifenc_path: Optional[Path] = None
         self._detect_binaries()
         self._semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
@@ -76,11 +78,25 @@ class Optimizer:
         whether to enable a particular (format, mode) option in the UI or
         accept it on the server side.
         """
+        modes = {("webp", "standard"), ("webp", "lossless"), ("webp", "resize_only")}
         if self.pngquant_path is not None:
-            return {("png", "standard"), ("png", "lossless"), ("png", "resize_only"),
-                    ("webp", "standard"), ("webp", "lossless"), ("webp", "resize_only")}
-        return {("png", "lossless"), ("png", "resize_only"),
-                ("webp", "standard"), ("webp", "lossless"), ("webp", "resize_only")}
+            modes |= {("png", "standard"), ("png", "lossless"), ("png", "resize_only")}
+        else:
+            modes |= {("png", "lossless"), ("png", "resize_only")}
+        # JPEG output needs mozjpeg's cjpeg — every JPEG mode is a lossy
+        # re-encode (JPEG is an inherently lossy codec; "lossless" maps to
+        # the highest quality pass, see _optimize_jpeg). No cjpeg → no JPG.
+        if self.cjpeg_path is not None:
+            modes |= {("jpg", "standard"), ("jpg", "lossless"), ("jpg", "resize_only")}
+        # AVIF output needs avifenc — all three modes are available when
+        # the binary is found. AVIF is a modern, efficient codec that
+        # typically produces smaller files than PNG or WebP at equivalent
+        # quality, but encoding is slower. Like JPEG, "lossless" maps to
+        # a very-high-quality pass (AVIF does support true lossless, but
+        # the quality map keeps the UI consistent with other formats).
+        if self.avifenc_path is not None:
+            modes |= {("avif", "standard"), ("avif", "lossless"), ("avif", "resize_only")}
+        return modes
 
     def _find_binary(self, name: str) -> Optional[Path]:
         try:
@@ -102,6 +118,18 @@ class Optimizer:
     def _detect_binaries(self):
         self.pngquant_path = self._find_binary("pngquant")
         self.oxipng_path = self._find_binary("oxipng")
+        # mozjpeg releases/prebuilt zip files name the encoder either
+        # `cjpeg` or `cjpeg-static` (the static variant shipped by several
+        # Windows/AiZ builds) — try both spellings so either is picked up.
+        self.cjpeg_path = self._find_binary_any(["cjpeg", "cjpeg-static"])
+        self.avifenc_path = self._find_binary("avifenc")
+
+    def _find_binary_any(self, names: list[str]) -> Optional[Path]:
+        for name in names:
+            path = self._find_binary(name)
+            if path is not None:
+                return path
+        return None
 
     @staticmethod
     def _is_png(path: Path) -> bool:
@@ -236,6 +264,30 @@ class Optimizer:
         return bytes(out)
 
     @staticmethod
+    def _find_png_chunk_offset(data: bytes, chunk_type: bytes) -> Optional[int]:
+        """Walk the PNG chunk stream (the same structural walk
+        `_strip_png_chunks` does) and return the byte offset of the first
+        chunk of `chunk_type` — pointing at its 4-byte length field — or
+        None if it isn't found or the stream is malformed/truncated.
+
+        Unlike a raw `bytes.find(b"IEND")`, this can't be fooled by those
+        four bytes appearing inside another chunk's *data* (e.g. a stray
+        tEXt/iTXt comment that happens to contain the literal text
+        "IEND") — it only matches an actual chunk header."""
+        pos = 8
+        n = len(data)
+        while pos + 8 <= n:
+            length = int.from_bytes(data[pos:pos + 4], "big")
+            ctype = data[pos + 4:pos + 8]
+            total = 8 + length + 4
+            if pos + total > n:
+                return None  # malformed/truncated
+            if ctype == chunk_type:
+                return pos
+            pos += total
+        return None
+
+    @staticmethod
     def _finalize_png_exif(png_path: Path, exif_bytes: bytes) -> None:
         """Attach cleaned EXIF to a finished PNG by inserting a single
         eXIf chunk before IEND. Any pre-existing eXIf chunks are removed
@@ -254,10 +306,9 @@ class Optimizer:
             chunk_body = exif_bytes
             chunk = struct.pack(">I", len(chunk_body)) + b"eXIf" + chunk_body
             chunk += struct.pack(">I", zlib.crc32(b"eXIf" + chunk_body) & 0xFFFFFFFF)
-            iend = data.find(b"IEND")
-            if iend < 8:
+            iend_start = Optimizer._find_png_chunk_offset(data, b"IEND")
+            if iend_start is None:
                 return
-            iend_start = iend - 4  # back up over IEND's 4-byte length field
             png_path.write_bytes(data[:iend_start] + chunk + data[iend_start:])
         except Exception:
             pass
@@ -289,6 +340,18 @@ class Optimizer:
 
         if output_format == "webp":
             return await self._optimize_webp(
+                input_path, output_path, quality, max_width, compression_mode,
+                progress_callback, keep_exif=keep_exif, cleaned_exif=cleaned_exif,
+            )
+
+        if output_format in ("jpg", "jpeg"):
+            return await self._optimize_jpeg(
+                input_path, output_path, quality, max_width, compression_mode,
+                progress_callback, keep_exif=keep_exif, cleaned_exif=cleaned_exif,
+            )
+
+        if output_format == "avif":
+            return await self._optimize_avif(
                 input_path, output_path, quality, max_width, compression_mode,
                 progress_callback, keep_exif=keep_exif, cleaned_exif=cleaned_exif,
             )
@@ -515,5 +578,313 @@ class Optimizer:
         except Exception as e:
             result["success"] = False
             result["error"] = str(e)
+
+        return result
+
+    async def _optimize_jpeg(
+        self,
+        input_path: Path,
+        output_path: Path,
+        quality: str,
+        max_width: int,
+        compression_mode: str,
+        progress_callback: Optional[Callable],
+        *,
+        keep_exif: bool = False,
+        cleaned_exif: bytes = b"",
+    ) -> dict:
+        """Lossy JPEG re-encode through mozjpeg's cjpeg, keeping the JPEG
+        format (the output stays a .jpg — no conversion to PNG/WebP).
+
+        Why not pngquant/oxipng? Those only understand PNG input, and the
+        whole point of this path is a *genuine JPEG* compression. The
+        source is decoded with Pillow (EXIF orientation baked in, optional
+        resize, alpha composited onto white since JPEG has no alpha
+        channel), written to a PPM intermediate, then re-encoded by cjpeg
+        — mozjpeg's encoder produces smaller JPEGs than stock libjpeg at
+        equal quality (trellis quantization + tuned progressive output).
+        The PPM detour is deliberate: several common mozjpeg Windows
+        builds ship a cjpeg without the rdpng/rdjpeg readers, so the only
+        input format guaranteed to work on every build is PPM/PGM.
+
+        Mode semantics for JPEG (an inherently lossy codec):
+        - standard    -> cjpeg -quality from the {high, medium, low} map
+        - lossless    -> no true lossless JPEG pass exists; maps to the
+          highest cjpeg quality (95) so the re-encode loses as little as
+          possible. Name kept for consistency with the other formats;
+          the UI/available_modes docs make clear what it actually does.
+        - resize_only -> resize first, then encode at that same high
+          quality so the savings come from the smaller dimensions rather
+          than from dropping image quality.
+        """
+        original_size = os.path.getsize(input_path)
+        result = {
+            "success": False,
+            "original_size": original_size,
+            "compressed_size": original_size,
+            "error": None,
+            "warning": None,
+        }
+        if self.cjpeg_path is None:
+            result["error"] = "cjpeg (mozjpeg) not found — cannot produce JPEG output"
+            return result
+
+        quality_map = {"high": 85, "medium": 75, "low": 60}
+        if compression_mode in ("lossless", "resize_only"):
+            q = 95
+        else:
+            q = quality_map.get(quality, 75)
+
+        temp_files: list = []
+        try:
+            loop = asyncio.get_running_loop()
+            ppm_path = output_path.with_suffix(".src.ppm")
+            tmp_jpg = output_path.with_suffix(".cjpeg.jpg")
+            temp_files = [ppm_path, tmp_jpg]
+
+            def _prepare_ppm():
+                with Image.open(input_path) as opened:
+                    # Same orientation bake-in as _ensure_png / _optimize_webp
+                    # — a portrait phone JPEG must not come out sideways.
+                    img = ImageOps.exif_transpose(opened)
+                    if img.mode == "CMYK":
+                        img = img.convert("RGB")
+                    elif img.mode not in ("RGB", "L", "I;16"):
+                        # RGBA/LA/PA/P carry an alpha channel JPEG can't
+                        # hold — composite transparency onto white instead
+                        # of a bare convert("RGB"), which renders it black.
+                        rgba = img.convert("RGBA")
+                        bg = Image.new("RGB", rgba.size, (255, 255, 255))
+                        bg.paste(rgba, mask=rgba.getchannel("A"))
+                        img = bg
+
+                    if max_width > 0:
+                        w, h = img.size
+                        if w > max_width:
+                            ratio = max_width / w
+                            img = img.resize((max_width, int(h * ratio)), Image.Resampling.LANCZOS)
+
+                    # cjpeg starts fresh from the PPM so metadata can't
+                    # survive (matches the keep_exif=False strip-everything
+                    # default). When keep_exif=True the cleaned copy is
+                    # re-attached after encoding via _finalize_jpeg_exif.
+                    img.info.pop("exif", None)
+                    img.save(ppm_path, format="PPM")
+
+            if progress_callback:
+                mode_desc = "near-lossless" if compression_mode in ("lossless", "resize_only") else f"quality={q}"
+                await progress_callback(f"encoding JPEG via mozjpeg ({mode_desc})...")
+            await loop.run_in_executor(None, _prepare_ppm)
+
+            async with self._semaphore:
+                proc = await asyncio.create_subprocess_exec(
+                    str(self.cjpeg_path),
+                    "-quality", str(q),
+                    "-progressive",
+                    "-optimize",
+                    "-outfile", str(tmp_jpg),
+                    str(ppm_path),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr = await proc.communicate()
+
+            if tmp_jpg.exists():
+                if keep_exif and cleaned_exif:
+                    self._finalize_jpeg_exif(tmp_jpg, cleaned_exif)
+                tmp_jpg.replace(output_path)
+            else:
+                msg = stderr.decode().strip()
+                if progress_callback:
+                    await progress_callback(f"cjpeg: {msg} (skipped)")
+                result["warning"] = msg or "cjpeg produced no output"
+                result["error"] = "cjpeg did not produce an output file"
+                return result
+
+            if output_path.exists():
+                result["compressed_size"] = os.path.getsize(output_path)
+                result["success"] = True
+            else:
+                result["error"] = "output file not generated"
+        except Exception as e:
+            result["success"] = False
+            result["error"] = str(e)
+        finally:
+            for f in temp_files:
+                try:
+                    if f.exists() and f != output_path:
+                        f.unlink()
+                except Exception:
+                    pass
+
+        return result
+
+    @staticmethod
+    def _finalize_jpeg_exif(jpg_path: Path, exif_bytes: bytes) -> None:
+        """Attach cleaned EXIF to a finished JPEG by inserting a single APP1
+        'Exif' segment right after the SOI marker.
+
+        cjpeg writes metadata-free output from the PPM intermediate, so the
+        finished .jpg only ever carries the EXIF we inject here (preserving
+        the keep_exif=False strip-everything default). JPEG APP1 Exif
+        payloads are `Exif\\x00\\x00` followed by raw TIFF; cleaned_exif
+        from _capture_cleaned_exif is already the raw TIFF (prefix
+        stripped), so the prefix is re-added here. Best-effort — never
+        raises: a failed metadata attach must not turn a successful
+        compression into a failure."""
+        if not exif_bytes:
+            return
+        if exif_bytes[:1] not in (b"I", b"M"):
+            return
+        try:
+            data = jpg_path.read_bytes()
+            if data[:2] != b"\xff\xd8":  # not a JPEG (no SOI marker) — bail
+                return
+            payload = b"Exif\x00\x00" + exif_bytes
+            segment = b"\xff\xe1" + struct.pack(">H", len(payload) + 2) + payload
+            jpg_path.write_bytes(data[:2] + segment + data[2:])
+        except Exception:
+            pass
+
+    async def _optimize_avif(
+        self,
+        input_path: Path,
+        output_path: Path,
+        quality: str,
+        max_width: int,
+        compression_mode: str,
+        progress_callback: Optional[Callable],
+        *,
+        keep_exif: bool = False,
+        cleaned_exif: bytes = b"",
+    ) -> dict:
+        """AVIF encode through avifenc. Source is decoded with Pillow (EXIF
+        orientation baked in, optional resize) and written to a PNG
+        intermediate, then re-encoded by avifenc.
+
+        The intermediate used to be a ".ppm" file under the assumption that
+        avifenc needed Y4M/PPM for reliability, but real avifenc builds
+        (verified against the official libavif CLI, v1.3.0) only accept
+        `input.[jpg|jpeg|png|y4m]` — PPM isn't recognized at all, so every
+        AVIF encode failed unconditionally. PNG is lossless (so it doesn't
+        cost any quality versus the old approach) and, unlike a Y4M/PPM
+        intermediate, carries an alpha channel straight through, so alpha
+        is now preserved instead of being composited onto white — AVIF
+        supports transparency natively, so there's no reason to throw it
+        away like the JPEG intermediate has to.
+
+        Mode semantics:
+        - standard    -> avifenc -q from the {high, medium, low} map
+        - lossless    -> avifenc --lossless (true lossless AVIF)
+        - resize_only -> resize first, then encode at high quality so savings
+          come from the smaller dimensions.
+        """
+        original_size = os.path.getsize(input_path)
+        result = {
+            "success": False,
+            "original_size": original_size,
+            "compressed_size": original_size,
+            "error": None,
+            "warning": None,
+        }
+        if self.avifenc_path is None:
+            result["error"] = "avifenc not found — cannot produce AVIF output"
+            return result
+
+        quality_map = {"high": 80, "medium": 60, "low": 40}
+        if compression_mode == "lossless":
+            q = 100
+        elif compression_mode == "resize_only":
+            q = 90
+        else:
+            q = quality_map.get(quality, 60)
+
+        temp_files: list = []
+        try:
+            loop = asyncio.get_running_loop()
+            intermediate_path = output_path.with_suffix(".src.png")
+            tmp_avif = output_path.with_suffix(".avifenc.avif")
+            temp_files = [intermediate_path, tmp_avif]
+
+            def _prepare_intermediate():
+                with Image.open(input_path) as opened:
+                    img = ImageOps.exif_transpose(opened)
+                    if img.mode == "CMYK":
+                        img = img.convert("RGB")
+                    elif img.mode not in ("RGB", "RGBA", "L"):
+                        # Anything else (P/palette, LA, etc.) — normalize to
+                        # RGBA so a possible alpha channel survives; avifenc
+                        # reads alpha straight from the PNG.
+                        img = img.convert("RGBA")
+                    elif img.mode == "L":
+                        img = img.convert("RGB")
+
+                    if max_width > 0:
+                        w, h = img.size
+                        if w > max_width:
+                            ratio = max_width / w
+                            img = img.resize((max_width, int(h * ratio)), Image.Resampling.LANCZOS)
+
+                    img.info.pop("exif", None)
+                    img.save(intermediate_path, format="PNG")
+
+            if progress_callback:
+                mode_desc = "lossless" if compression_mode == "lossless" else f"quality={q}"
+                await progress_callback(f"encoding AVIF via avifenc ({mode_desc})...")
+            await loop.run_in_executor(None, _prepare_intermediate)
+
+            cmd = [
+                str(self.avifenc_path),
+            ]
+            if compression_mode == "lossless":
+                cmd += ["--lossless"]
+            else:
+                # avifenc has no long-form "--quality" flag — it's
+                # -q/--qcolor (verified against the official CLI's --help).
+                # The old "--quality" flag was simply unrecognized, so every
+                # non-lossless AVIF encode failed on top of the PPM issue
+                # above.
+                cmd += ["-q", str(q)]
+            cmd += ["--speed", "6"]
+            if keep_exif and cleaned_exif:
+                exif_path = output_path.with_suffix(".exif")
+                exif_path.write_bytes(cleaned_exif)
+                temp_files.append(exif_path)
+                cmd += ["--exif", str(exif_path)]
+            cmd += ["-o", str(tmp_avif), str(intermediate_path)]
+
+            async with self._semaphore:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr = await proc.communicate()
+
+            if tmp_avif.exists() and tmp_avif.stat().st_size > 0:
+                tmp_avif.replace(output_path)
+            else:
+                msg = stderr.decode().strip()
+                if progress_callback:
+                    await progress_callback(f"avifenc: {msg} (skipped)")
+                result["warning"] = msg or "avifenc produced no output"
+                result["error"] = "avifenc did not produce an output file"
+                return result
+
+            if output_path.exists():
+                result["compressed_size"] = os.path.getsize(output_path)
+                result["success"] = True
+            else:
+                result["error"] = "output file not generated"
+        except Exception as e:
+            result["success"] = False
+            result["error"] = str(e)
+        finally:
+            for f in temp_files:
+                try:
+                    if f.exists() and f != output_path:
+                        f.unlink()
+                except Exception:
+                    pass
 
         return result

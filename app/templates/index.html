@@ -192,14 +192,20 @@ header h1 span { color: var(--accent); }
 .file-stats { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; font-size: 13px; color: var(--text2); }
 .file-grid {
   display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px;
-  max-height: 360px; overflow-y: auto;
+  max-height: 360px; overflow-y: auto; align-items: start;
 }
 .file-card {
   background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
-  padding: 8px; cursor: pointer; transition: all .2s; position: relative;
+  padding: 8px; cursor: pointer; transition: all .2s;
 }
 .file-card:hover { border-color: var(--accent); }
 .file-card.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+/* .fc-main wraps everything that isn't the (optional) override panel, and
+   is the positioning context for the check/gear/preview-btn overlays —
+   scoping them here (instead of to .file-card) means opening the override
+   panel below can never cover them, since they're absolutely positioned
+   relative to this box, not the taller card. */
+.file-card .fc-main { position: relative; }
 .file-card .thumb {
   width: 100%; aspect-ratio: 16/10; object-fit: cover; border-radius: 4px;
   background: #222; display: block;
@@ -208,7 +214,16 @@ header h1 span { color: var(--accent); }
   font-size: 12px; margin-top: 6px; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap;
 }
-.file-card .fsize { font-size: 11px; color: var(--text2); }
+/* fsize + preview-btn share one row so the button can never ride up over
+   .fname above it (it did when it was absolutely positioned off the
+   bottom of .fc-main, which floated at a fixed offset regardless of how
+   tall the content above actually was) — same line, same baseline, always
+   bottom-aligned with the size text by construction. */
+.file-card .fmeta { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-top: 2px; }
+.file-card .fsize {
+  font-size: 11px; color: var(--text2); flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .file-card .check {
   position: absolute; top: 4px; right: 4px; width: 18px; height: 18px;
   border-radius: 50%; background: rgba(0,0,0,.6); border: 2px solid rgba(255,255,255,.3);
@@ -217,11 +232,9 @@ header h1 span { color: var(--accent); }
 }
 .file-card.selected .check { background: var(--accent); border-color: var(--accent); color: #000; }
 .file-card .preview-btn {
-  position: absolute; bottom: 4px; right: 4px;
-  font-size: 10px; padding: 2px 6px; border-radius: 4px;
+  font-size: 10px; padding: 2px 6px; border-radius: 4px; flex-shrink: 0;
   border: 1px solid var(--border); background: var(--card); color: var(--text2);
-  cursor: pointer; white-space: nowrap; max-width: calc(100% - 12px);
-  overflow: hidden; text-overflow: ellipsis; transition: opacity .15s;
+  cursor: pointer; white-space: nowrap; transition: opacity .15s;
   opacity: 0;
 }
 .file-card:hover .preview-btn, .file-card .preview-btn:not(:disabled) { opacity: .9; }
@@ -236,11 +249,16 @@ header h1 span { color: var(--accent); }
 .file-card:hover .card-gear { opacity: .85; }
 .file-card .card-gear:hover { opacity: 1; color: var(--accent); border-color: var(--accent); }
 .file-card.has-override .card-gear { opacity: 1; color: var(--accent); border-color: var(--accent); }
+/* Normal-flow block below .fc-main (not an absolute overlay) — opening it
+   grows the card's own height instead of covering fsize/preview-btn, which
+   both live inside .fc-main above it. */
 .file-card .file-override {
-  position: absolute; left: 0; right: 0; bottom: 0; z-index: 2;
-  background: var(--card); border-top: 1px solid var(--border);
-  padding: 4px 6px; font-size: 10px; display: flex; flex-direction: column; gap: 2px;
+  margin-top: 6px; border-top: 1px solid var(--border);
+  padding-top: 4px; font-size: 10px; display: flex; flex-direction: column; gap: 2px;
 }
+/* The panel's own `hidden` attribute must beat the `display:flex` above —
+   otherwise the panel is force-shown and the gear toggle can't hide it. */
+.file-card .file-override[hidden] { display: none; }
 .file-card .fo-row { display: flex; align-items: center; gap: 4px; }
 .file-card .fo-label { width: 42px; color: var(--text2); flex-shrink: 0; }
 .file-card .fo-row select, .file-card .fo-row input {
@@ -322,6 +340,44 @@ header h1 span { color: var(--accent); }
 .action-bar .btn { flex-shrink: 0; }
 .action-bar .spacer { flex: 1; }
 
+/* Watch Mode */
+.watch-status { font-size: 13px; color: var(--text2); padding: 4px 0; }
+.watch-log-box {
+  background: var(--bg); border-radius: var(--radius); padding: 10px 14px;
+  max-height: 180px; overflow-y: auto; font-family: "Cascadia Code", "Fira Code", monospace;
+  font-size: 12px; line-height: 1.7; margin-top: 8px;
+}
+
+/* Settings panel */
+.settings-btn {
+  background: var(--bg); border: 1px solid var(--border); color: var(--text2);
+  border-radius: var(--radius); cursor: pointer; padding: 6px 10px; font-size: 15px;
+  line-height: 1; transition: all .15s;
+}
+.settings-btn:hover { border-color: var(--accent); color: var(--text); }
+.settings-overlay {
+  display: none; position: fixed; inset: 0; background: rgba(0,0,0,.35);
+  z-index: 900; align-items: center; justify-content: center;
+}
+.settings-overlay.open { display: flex; }
+.settings-panel {
+  background: var(--surface); border-radius: var(--radius); box-shadow: 0 8px 30px rgba(0,0,0,.18);
+  width: 420px; max-width: 92vw; max-height: 85vh; overflow-y: auto; padding: 24px;
+}
+.settings-panel h2 { font-size: 16px; font-weight: 700; margin-bottom: 16px; display: flex; align-items: center; justify-content: space-between; }
+.settings-panel h2 button { background: none; border: none; font-size: 18px; cursor: pointer; color: var(--text2); padding: 2px 6px; }
+.settings-panel h2 button:hover { color: var(--text); }
+.settings-field { margin-bottom: 14px; }
+.settings-field label { display: block; font-size: 12px; font-weight: 600; color: var(--text2); margin-bottom: 4px; }
+.settings-field input {
+  width: 100%; padding: 7px 10px; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--bg); color: var(--text); font-size: 13px;
+}
+.settings-field input:focus { outline: none; border-color: var(--accent); }
+.settings-field .field-hint { font-size: 11px; color: var(--text2); margin-top: 2px; }
+.settings-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 18px; }
+.settings-actions .btn { padding: 7px 18px; font-size: 13px; }
+
 /* Responsive */
 @media (max-width: 640px) {
   .container { padding: 12px; }
@@ -338,11 +394,60 @@ header h1 span { color: var(--accent); }
   <div class="header-right">
     <span id="health-status"><span class="status-dot warn"></span>Checking...</span>
     <span id="workspace-info"></span>
+    <button class="settings-btn" id="settings-btn" title="Settings" aria-label="Open settings">&#9881;</button>
     <button class="theme-toggle" id="theme-toggle" title="Toggle light / dark theme" aria-label="Toggle theme"></button>
   </div>
 </header>
 
+<!-- Settings modal -->
+<div class="settings-overlay" id="settings-overlay">
+  <div class="settings-panel">
+    <h2>Settings <button id="settings-close" aria-label="Close settings">&times;</button></h2>
+    <div class="settings-field">
+      <label for="setting-host">Host</label>
+      <input type="text" id="setting-host" placeholder="127.0.0.1">
+      <div class="field-hint">Requires restart to take effect</div>
+    </div>
+    <div class="settings-field">
+      <label for="setting-port">Port</label>
+      <input type="number" id="setting-port" min="1" max="65535" placeholder="8090">
+      <div class="field-hint">Requires restart to take effect</div>
+    </div>
+    <div class="settings-field">
+      <label for="setting-concurrent-workers">Concurrent Workers</label>
+      <input type="number" id="setting-concurrent-workers" min="1" placeholder="4">
+      <div class="field-hint">Number of images compressed in parallel. Requires restart</div>
+    </div>
+    <div class="settings-field">
+      <label for="setting-thumbnail-workers">Thumbnail Workers</label>
+      <input type="number" id="setting-thumbnail-workers" min="1" placeholder="4">
+      <div class="field-hint">Number of thumbnails generated in parallel. Requires restart</div>
+    </div>
+    <div class="settings-field">
+      <label for="setting-cleanup-delay">Workspace Cleanup Delay (seconds)</label>
+      <input type="number" id="setting-cleanup-delay" min="0" step="0.5" placeholder="10">
+    </div>
+    <div class="settings-field">
+      <label for="setting-idle-timeout">Session Idle Timeout (hours)</label>
+      <input type="number" id="setting-idle-timeout" min="0" step="0.5" placeholder="4">
+    </div>
+    <div class="settings-actions">
+      <button class="btn" id="settings-cancel" style="background:var(--surface2)">Cancel</button>
+      <button class="btn" id="settings-save" style="background:var(--accent);color:#fff">Save</button>
+    </div>
+  </div>
+</div>
+
 <div id="notice-container"></div>
+
+<!-- Batch resume banner -->
+<div id="batch-resume-banner" style="display:none;background:#fff3cd;border:1px solid #ffc107;border-radius:8px;padding:12px 20px;margin:0 24px;display:none;align-items:center;gap:12px;font-size:14px">
+  <span id="batch-resume-text"></span>
+  <div style="margin-left:auto;display:flex;gap:8px">
+    <button class="btn btn-primary btn-sm" id="batch-resume-btn" style="padding:4px 16px;font-size:13px">Resume</button>
+    <button class="btn btn-secondary btn-sm" id="batch-dismiss-btn" style="padding:4px 12px;font-size:13px">Dismiss</button>
+  </div>
+</div>
 
 <div class="container">
 
@@ -417,10 +522,18 @@ header h1 span { color: var(--accent); }
         <label>Output Format</label>
         <div class="radio-group" id="format-group">
           <input type="radio" name="format" id="fmt-png" value="png" checked><label for="fmt-png">PNG</label>
+          <input type="radio" name="format" id="fmt-jpg" value="jpg"
+            title="Re-compresses images with mozjpeg's cjpeg while KEEPING the JPEG format — the way to shrink a batch of JPGs without converting them. Quality applies in Standard mode; 'Lossless' maps to the highest mozjpeg quality (~95) since JPEG is inherently lossy. Requires cjpeg in the bin/ directory.">
+          <label for="fmt-jpg"
+            title="Re-compresses images with mozjpeg's cjpeg while KEEPING the JPEG format — the way to shrink a batch of JPGs without converting them. Quality applies in Standard mode; 'Lossless' maps to the highest mozjpeg quality (~95) since JPEG is inherently lossy. Requires cjpeg in the bin/ directory.">JPG</label>
           <input type="radio" name="format" id="fmt-webp" value="webp"
             title="WebP typically produces smaller files than PNG at similar visual quality. Uses its own encoder (not pngquant/oxipng) — Quality/Protect Colors/Dithering don't apply, only Compression Mode's lossy-vs-lossless choice does.">
           <label for="fmt-webp"
             title="WebP typically produces smaller files than PNG at similar visual quality. Uses its own encoder (not pngquant/oxipng) — Quality/Protect Colors/Dithering don't apply, only Compression Mode's lossy-vs-lossless choice does.">WebP</label>
+          <input type="radio" name="format" id="fmt-avif" value="avif"
+            title="AVIF is a modern codec that typically produces the smallest files at equivalent quality. Slower encoding than PNG/WebP. Requires avifenc in the bin/ directory or PATH.">
+          <label for="fmt-avif"
+            title="AVIF is a modern codec that typically produces the smallest files at equivalent quality. Slower encoding than PNG/WebP. Requires avifenc in the bin/ directory or PATH.">AVIF</label>
         </div>
       </div>
       <div class="config-group">
@@ -454,11 +567,44 @@ header h1 span { color: var(--accent); }
       </div>
     </div>
     <div id="mode-hint" style="display:none;font-size:12px;color:var(--red);margin:-8px 0 16px"></div>
+    <div id="mode-note" style="display:none;font-size:12px;color:var(--yellow);margin:-8px 0 16px"></div>
     <div class="action-bar">
       <div class="spacer"></div>
       <span style="font-size:13px;color:var(--text2)" id="file-count-info"></span>
       <button class="btn btn-primary" id="start-btn" disabled>Start</button>
     </div>
+  </div>
+
+  <!-- Watch Mode -->
+  <div class="card" id="watch-section">
+    <div class="card-title">Watch Mode</div>
+    <div style="font-size:12px;color:var(--text2);margin-bottom:10px">
+      Monitor a folder and auto-optimize new or changed images as they appear.
+    </div>
+    <div class="input-row" style="margin-bottom:8px">
+      <input type="text" id="watch-dir" placeholder="Watch directory" style="flex:1" />
+      <button class="btn btn-secondary" id="watch-browse-dir-btn" style="white-space:nowrap">Browse...</button>
+    </div>
+    <div class="input-row" style="margin-bottom:8px">
+      <input type="text" id="watch-output-dir" placeholder="Output directory (required)" style="flex:1" />
+      <button class="btn btn-secondary" id="watch-browse-output-btn" style="white-space:nowrap">Browse...</button>
+    </div>
+    <div style="display:flex;gap:12px;margin-bottom:10px">
+      <label style="font-size:13px;cursor:pointer;user-select:none;display:flex;align-items:center;gap:4px">
+        <input type="checkbox" id="watch-recursive" checked /> Include subfolders
+      </label>
+      <label style="font-size:13px;cursor:pointer;user-select:none;display:flex;align-items:center;gap:4px">
+        <input type="checkbox" id="watch-process-existing" /> Process existing files
+      </label>
+    </div>
+    <div class="watch-status" id="watch-status">Idle</div>
+    <div class="action-bar" style="margin-top:8px">
+      <button class="btn btn-primary" id="watch-start-btn">Start Watching</button>
+      <button class="btn btn-danger" id="watch-stop-btn" style="display:none">Stop</button>
+      <div class="spacer"></div>
+      <span style="font-size:12px;color:var(--text2)" id="watch-stats"></span>
+    </div>
+    <div class="watch-log-box" id="watch-log-box" style="display:none"></div>
   </div>
 
   </div>
@@ -535,14 +681,22 @@ const STATE = {
   results: [],
   wsName: '',
   isRunning: false,
+  isPaused: false,
   pollTimer: null,
-  runStartTime: 0,      // ms timestamp when the current run began (for ETA)
+  runStartTime: 0,
   resultSort: 'default',
   resultFilter: 'all',
-  resultCursor: 0,      // # of results already pulled (incremental /api/progress)
-  logCursor: 0,         // # of log lines already pulled
-  logLines: [],         // accumulated log lines (capped for display)
-  fileOverrides: {},    // {file_id: {field: value}} — per-file settings that override the globals; only files the user expanded get an entry
+  resultCursor: 0,
+  logCursor: 0,
+  logLines: [],
+  fileOverrides: {},
+  watchRunning: false,
+  watchProcessed: 0,
+  watchErrors: 0,
+  watchLogs: [],
+  watchLogCursor: 0,
+  watchSSE: null,
+  watchPollTimer: null,
 };
 
 // DOM refs
@@ -740,7 +894,11 @@ async function checkHealth() {
     else tools.push('pngquant ✗');
     if (d.oxipng) tools.push('oxipng ✓');
     else tools.push('oxipng ✗');
-    const allOk = d.pngquant && d.oxipng;
+    if (d.cjpeg) tools.push('cjpeg ✓');
+    else tools.push('cjpeg ✗');
+    if (d.avifenc) tools.push('avifenc ✓');
+    else tools.push('avifenc ✗');
+    const allOk = d.pngquant && d.oxipng && d.cjpeg;
     healthStatus.innerHTML =
       `<span class="status-dot ${allOk ? 'ok' : 'warn'}"></span>${tools.join(' ')}`;
     // NOTE: deliberately no startBtn touching here — missing binaries only
@@ -978,15 +1136,19 @@ function renderFiles() {
   for (const f of files) {
     html += `
       <div class="file-card selected" data-id="${f.id}" onclick="toggleFile('${f.id}')">
-        <img class="thumb" src="${f.thumbnail}" alt="${escHtml(f.name)}" loading="lazy" />
-        <div class="fname" title="${escHtml(f.name)}">${escHtml(f.name)}</div>
-        <div class="fsize">${fmtSize(f.size)}</div>
-        <div class="check">✓</div>
-        <button class="card-gear" type="button" title="Per-file settings (override the global quality/mode for just this file)"
-          onclick="event.stopPropagation(); toggleFileOverride('${f.id}', this)">⚙</button>
-        <button class="preview-btn" type="button"
-          title="Run a single-file dry run with the current settings to project the compressed size. Does not affect results or the download ZIP."
-          onclick="event.stopPropagation(); previewFile('${f.id}', this)">Preview</button>
+        <div class="fc-main">
+          <img class="thumb" src="${f.thumbnail}" alt="${escHtml(f.name)}" loading="lazy" />
+          <div class="fname" title="${escHtml(f.name)}">${escHtml(f.name)}</div>
+          <div class="fmeta">
+            <span class="fsize" title="${fmtSize(f.size)}">${fmtSize(f.size)}</span>
+            <button class="preview-btn" type="button"
+              title="Run a single-file dry run with the current settings to project the compressed size. Does not affect results or the download ZIP."
+              onclick="event.stopPropagation(); previewFile('${f.id}', this)">Preview</button>
+          </div>
+          <div class="check">✓</div>
+          <button class="card-gear" type="button" title="Per-file settings (override the global quality/mode for just this file)"
+            onclick="event.stopPropagation(); toggleFileOverride('${f.id}', this)">⚙</button>
+        </div>
         <div class="file-override" data-id="${f.id}" hidden onclick="event.stopPropagation()">
           <div class="fo-row">
             <span class="fo-label">Quality</span>
@@ -1003,6 +1165,12 @@ function renderFiles() {
           <div class="fo-row">
             <span class="fo-label">Width</span>
             <input type="number" min="0" data-field="max_width" placeholder="inherit" oninput="setFileOverride('${f.id}')">
+          </div>
+          <div class="fo-row">
+            <span class="fo-label">Format</span>
+            <select data-field="output_format" onchange="setFileOverride('${f.id}')">
+              <option value="">inherit</option><option value="png">png</option><option value="webp">webp</option><option value="jpg">jpg</option>
+            </select>
           </div>
         </div>
       </div>
@@ -1131,12 +1299,25 @@ function updateModeDependentControls() {
   protectColorsGroup.classList.toggle('disabled-group', !pngquantApplies);
   ditheringGroup.classList.toggle('disabled-group', !pngquantApplies);
 
-  // Quality: relevant for Standard-mode PNG (pngquant target) and for
-  // Standard-mode WebP (Pillow's own quality parameter) — only meaningless
-  // when compression mode isn't Standard (Lossless/Resize Only skip
-  // quality entirely for both formats).
+  // Quality: relevant for Standard-mode PNG (pngquant target), Standard-mode
+  // WebP/AVIF (Pillow's/avifenc's own quality parameter), and Standard-mode
+  // JPEG (cjpeg -quality) — only meaningless when compression mode isn't
+  // Standard (Lossless/Resize Only skip quality entirely for every format).
   document.querySelectorAll('input[name="quality"]').forEach(r => r.disabled = !isStandard);
   document.getElementById('quality-group').classList.toggle('disabled-group', !isStandard);
+
+  // JPEG is an inherently lossy codec — there's no true lossless pass, so
+  // 'Lossless'/'Resize Only' for JPG just encodes at mozjpeg's highest
+  // quality (~95) with no palette change. Tell the user that up front
+  // instead of implying pixel-perfect output.
+  const modeNote = $('mode-note');
+  if (format === 'jpg' && !isStandard) {
+    modeNote.textContent =
+      'JPEG is inherently lossy — "Lossless" and "Resize Only" use mozjpeg\u2019s highest quality (~95) with no palette changes.';
+    modeNote.style.display = 'block';
+  } else {
+    modeNote.style.display = 'none';
+  }
 
   // Max Width is intentionally NOT tied to compression mode or format —
   // resizing is orthogonal to how colors/encoding are handled. You can
@@ -1193,6 +1374,7 @@ async function runOptimize(ids, opts) {
   STATE.resultCursor = 0;
   STATE.logCursor = 0;
   STATE.logLines = [];
+  STATE.isPaused = false;
   // Clean up any transport left over from a previous run before starting fresh.
   if (STATE.pollTimer) { clearInterval(STATE.pollTimer); STATE.pollTimer = null; }
   stopSSE();
@@ -1313,11 +1495,24 @@ function startSSE() {
     fallbackToPolling();
     return;
   }
+  sseSource.addEventListener('status', e => {
+    sseLastMsg = Date.now();
+    let d = {};
+    try { d = JSON.parse(e.data); } catch (_) {}
+    STATE.isPaused = !!d.paused;
+    setRunButtons(true, STATE.isPaused);
+    renderProgressBar(true, STATE.isPaused, d.current != null ? d.current : STATE.results.length, d.total != null ? d.total : STATE.total);
+  });
   sseSource.addEventListener('result', e => {
     sseLastMsg = Date.now();
     try { STATE.results.push(JSON.parse(e.data)); } catch (_) {}
-    setRunButtons(true, false);
-    renderProgressBar(true, false, STATE.results.length, STATE.total);
+    // A result can arrive just after Pause was clicked — it's a file that
+    // was already mid-compression when the run paused, finishing up on its
+    // own (see /api/pause docstring). Keep reflecting the real paused state
+    // here rather than assuming "a result came in, so we must be running
+    // normally" — that assumption is what made Pause look broken.
+    setRunButtons(true, STATE.isPaused);
+    renderProgressBar(true, STATE.isPaused, STATE.results.length, STATE.total);
   });
   sseSource.addEventListener('log', e => {
     sseLastMsg = Date.now();
@@ -1612,6 +1807,309 @@ async function restoreState() {
   }
 }
 
+// --- Watch mode ---
+const watchDir = $('watch-dir'),
+      watchOutputDir = $('watch-output-dir'),
+      watchRecursive = $('watch-recursive'),
+      watchProcessExisting = $('watch-process-existing'),
+      watchStartBtn = $('watch-start-btn'),
+      watchStopBtn = $('watch-stop-btn'),
+      watchStatusEl = $('watch-status'),
+      watchLogBox = $('watch-log-box'),
+      watchStatsEl = $('watch-stats');
+
+async function startWatch() {
+  const dir = watchDir.value.trim();
+  const outputDir = watchOutputDir.value.trim();
+  if (!dir) { showNotice('Please enter a watch directory', 'err'); return; }
+  if (!outputDir) { showNotice('Please enter an output directory', 'err'); return; }
+
+  const quality = document.querySelector('input[name="quality"]:checked').value;
+  const maxWidth = parseInt($('max-width').value);
+  const format = document.querySelector('input[name="format"]:checked').value;
+  const compressionMode = document.querySelector('input[name="mode"]:checked').value;
+  const protectedColors = protectColorsInput.value.split(',').map(s => s.trim()).filter(Boolean);
+  const dithering = ditheringInput.checked;
+  const keepExif = $('keep-exif').checked;
+
+  try {
+    const r = await apiFetch('/api/watch/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        directory: dir, recursive: watchRecursive.checked,
+        process_existing: watchProcessExisting.checked,
+        quality, max_width: maxWidth, output_format: format,
+        compression_mode: compressionMode, protected_colors: protectedColors,
+        dithering, keep_exif: keepExif, output_dir: outputDir,
+      }),
+    });
+    const d = await r.json();
+    if (d.error) { showNotice(d.error, 'err'); return; }
+    if (d.warning) showNotice(d.warning, 'info');
+    STATE.watchRunning = true;
+    STATE.watchLogs = [];
+    STATE.watchLogCursor = 0;
+    updateWatchUI();
+    startWatchSSE();
+  } catch(e) {
+    showNotice('Watch start failed: ' + e.message, 'err');
+  }
+}
+
+async function stopWatch() {
+  try {
+    const r = await apiFetch('/api/watch/stop', { method: 'POST' });
+    const d = await r.json();
+    if (d.error) showNotice(d.error, 'err');
+  } catch(e) { /* best-effort */ }
+  STATE.watchRunning = false;
+  stopWatchSSE();
+  updateWatchUI();
+}
+
+let watchSSESource = null, watchSSEWatchdog = null, watchSSELastMsg = 0;
+const WATCH_SSE_SILENCE_MS = 10000;
+
+function startWatchSSE() {
+  watchSSELastMsg = Date.now();
+  try {
+    watchSSESource = new EventSource('/api/watch/events');
+  } catch (e) { fallbackWatchToPolling(); return; }
+  watchSSESource.addEventListener('watch_log', e => {
+    watchSSELastMsg = Date.now();
+    try { STATE.watchLogs.push(JSON.parse(e.data).line); } catch (_) {}
+    renderWatchLog();
+  });
+  watchSSESource.addEventListener('watch_status', e => {
+    watchSSELastMsg = Date.now();
+    try {
+      const d = JSON.parse(e.data);
+      STATE.watchRunning = d.running;
+      STATE.watchProcessed = d.processed;
+      STATE.watchErrors = d.errors;
+    } catch (_) {}
+    updateWatchUI();
+    if (!STATE.watchRunning) stopWatchSSE();
+  });
+  watchSSESource.onerror = () => { fallbackWatchToPolling(); };
+  watchSSEWatchdog = setInterval(() => {
+    if (watchSSESource && Date.now() - watchSSELastMsg > WATCH_SSE_SILENCE_MS) fallbackWatchToPolling();
+  }, 3000);
+}
+
+function stopWatchSSE() {
+  if (watchSSESource) { watchSSESource.close(); watchSSESource = null; }
+  if (watchSSEWatchdog) { clearInterval(watchSSEWatchdog); watchSSEWatchdog = null; }
+  if (STATE.watchPollTimer) { clearInterval(STATE.watchPollTimer); STATE.watchPollTimer = null; }
+}
+
+function fallbackWatchToPolling() {
+  stopWatchSSE();
+  if (!STATE.watchPollTimer && STATE.watchRunning) {
+    STATE.watchPollTimer = setInterval(pollWatchStatus, 2000);
+  }
+}
+
+async function pollWatchStatus() {
+  try {
+    const r = await fetch('/api/watch/status');
+    const d = await r.json();
+    STATE.watchRunning = d.running;
+    STATE.watchProcessed = d.processed;
+    STATE.watchErrors = d.errors;
+    if (d.logs && d.logs.length > STATE.watchLogCursor) {
+      for (let i = STATE.watchLogCursor; i < d.logs.length; i++) STATE.watchLogs.push(d.logs[i]);
+      STATE.watchLogCursor = d.logs.length;
+      renderWatchLog();
+    }
+    updateWatchUI();
+    if (!STATE.watchRunning) stopWatchSSE();
+  } catch(e) { /* ignore */ }
+}
+
+function updateWatchUI() {
+  if (STATE.watchRunning) {
+    watchStartBtn.style.display = 'none';
+    watchStopBtn.style.display = '';
+    watchStatusEl.innerHTML = '<span class="status-dot ok"></span>Watching\u2026';
+    watchLogBox.style.display = '';
+  } else {
+    watchStartBtn.style.display = '';
+    watchStopBtn.style.display = 'none';
+    watchStatusEl.textContent = 'Idle';
+    watchLogBox.style.display = 'none';
+  }
+  watchStatsEl.textContent = STATE.watchProcessed || STATE.watchErrors
+    ? `Processed: ${STATE.watchProcessed} | Errors: ${STATE.watchErrors}`
+    : '';
+}
+
+function renderWatchLog() {
+  if (STATE.watchLogs.length > 300) STATE.watchLogs = STATE.watchLogs.slice(-300);
+  watchLogBox.innerHTML = STATE.watchLogs.map(l => {
+    let c = 'log-entry';
+    if (l.indexOf('OK ') !== -1) c += ' ok';
+    else if (l.indexOf('FAIL') !== -1 || l.indexOf('ERROR') !== -1) c += ' err';
+    else if (l.startsWith('  ')) c += ' info';
+    return `<div class="${c}">${escHtml(l)}</div>`;
+  }).join('');
+  watchLogBox.scrollTop = watchLogBox.scrollHeight;
+}
+
+watchStartBtn.addEventListener('click', startWatch);
+watchStopBtn.addEventListener('click', stopWatch);
+$('watch-browse-dir-btn').addEventListener('click', async () => {
+  const path = await pickFolder();
+  if (path) watchDir.value = path;
+});
+$('watch-browse-output-btn').addEventListener('click', async () => {
+  const path = await pickFolder();
+  if (path) watchOutputDir.value = path;
+});
+
+async function checkWatchStatus() {
+  try {
+    const r = await fetch('/api/watch/status');
+    const d = await r.json();
+    if (d.running) {
+      STATE.watchRunning = true;
+      STATE.watchProcessed = d.processed;
+      STATE.watchErrors = d.errors;
+      STATE.watchLogs = d.logs || [];
+      STATE.watchLogCursor = STATE.watchLogs.length;
+      updateWatchUI();
+      renderWatchLog();
+      startWatchSSE();
+    }
+  } catch(e) { /* fresh session or server unreachable */ }
+}
+
+// --- Batch resume ---
+const resumeBanner = $('batch-resume-banner');
+const resumeText = $('batch-resume-text');
+const batchResumeBtn = $('batch-resume-btn');
+const batchDismissBtn = $('batch-dismiss-btn');
+let _savedBatchState = null;  // remember params from the banner to send on Resume
+
+async function checkBatchState() {
+  try {
+    const r = await fetch('/api/batch-state');
+    const d = await r.json();
+    if (!d.has_batch) return;
+    _savedBatchState = d;
+    resumeText.textContent = `Found unfinished batch: ${d.done}/${d.total} completed (${d.failed} failed). Resume?`;
+    resumeBanner.style.display = 'flex';
+  } catch(e) { /* no batch or server error */ }
+}
+
+batchResumeBtn.addEventListener('click', async () => {
+  if (!_savedBatchState) return;
+  resumeBanner.style.display = 'none';
+  // Pre-fill the output dir from the saved batch so the UI is consistent
+  if (_savedBatchState.output_dir) {
+    outputDir.value = _savedBatchState.output_dir;
+  }
+  try {
+    const r = await apiFetch('/api/optimize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        resume: true,
+        output_dir: _savedBatchState.output_dir,
+        output_format: _savedBatchState.output_format,
+        quality: _savedBatchState.quality,
+        compression_mode: _savedBatchState.compression_mode,
+      }),
+    });
+    const d = await r.json();
+    if (!r.ok) { showNotice(d.error || 'Resume failed', 'err'); return; }
+    STATE.isRunning = true;
+    STATE.runStartTime = Date.now();
+    STATE.resultCursor = 0;
+    STATE.logCursor = 0;
+    cancelBtn.style.display = '';
+    updateStartButtonState();
+    startSSE();
+  } catch(e) {
+    showNotice('Resume failed: ' + e.message, 'err');
+  }
+});
+
+batchDismissBtn.addEventListener('click', () => {
+  resumeBanner.style.display = 'none';
+  _savedBatchState = null;
+});
+
+// --- Settings panel ---
+const settingsOverlay = $('settings-overlay');
+const settingsBtn = $('settings-btn');
+const settingsClose = $('settings-close');
+const settingsCancel = $('settings-cancel');
+const settingsSave = $('settings-save');
+const settingHost = $('setting-host');
+const settingPort = $('setting-port');
+const settingConcurrentWorkers = $('setting-concurrent-workers');
+const settingThumbnailWorkers = $('setting-thumbnail-workers');
+const settingCleanupDelay = $('setting-cleanup-delay');
+const settingIdleTimeout = $('setting-idle-timeout');
+
+function openSettings() {
+  settingsOverlay.classList.add('open');
+  // Load current values
+  apiFetch('/api/settings').then(r => r.json()).then(data => {
+    const s = data.settings || {};
+    settingHost.value = s.host || '';
+    settingPort.value = s.port || '';
+    settingConcurrentWorkers.value = s.concurrent_workers || '';
+    settingThumbnailWorkers.value = s.thumbnail_workers || '';
+    settingCleanupDelay.value = s.workspace_cleanup_delay || '';
+    settingIdleTimeout.value = s.session_idle_timeout_hours || '';
+  }).catch(() => {});
+}
+
+function closeSettings() {
+  settingsOverlay.classList.remove('open');
+}
+
+settingsBtn.addEventListener('click', openSettings);
+settingsClose.addEventListener('click', closeSettings);
+settingsCancel.addEventListener('click', closeSettings);
+settingsOverlay.addEventListener('click', (e) => {
+  if (e.target === settingsOverlay) closeSettings();
+});
+
+settingsSave.addEventListener('click', async () => {
+  const payload = {
+    host: settingHost.value.trim(),
+    port: settingPort.value,
+    concurrent_workers: settingConcurrentWorkers.value,
+    thumbnail_workers: settingThumbnailWorkers.value,
+    workspace_cleanup_delay: settingCleanupDelay.value,
+    session_idle_timeout_hours: settingIdleTimeout.value,
+  };
+  try {
+    const r = await apiFetch('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      showNotice(data.error || 'Failed to save settings', 'err');
+      return;
+    }
+    let msg = 'Settings saved.';
+    if (data.requires_restart && data.requires_restart.length > 0) {
+      msg += ' Some changes require a restart to take effect.';
+    }
+    showNotice(msg, 'ok');
+    closeSettings();
+  } catch (e) {
+    showNotice('Failed to save settings: ' + e.message, 'err');
+  }
+});
+
 // Init
 applyStoredTheme();
 loadConfig();
@@ -1628,6 +2126,8 @@ if (autoDir) {
 } else {
   restoreState();
 }
+checkWatchStatus();
+checkBatchState();
 </script>
 </body>
 </html>

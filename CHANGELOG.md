@@ -4,6 +4,102 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **AVIF output never actually worked.** Verified against the real
+  libavif CLI (avifenc v1.3.0): (1) the intermediate file was written as
+  `.src.ppm`, but avifenc only recognizes `input.[jpg|jpeg|png|y4m]` — PPM
+  is rejected outright ("Unrecognized file format"), so every single AVIF
+  encode failed regardless of quality/mode. (2) The quality flag was
+  `--quality`, which doesn't exist on avifenc — the real flag is
+  `-q`/`--qcolor`; this alone would have broken every non-lossless AVIF
+  encode even with (1) fixed. Both are now fixed: the intermediate is a
+  PNG (also lossless, so no quality regression versus the old approach),
+  and the CLI invocation uses `-q`. As a side benefit, since PNG (unlike
+  the old PPM path) carries an alpha channel, AVIF output now preserves
+  transparency instead of compositing it onto white — AVIF supports alpha
+  natively, so there was no reason to throw it away. The test suite's
+  fake avifenc previously accepted any input/flags, so it couldn't catch
+  either bug; it now validates the same way the real binary does.
+- **Watch mode could get stuck in an infinite self-reprocessing loop** if
+  `output_dir` was the watched directory itself, or a subfolder of it
+  while watching recursively (e.g. "watch my screenshots folder and
+  shrink new screenshots in place" — a natural thing to want). Writing
+  optimized output back into the watched tree makes the poller detect
+  that output as a new/changed file on the very next scan and reprocess
+  it, forever — confirmed empirically: a single dropped-in file was
+  reprocessed 7 times in 3 seconds with no upper bound. `POST
+  /api/watch/start` now rejects an `output_dir` that would create this
+  overlap, with a message explaining why and how to avoid it.
+- **Batch resume state was a single global file shared by every browser
+  tab/session.** `~/.image-optimizer/batch_state.json` didn't distinguish
+  between unrelated batches, even though the rest of the app's state
+  (`state.files`, `state.results`, `state.workspace`) is per-session. Two
+  tabs running batches into different output folders would silently
+  clobber each other's resume data — e.g. tab B finishing a normal batch
+  called the same global `_clear_batch_state()`, wiping out tab A's
+  still-interrupted batch and its resume banner along with it. Batch
+  state is now stored one file per output_dir under
+  `~/.image-optimizer/batches/` (filename derived from a hash of the
+  resolved output_dir), keyed by output_dir rather than session id so
+  resume still survives a server restart (session ids are re-issued on
+  restart; output_dir isn't). `GET /api/batch-state` accepts an optional
+  `?output_dir=` to check one specific batch, or with no query param
+  reports the most recently updated batch that's still unfinished across
+  everything on disk. `POST /api/optimize` with `resume: true` now
+  requires `output_dir` up front (400 if missing) since that's what
+  identifies which saved batch to resume.
+
+### Added
+- **AVIF output** (`output_format: "avif"`). Selecting AVIF encodes through
+  `avifenc` (auto-detected in `bin/` or PATH; without it the `(avif, *)`
+  modes drop out of `available_modes()` and the UI warns up front).
+  Pillow decodes the source (EXIF transpose, alpha composited onto white,
+  optional resize), writes a PPM intermediate, then avifenc encodes the
+  final AVIF. `keep_exif` passes cleaned EXIF via avifenc's `--exif`
+  sidecar. Quality map: high=80, medium=60, low=40; lossless uses
+  `--lossless`; resize_only encodes at q=90 after downscaling.
+- **Batch resume** (`GET /api/batch-state`, `POST /api/optimize` with
+  `resume: true`). Progress is persisted (one file per output_dir, under
+  `~/.image-optimizer/batches/` — see Fixed below) after each file
+  completes. If the server crashes or the user cancels mid-batch, the
+  frontend shows a banner on reload ("Found unfinished batch: X/Y
+  completed") with a Resume button that re-processes only the
+  pending/failed files into the same output directory. Batch state is
+  auto-cleared when every file finishes successfully. Runs without a
+  persistent output_dir don't create batch state (the temp workspace
+  disappears anyway).
+- **Watch mode** (`POST /api/watch/start`, `/stop`, `/status`, `/events`).
+  Monitor a folder and auto-optimize new or changed images as they appear.
+  `FolderWatcher` polls on a timer, diffs by (mtime, size), and fires a
+  per-file handler that runs the full optimizer pipeline into a chosen
+  output directory. SSE endpoint streams live logs and status updates;
+  the frontend falls back to polling when SSE is unavailable. Watch mode
+  and batch optimize are mutually exclusive per session (400 guard).
+  Options: recursive, process-existing, quality/mode/format reuse the
+  global settings card. Errors on individual files are logged but never
+  stop the watcher.
+- **True JPEG optimization** (`output_format: "jpg"`). Selecting JPG for a
+  batch of `.jpg` files now genuinely re-compresses them lossily with
+  mozjpeg's `cjpeg` while *keeping the JPEG format* — previously JPEG/BMP/
+  TIFF/WebP sources were silently transcoded to PNG or WebP, so "just make
+  this batch of JPEGs smaller, same format" wasn't possible. Pillow decodes
+  (EXIF orientation baked in, alpha composited onto white, optional resize)
+  to a PPM intermediate, then `cjpeg -quality N -progressive -optimize`
+  re-encodes. `keep_exif` works too: cleaned EXIF is re-injected as an APP1
+  segment after SOI. `cjpeg`/`cjpeg-static` is auto-detected in `bin/` or
+  PATH; without it the `(jpg, *)` modes drop out of `available_modes()` and
+  Start warns up front. "Lossless"/"Resize Only" for JPEG map to the highest
+  cjpeg quality (95) — JPEG is inherently lossy, and the UI says so.
+- **In-app settings panel** (`GET /api/settings`, `PUT /api/settings`).
+  Gear icon in the header opens a modal with Host, Port, Concurrent
+  Workers, Thumbnail Workers, Workspace Cleanup Delay, and Session Idle
+  Timeout fields. PUT accepts partial updates, validates each field, and
+  persists to `~/.image-optimizer/config.json`. Keys that require a
+  server restart (host, port, workers) are flagged in the response so
+  the UI can inform the user.
+
+## [August 2026 review batch]
+
 Six features from the August 2026 project review. Each shipped test-first
 with a regression test that exposes its cross-cutting interaction with the
 existing batch state machine (`skip_existing` / `retry` / narrowed

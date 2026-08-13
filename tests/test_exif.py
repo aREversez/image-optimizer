@@ -243,6 +243,58 @@ class TestWebPExifRetention:
         assert not _read_exif(out)
 
 
+class TestJpegExifRetention:
+    """JPEG output keeps JPEG format via mozjpeg's cjpeg. cjpeg starts fresh
+    from the PPM intermediate so the default (keep_exif=False) output is
+    metadata-free, and keep_exif=True injects a cleaned APP1 Exif segment
+    after SOI. Same no-double-rotation guarantee as PNG/WebP."""
+
+    def test_default_strips_exif(self, tmp_path, optimizer):
+        src = tmp_path / "src.jpg"
+        _make_oriented_jpeg(src)
+        out = tmp_path / "out.jpg"
+
+        result = asyncio.run(optimizer.optimize_png(src, out, output_format="jpg"))
+        assert result["success"]
+        exif = _read_exif(out)
+        assert not exif, "default JPEG run must produce no EXIF"
+
+    def test_keep_exif_retains_without_orientation(self, tmp_path, optimizer):
+        src = tmp_path / "src.jpg"
+        _make_oriented_jpeg(src)
+        out = tmp_path / "out.jpg"
+
+        result = asyncio.run(optimizer.optimize_png(src, out, output_format="jpg", keep_exif=True))
+        assert result["success"]
+
+        exif = _read_exif(out)
+        assert TAG_ORIENTATION not in exif, "Orientation must not be re-written (double-rotation)"
+        assert exif.get(TAG_MAKE) == "TestMake"
+        assert exif.get(TAG_MODEL) == "TestModel"
+
+    def test_keep_exif_no_double_rotation(self, tmp_path, optimizer):
+        src = tmp_path / "portrait.jpg"
+        _make_oriented_jpeg(src, base_size=(40, 80), orientation=6)
+        out = tmp_path / "out.jpg"
+
+        result = asyncio.run(optimizer.optimize_png(src, out, output_format="jpg", keep_exif=True))
+        assert result["success"]
+        with Image.open(out) as img:
+            assert img.size == (80, 40), "pixels must be the upright (transposed) size"
+        exif = _read_exif(out)
+        assert TAG_ORIENTATION not in exif
+
+    def test_keep_exif_with_no_source_exif_is_noop(self, tmp_path, optimizer):
+        from PIL import Image as _Image
+        src = tmp_path / "plain.jpg"
+        _Image.new("RGB", (40, 40)).save(src, format="JPEG")
+        out = tmp_path / "out.jpg"
+
+        result = asyncio.run(optimizer.optimize_png(src, out, output_format="jpg", keep_exif=True))
+        assert result["success"]
+        assert not _read_exif(out), "no source EXIF → no EXIF in output, no error"
+
+
 class TestExifViaApi:
     """End-to-end through the FastAPI layer: keep_exif plumbed through
     OptimizeRequest → _process_files → optimizer.optimize_png, and the

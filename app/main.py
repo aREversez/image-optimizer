@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import secrets
@@ -21,8 +22,9 @@ from PIL import Image
 if __package__ is None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.models import OptimizeRequest, PreviewRequest, RecentClearRequest, RecentRemoveRequest, ScanRequest
+from app.models import OptimizeRequest, PreviewRequest, RecentClearRequest, RecentRemoveRequest, ScanRequest, WatchRequest
 from app.optimizer import HEX_COLOR_RE, Optimizer
+from app.watcher import FolderWatcher
 
 if getattr(sys, "frozen", False):
     BASE_DIR = Path(sys._MEIPASS) / "app"
@@ -100,6 +102,20 @@ class AppState:
         # when nothing changed since the last archive.
         self.output_version = 0
         self.zip_built_version = -1
+        # Watch mode (auto-optimize): a per-session background task that
+        # polls a directory and compresses new/changed images as they
+        # appear. Independent of state.files/results/workspace — it writes
+        # straight into the user's chosen output_dir. Name has no leading
+        # underscore unlike most sibling fields because it's manipulated
+        # from endpoints and helpers, not just this class.
+        self.watch_running = False
+        self.watch_dir: Optional[str] = None
+        self.watch_output_dir: Optional[str] = None
+        self.watch_task: Optional[asyncio.Task] = None
+        self.watch_watcher: Optional[FolderWatcher] = None
+        self.watch_processed = 0
+        self.watch_errors = 0
+        self.watch_logs: list = []
 
     def reset(self):
         self.files = []
@@ -231,6 +247,85 @@ def _recent_file() -> Path:
     return _config_dir() / "recent.json"
 
 
+def _batch_state_dir() -> Path:
+    d = _config_dir() / "batches"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
+def _batch_id_for_output_dir(output_dir: str) -> str:
+    """Stable id for a batch, derived from its output_dir rather than the
+    browser session. Session ids are ephemeral — they're re-issued on every
+    server restart (see get_session), which is exactly when resume needs to
+    work — so keying storage by session would make a crash-restart batch
+    un-resumable. output_dir is what the resume flow already treats as a
+    batch's identity (start_optimization rejects a resume whose output_dir
+    doesn't match), and unlike a session it's stable across restarts and
+    naturally distinct between unrelated batches, so two tabs/processes
+    running different batches can no longer collide on one shared file."""
+    normalized = str(Path(output_dir).resolve())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def _batch_state_file(output_dir: str) -> Path:
+    return _batch_state_dir() / f"{_batch_id_for_output_dir(output_dir)}.json"
+
+
+def _load_batch_state(output_dir: str) -> Optional[dict]:
+    """Load the batch persisted for this output_dir, if any.
+    Returns None if there's no such file or it's corrupt."""
+    try:
+        return json.loads(_batch_state_file(output_dir).read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+
+def _save_batch_state(bs: dict):
+    """Persist batch state to disk, scoped to its own output_dir. Called
+    after each file completes so a crash / server restart can pick up
+    where it left off, without touching any other batch's file."""
+    output_dir = bs.get("output_dir")
+    if not output_dir:
+        return  # nothing to scope the file to — shouldn't happen in practice
+    try:
+        bs["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        _batch_state_file(output_dir).write_text(
+            json.dumps(bs, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    except OSError:
+        pass  # best-effort — a write failure here mustn't crash the batch
+
+
+def _clear_batch_state(output_dir: str):
+    """Remove one batch's state file — called when that batch completes
+    fully. Only ever touches the file for this specific output_dir, so an
+    unrelated batch finishing elsewhere can't wipe this one's resume data."""
+    try:
+        _batch_state_file(output_dir).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _list_unfinished_batch_states() -> list[dict]:
+    """Every persisted batch that still has pending/failed files, newest
+    first. Used to populate the resume banner without requiring the caller
+    to already know which output_dir to ask about."""
+    out = []
+    for f in _batch_state_dir().glob("*.json"):
+        try:
+            bs = json.loads(f.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        files = bs.get("files", [])
+        if any(item.get("status") in ("pending", "failed") for item in files):
+            out.append(bs)
+    out.sort(key=lambda bs: bs.get("updated_at", ""), reverse=True)
+    return out
+
+
 # Defaults for everything a config.json can override. CLI flags (where they
 # exist) take priority over the config file, which takes priority over
 # these. Keep this in sync with README's config.json documentation.
@@ -351,10 +446,12 @@ async def lifespan(app: FastAPI):
         tools.append(f"pngquant: {optimizer.pngquant_path}")
     if optimizer.oxipng_path:
         tools.append(f"oxipng: {optimizer.oxipng_path}")
+    if optimizer.cjpeg_path:
+        tools.append(f"cjpeg: {optimizer.cjpeg_path}")
     if tools:
         print(f"[Startup] Detected: {', '.join(tools)}")
     else:
-        print("[Startup] pngquant/oxipng not found — place binaries in the bin/ directory")
+        print("[Startup] pngquant/oxipng/cjpeg not found — place binaries in the bin/ directory")
     sweep_task = asyncio.create_task(_sweep_stale_sessions())
     yield
     sweep_task.cancel()
@@ -419,6 +516,7 @@ _MEDIA_TYPES = {
     ".tif": "image/tiff",
     ".tiff": "image/tiff",
     ".webp": "image/webp",
+    ".avif": "image/avif",
 }
 
 
@@ -432,6 +530,35 @@ def _fmt_size(b: int) -> str:
     if b < 1024 * 1024:
         return f"{b / 1024:.1f} KB"
     return f"{b / (1024 * 1024):.2f} MB"
+
+
+def _is_valid_reusable_output(path: Path, expected_format: str) -> bool:
+    """Best-effort corruption check for a skip_existing reuse candidate.
+
+    A non-empty file isn't strong enough evidence that it's safe to reuse:
+    if pngquant/oxipng was killed mid-write on a previous run (crash, OOM
+    kill, power loss), it can leave behind a file that's non-empty but
+    truncated or structurally broken. Reusing that file would silently
+    hand the user a corrupt "optimized" image instead of recompressing it.
+
+    Uses Pillow's verify() (structural/header check, doesn't decode full
+    pixel data — cheap) and confirms the format actually matches what
+    this run expects, so e.g. a stray same-named file from a different
+    output_format never gets reused by mistake."""
+    try:
+        with Image.open(path) as img:
+            img.verify()
+            fmt = (img.format or "").upper()
+    except Exception:
+        return False
+    expected = {
+        "png": "PNG",
+        "webp": "WEBP",
+        "jpg": "JPEG",
+        "jpeg": "JPEG",
+        "avif": "AVIF",
+    }.get(expected_format, "PNG")
+    return fmt == expected
 
 
 async def _run_worker_pool(
@@ -596,8 +723,12 @@ async def health():
     return JSONResponse({
         "pngquant": optimizer.pngquant_path is not None,
         "oxipng": optimizer.oxipng_path is not None,
+        "cjpeg": optimizer.cjpeg_path is not None,
+        "avifenc": optimizer.avifenc_path is not None,
         "pngquant_path": str(optimizer.pngquant_path) if optimizer.pngquant_path else None,
         "oxipng_path": str(optimizer.oxipng_path) if optimizer.oxipng_path else None,
+        "cjpeg_path": str(optimizer.cjpeg_path) if optimizer.cjpeg_path else None,
+        "avifenc_path": str(optimizer.avifenc_path) if optimizer.avifenc_path else None,
     })
 
 
@@ -783,12 +914,12 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
             {"error": f"Invalid quality: {data.quality!r}. Supported: 'high', 'medium', 'low'."},
             status_code=400,
         )
-    if data.output_format not in ("png", "webp"):
-        # The pipeline only ever produces real PNG or WebP bytes — accepting
-        # anything else here would silently produce a file whose extension
-        # lies about its actual content.
+    if data.output_format not in ("png", "webp", "jpg", "avif"):
+        # The pipeline only ever produces real PNG, WebP, JPEG, or AVIF bytes —
+        # accepting anything else here would silently produce a file whose
+        # extension lies about its actual content.
         return JSONResponse(
-            {"error": f"Unsupported output_format: {data.output_format!r}. Supported: 'png', 'webp'."},
+            {"error": f"Unsupported output_format: {data.output_format!r}. Supported: 'png', 'webp', 'jpg', 'avif'."},
             status_code=400,
         )
     if data.compression_mode == "resize_only" and data.max_width <= 0:
@@ -802,10 +933,71 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
             status_code=400,
         )
 
-    files_to_process = state.files
-    if data.file_ids is not None:
-        ids = set(data.file_ids)
-        files_to_process = [f for f in state.files if f["id"] in ids]
+    if state.watch_running:
+        return JSONResponse({"error": "Watch mode is running, stop it first"}, status_code=400)
+
+    # --- Resume flow ---
+    # When resume=True, reconstruct state from batch_state.json. The server
+    # may have restarted, so state.files is empty — we rebuild it from the
+    # persisted batch state and only process files that weren't completed.
+    batch_state = None
+    previous_results = []
+    if data.resume:
+        if not data.output_dir:
+            return JSONResponse(
+                {"error": "Resume requires output_dir to identify which batch to resume"},
+                status_code=400,
+            )
+        # Batch state is stored per output_dir (see _batch_state_file), so
+        # this already only ever loads *this* batch — no separate mismatch
+        # check needed, and no risk of picking up an unrelated batch that
+        # happens to be saved for a different output_dir.
+        bs = _load_batch_state(data.output_dir)
+        if bs is None:
+            return JSONResponse(
+                {"error": "No resumable batch state found"},
+                status_code=400,
+            )
+        # Reconstruct state.files from batch_state (server may have restarted)
+        state.files = [
+            {"id": f.get("id", secrets.token_urlsafe(8)), "name": f["name"], "path": f["path"],
+             "size": f.get("size", 0), "thumbnail": ""}
+            for f in bs.get("files", [])
+            if Path(f["path"]).exists()
+        ]
+        if not state.files:
+            return JSONResponse(
+                {"error": "Source files no longer available for resume"},
+                status_code=400,
+            )
+        # Filter to pending/failed only
+        pending_paths = {
+            f["path"] for f in bs.get("files", [])
+            if f["status"] in ("pending", "failed")
+        }
+        files_to_process = [
+            f for f in state.files if f["path"] in pending_paths
+        ]
+        if not files_to_process:
+            return JSONResponse(
+                {"error": "No pending files to resume"},
+                status_code=400,
+            )
+        # Restore previous results for the UI (compare, progress display)
+        previous_results = bs.get("results", [])
+        batch_state = bs
+        # Create a workspace for this session (the old one is gone if the
+        # server restarted — _process_files needs one for its output dir).
+        if state.workspace is None:
+            state.new_workspace()
+        # Skip the normal file selection — resume uses its own filtered list
+        # (fall through to the validation/override checks below with
+        # files_to_process already set)
+    else:
+        files_to_process = state.files
+        if data.file_ids is not None:
+            ids = set(data.file_ids)
+            files_to_process = [f for f in state.files if f["id"] in ids]
 
     if not files_to_process:
         return JSONResponse({"error": "No files to process"}, status_code=400)
@@ -827,7 +1019,11 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
     state.logs = []
     state.cancelled = False
     state.paused = False
-    if data.retry:
+    if data.resume:
+        # Restore previous results from the batch so the UI shows the full
+        # picture (earlier successes + new ones as they complete).
+        state.results = list(previous_results)
+    elif data.retry:
         # Retry re-runs only the previously-failed files. Keep every result
         # that isn't being retried (the earlier successes and their outputs
         # on disk stay intact) and drop just the stale entries for the ids
@@ -838,16 +1034,46 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
     else:
         state.results = []
 
+    # Create batch state for normal runs with a persistent output_dir —
+    # this is what enables resume after a crash / server restart. Runs
+    # without output_dir use a temp workspace that disappears anyway, so
+    # there's nothing to resume into.
+    if not data.resume and data.output_dir:
+        batch_state = {
+            "session_id": secrets.token_urlsafe(12),
+            "input_dir": str(Path(state.files[0]["path"]).parent) if state.files else "",
+            "output_dir": data.output_dir,
+            "output_format": data.output_format,
+            "quality": data.quality,
+            "compression_mode": data.compression_mode,
+            "files": [
+                {"id": f["id"], "path": f["path"], "name": f["name"], "size": f.get("size", 0), "status": "pending"}
+                for f in files_to_process
+            ],
+            "results": [],
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        _save_batch_state(batch_state)
+
     # Surface degraded capability up front instead of only as a per-file
     # log line: PNG+standard without pngquant still runs, but silently
     # downgrades to lossless-only compression — the user should know why
-    # their files barely shrank. available_modes() is the source of truth.
+    # their files barely shrank. JPEG without cjpeg fails outright per-file,
+    # so warn before any work starts. available_modes() is the source of
+    # truth.
     warning = None
     if optimizer is not None and (data.output_format, data.compression_mode) not in optimizer.available_modes():
-        warning = (
-            "pngquant not found — Standard mode PNG output falls back to lossless-only "
-            "compression (larger files). Place pngquant in the bin/ directory for full compression."
-        )
+        if data.output_format in ("jpg", "jpeg"):
+            warning = (
+                "cjpeg (mozjpeg) not found — JPEG output isn't possible. Place cjpeg in the "
+                "bin/ directory (or PATH) to compress JPEGs while keeping the JPEG format."
+            )
+        else:
+            warning = (
+                "pngquant not found — Standard mode PNG output falls back to lossless-only "
+                "compression (larger files). Place pngquant in the bin/ directory for full compression."
+            )
         state.logs.append(f"[Warning] {warning}")
 
     asyncio.create_task(
@@ -865,6 +1091,7 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
             skip_existing=data.skip_existing,
             keep_exif=data.keep_exif,
             overrides=data.overrides,
+            batch_state=batch_state,
         )
     )
 
@@ -912,7 +1139,7 @@ def _validate_overrides(overrides: dict, selected_ids: set, top_mode: str, top_w
             return f"Invalid quality in override for file {fid!r}: {ov['quality']!r}"
         if "compression_mode" in ov and ov["compression_mode"] not in ("standard", "lossless", "resize_only"):
             return f"Invalid compression_mode in override for file {fid!r}: {ov['compression_mode']!r}"
-        if "output_format" in ov and ov["output_format"] not in ("png", "webp"):
+        if "output_format" in ov and ov["output_format"] not in ("png", "webp", "jpg", "avif"):
             return f"Invalid output_format in override for file {fid!r}: {ov['output_format']!r}"
         if "max_width" in ov and (not isinstance(ov["max_width"], int) or isinstance(ov["max_width"], bool) or ov["max_width"] < 0):
             return f"Invalid max_width in override for file {fid!r}: {ov['max_width']!r}"
@@ -948,6 +1175,7 @@ async def _process_files(
     skip_existing: bool = False,
     keep_exif: bool = False,
     overrides: Optional[dict] = None,
+    batch_state: Optional[dict] = None,
 ):
     if optimizer is None:
         state.logs.append("Optimizer not initialized")
@@ -955,6 +1183,14 @@ async def _process_files(
         return
 
     overrides = overrides or {}
+
+    # Build a path→entry lookup for batch state persistence — O(1) per file
+    # instead of scanning the whole list each time. Only populated when a
+    # batch_state was provided (resume flow).
+    _bs_lookup: dict[str, dict] = {}
+    if batch_state:
+        for _f in batch_state.get("files", []):
+            _bs_lookup[_f["path"]] = _f
 
     ws = state.workspace
     opt_output_dir = ws / "output"
@@ -1045,12 +1281,36 @@ async def _process_files(
         # Compare/preview (/api/result) and the download ZIP keep working — the
         # copy is cheap next to a re-compress. No-op without output_dir (the
         # temp workspace is wiped/empty each fresh run, nothing to reuse).
+        # _is_valid_reusable_output guards against reusing a truncated/corrupt
+        # leftover from a previous run that was interrupted mid-write — a
+        # non-empty file alone isn't proof it's complete.
+        # Staleness: reuse is only valid if the *source* hasn't changed since
+        # the existing output was produced. Same filename doesn't mean same
+        # content — e.g. a screenshot re-taken under the same name. There's no
+        # manifest recording "this output came from source hash X" (and we
+        # deliberately don't want to write sidecar files into the user's real
+        # output folder), so this uses the same mtime-newer-than-target check
+        # every incremental build tool uses (make, rsync -u, ...): if the
+        # source's mtime is more recent than the existing output's, treat it
+        # as changed and recompress instead of reusing. For the upload flow
+        # specifically, input_path is a fresh workspace-local copy made at
+        # upload time, so its mtime is always "now" — re-uploading an
+        # unchanged file will (safely, if unnecessarily) recompress rather
+        # than reuse; that's the conservative direction to fail in.
         # Note: a skipped file is NOT recompressed, so per-file overrides are
         # intentionally ignored on the skip path (the existing output stands).
         if skip_existing and output_dir:
             rel = out_path.relative_to(opt_output_dir)
             dest = Path(output_dir) / rel
-            if dest.exists() and dest.stat().st_size > 0:
+            source_unchanged = (
+                input_path.exists() and dest.exists()
+                and input_path.stat().st_mtime <= dest.stat().st_mtime
+            )
+            if (
+                source_unchanged
+                and dest.stat().st_size > 0
+                and _is_valid_reusable_output(dest, eff_output_format)
+            ):
                 shutil.copy2(dest, out_path)
                 orig_size = input_path.stat().st_size if input_path.exists() else 0
                 comp_size = dest.stat().st_size
@@ -1070,6 +1330,11 @@ async def _process_files(
                 }
                 state.logs.append(f"  SKIP {file_info['name']} (already optimized)")
                 state.results.append(skipped_result)
+                # Persist to batch state — a skipped file is "done"
+                if file_info["path"] in _bs_lookup:
+                    _bs_lookup[file_info["path"]]["status"] = "done"
+                    batch_state.setdefault("results", []).append(skipped_result)
+                    _save_batch_state(batch_state)
                 return
 
         state.logs.append(f"Processing: {file_info['name']}")
@@ -1128,6 +1393,15 @@ async def _process_files(
         # have no `await` between them, so no other worker interleaves).
         state.results.append(result)
 
+        # Persist per-file status to batch_state.json — this is what lets
+        # a crashed / restarted server pick up where it left off. Written
+        # inside process_one (not on_item_done) because the result dict
+        # with success/failure lives here; on_item_done only bumps the counter.
+        if file_info["path"] in _bs_lookup:
+            _bs_lookup[file_info["path"]]["status"] = "done" if result.get("success") else "failed"
+            batch_state.setdefault("results", []).append(result)
+            _save_batch_state(batch_state)
+
     def on_item_error(file_info, e):
         # Anything process_one doesn't already catch internally (optimize_png
         # has its own try/except, but e.g. mkdir permission errors or a
@@ -1144,6 +1418,10 @@ async def _process_files(
             "original_size": 0,
             "compressed_size": 0,
         })
+        # Persist failure to batch state so resume picks it up
+        if file_info.get("path") in _bs_lookup:
+            _bs_lookup[file_info["path"]]["status"] = "failed"
+            _save_batch_state(batch_state)
 
     def on_item_done(_file_info):
         state.current += 1
@@ -1182,6 +1460,13 @@ async def _process_files(
         )
         if output_dir:
             state.logs.append(f"  Output saved to: {Path(output_dir).resolve()}")
+        # Batch state: clear only when every file is done (no resume needed).
+        # If some are still pending/failed (cancel, crash, partial failure),
+        # leave the file on disk so the frontend can offer a Resume button.
+        if batch_state:
+            remaining = [f for f in batch_state.get("files", []) if f["status"] in ("pending", "failed")]
+            if not remaining and batch_state.get("output_dir"):
+                _clear_batch_state(batch_state["output_dir"])
 
 
 @app.get("/api/progress")
@@ -1260,7 +1545,24 @@ async def events(request: Request, state: AppState = Depends(get_session)):
     async def event_stream():
         nonlocal r_cur, l_cur
         last_emit = time.time()
+        # A pause/resume can happen with no new results/logs to piggyback
+        # on (the whole point of "soft pause" is new work stops getting
+        # scheduled), so paused-state changes get their own event rather
+        # than waiting for the next result/log — otherwise a client has no
+        # way to learn about it until the run's `done` event, which for a
+        # long pause could be a very long wait.
+        last_paused_sent = state.paused
+        yield _sse_format("status", {
+            "paused": state.paused, "current": state.current, "total": state.total,
+        }, f"r{r_cur}:l{l_cur}")
         while True:
+            if state.paused != last_paused_sent:
+                last_paused_sent = state.paused
+                yield _sse_format("status", {
+                    "paused": state.paused, "current": state.current, "total": state.total,
+                }, f"r{r_cur}:l{l_cur}")
+                last_emit = time.time()
+
             # Emit any new results since the cursor.
             for res in state.results[r_cur:]:
                 r_cur += 1
@@ -1298,6 +1600,17 @@ async def events(request: Request, state: AppState = Depends(get_session)):
             if time.time() - last_emit > 5:
                 yield ": keepalive\n\n"
                 last_emit = time.time()
+
+            # Detect a client that's gone away (tab closed, navigated off,
+            # network drop) explicitly rather than relying solely on the
+            # ASGI layer to raise GeneratorExit into us on the next yield —
+            # that's the common case, but this loop spends most of its time
+            # in asyncio.sleep() rather than yielding, so a disconnect could
+            # otherwise go unnoticed for a while and leave the generator
+            # (and its reference to `state`) alive longer than it should be.
+            if await request.is_disconnected():
+                return
+
             await asyncio.sleep(0.1)
 
     return StreamingResponse(
@@ -1359,9 +1672,9 @@ async def preview_optimize(data: PreviewRequest, state: AppState = Depends(get_s
             {"error": f"Invalid quality: {data.quality!r}. Supported: 'high', 'medium', 'low'."},
             status_code=400,
         )
-    if data.output_format not in ("png", "webp"):
+    if data.output_format not in ("png", "webp", "jpg", "avif"):
         return JSONResponse(
-            {"error": f"Unsupported output_format: {data.output_format!r}. Supported: 'png', 'webp'."},
+            {"error": f"Unsupported output_format: {data.output_format!r}. Supported: 'png', 'webp', 'jpg', 'avif'."},
             status_code=400,
         )
     if data.compression_mode == "resize_only" and data.max_width <= 0:
@@ -1752,6 +2065,164 @@ async def get_state(state: AppState = Depends(get_session)):
     })
 
 
+@app.get("/api/batch-state")
+async def get_batch_state(output_dir: Optional[str] = None, state: AppState = Depends(get_session)):
+    """Return whether there's an unfinished batch that can be resumed.
+    Called on page load so the frontend can show a 'Resume?' prompt.
+
+    Batch state is stored one file per output_dir (see _batch_state_file),
+    so this never mixes results from an unrelated batch:
+    - output_dir given: report on that specific batch only.
+    - output_dir omitted (the page-load case, before the user has picked a
+      folder): report the most recently updated batch that still has
+      pending/failed files, out of everything currently on disk. Every
+      candidate here is a real, currently-unfinished batch — finishing an
+      unrelated batch elsewhere can no longer make this list wrong, since
+      that batch's own file is the only one touched when it completes.
+    """
+    if output_dir:
+        bs = _load_batch_state(output_dir)
+    else:
+        candidates = _list_unfinished_batch_states()
+        bs = candidates[0] if candidates else None
+    if bs is None:
+        return JSONResponse({"has_batch": False})
+    total = len(bs.get("files", []))
+    done = sum(1 for f in bs.get("files", []) if f["status"] == "done")
+    failed = sum(1 for f in bs.get("files", []) if f["status"] == "failed")
+    pending = total - done - failed
+    return JSONResponse({
+        "has_batch": True,
+        "total": total,
+        "done": done,
+        "failed": failed,
+        "pending": pending,
+        "output_dir": bs.get("output_dir", ""),
+        "output_format": bs.get("output_format", "png"),
+        "quality": bs.get("quality", "medium"),
+        "compression_mode": bs.get("compression_mode", "standard"),
+        "created_at": bs.get("created_at", ""),
+    })
+
+
+# Keys that require a server restart to take effect. Changing them via
+# PUT /api/settings succeeds (the new value is persisted to config.json)
+# but the response flags requires_restart so the UI can tell the user.
+_RESTART_REQUIRED_KEYS = {"host", "port", "concurrent_workers", "thumbnail_workers"}
+
+
+@app.get("/api/settings")
+async def get_settings():
+    """Return the current config (merged with defaults) for the settings panel."""
+    cfg = _load_app_config()
+    return JSONResponse({
+        "settings": cfg,
+        "defaults": dict(DEFAULT_CONFIG),
+    })
+
+
+@app.put("/api/settings")
+async def put_settings(
+    body: Request,
+    _auth: None = Depends(require_token),
+):
+    """Accept a partial or full config update, validate, and persist to config.json.
+    Returns which keys require a restart to take effect."""
+    try:
+        data = await body.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    if not isinstance(data, dict):
+        return JSONResponse({"error": "Request body must be a JSON object"}, status_code=400)
+
+    # Load current config as the base, then overlay the submitted changes
+    cfg = _load_app_config()
+    requires_restart = []
+
+    for key, value in data.items():
+        if key not in DEFAULT_CONFIG:
+            return JSONResponse(
+                {"error": f"Unknown setting: {key!r}. Known: {list(DEFAULT_CONFIG.keys())}"},
+                status_code=400,
+            )
+        # Type/value validation per key
+        if key == "port":
+            try:
+                port = int(value)
+                if not (1 <= port <= 65535):
+                    raise ValueError()
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"error": f"Invalid port: {value!r}. Must be an integer 1-65535."},
+                    status_code=400,
+                )
+            cfg["port"] = port
+        elif key in ("concurrent_workers", "thumbnail_workers"):
+            try:
+                n = int(value)
+                if n < 1:
+                    raise ValueError()
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"error": f"Invalid {key}: {value!r}. Must be a positive integer."},
+                    status_code=400,
+                )
+            cfg[key] = n
+        elif key == "workspace_cleanup_delay":
+            try:
+                d = float(value)
+                if d < 0:
+                    raise ValueError()
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"error": f"Invalid {key}: {value!r}. Must be a non-negative number."},
+                    status_code=400,
+                )
+            cfg[key] = d
+        elif key == "session_idle_timeout_hours":
+            try:
+                h = float(value)
+                if h < 0:
+                    raise ValueError()
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"error": f"Invalid {key}: {value!r}. Must be a non-negative number."},
+                    status_code=400,
+                )
+            cfg[key] = h
+        elif key == "host":
+            if not isinstance(value, str) or not value.strip():
+                return JSONResponse(
+                    {"error": f"Invalid host: {value!r}. Must be a non-empty string."},
+                    status_code=400,
+                )
+            cfg[key] = value.strip()
+        else:
+            cfg[key] = value
+
+        if key in _RESTART_REQUIRED_KEYS:
+            requires_restart.append(key)
+
+    # Persist to config.json
+    try:
+        _config_file().write_text(
+            json.dumps(cfg, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError as e:
+        return JSONResponse(
+            {"error": f"Failed to write config.json: {e}"},
+            status_code=500,
+        )
+
+    return JSONResponse({
+        "ok": True,
+        "settings": cfg,
+        "requires_restart": requires_restart,
+    })
+
+
 @app.post("/api/reset")
 async def reset_session(state: AppState = Depends(get_session), _auth: None = Depends(require_token)):
     """Clear this session's server-side state (the UI Reset button used to
@@ -1767,6 +2238,282 @@ async def reset_session(state: AppState = Depends(get_session), _auth: None = De
         state.workspace = None
     state.reset()
     return JSONResponse({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Watch mode
+# ---------------------------------------------------------------------------
+
+def _watch_output_conflicts_with_input(directory: Path, output_dir: Path, recursive: bool) -> bool:
+    """True if writing optimized output into output_dir would land back
+    inside the tree Watch mode is scanning — which would make the watcher
+    detect its own output as a new/changed file and reprocess it forever
+    (empirically confirmed: a single dropped-in file gets re-picked-up on
+    every poll interval indefinitely once this happens, silently burning
+    CPU and rewriting the file over and over — see CHANGELOG).
+
+    - output_dir == directory: always a conflict, no matter recursive —
+      the top level is always scanned.
+    - output_dir inside directory, recursive=True: a conflict — the
+      recursive walk would descend into it too.
+    - output_dir inside directory, recursive=False: fine — a non-recursive
+      scan only lists directory's immediate children, so a nested output
+      folder's contents are never re-scanned.
+    """
+    d = directory.resolve()
+    o = output_dir.resolve()
+    if o == d:
+        return True
+    if recursive:
+        try:
+            o.relative_to(d)
+            return True
+        except ValueError:
+            return False
+    return False
+
+
+async def _watch_loop(state: AppState, req: WatchRequest):
+    """Background task for Watch mode — monitors a directory and auto-
+    optimizes every new/changed image using the same compression pipeline
+    as the batch optimizer. Each file is independent: an error on one
+    doesn't stop the rest (logged to state.watch_errors instead)."""
+    if optimizer is None:
+        state.watch_logs.append("[Error] Optimizer not initialized")
+        state.watch_running = False
+        return
+
+    directory = Path(req.directory)
+    output_dir = Path(req.output_dir) if req.output_dir else None
+
+    quality_map = {"high": 85, "medium": 75, "low": 60}
+    used_names: set[str] = set()
+
+    async def on_change(rel_path: str, abs_path: Path):
+        if optimizer is None:
+            return
+        try:
+            if output_dir:
+                out_path = output_dir / Path(rel_path).with_suffix(f".{req.output_format}")
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                # Collision guard: same filename from different subdirs
+                key = str(out_path).lower()
+                if key in used_names:
+                    n = 2
+                    while key in used_names:
+                        out_path = output_dir / Path(rel_path).with_name(
+                            f"{Path(rel_path).stem}_{n}.{req.output_format}"
+                        )
+                        key = str(out_path).lower()
+                        n += 1
+                used_names.add(key)
+            else:
+                return
+
+            state.watch_logs.append(f"Detected: {rel_path}")
+
+            q = quality_map.get(req.quality, 75)
+            if req.compression_mode in ("lossless", "resize_only"):
+                q = 95
+
+            result = await optimizer.optimize_png(
+                input_path=abs_path,
+                output_path=out_path,
+                quality=req.quality,
+                max_width=req.max_width,
+                compression_mode=req.compression_mode,
+                protected_colors=req.protected_colors,
+                dithering=req.dithering,
+                output_format=req.output_format,
+                keep_exif=req.keep_exif,
+            )
+
+            state.watch_processed += 1
+            if result.get("success"):
+                savings = result["original_size"] - result["compressed_size"]
+                pct = round(savings / result["original_size"] * 100, 1) if result["original_size"] > 0 else 0
+                state.watch_logs.append(
+                    f"  OK {rel_path}: {_fmt_size(result['original_size'])} -> "
+                    f"{_fmt_size(result['compressed_size'])} (saved {pct}%)"
+                )
+            else:
+                state.watch_errors += 1
+                state.watch_logs.append(f"  FAIL {rel_path}: {result.get('error', 'unknown')}")
+        except Exception as e:
+            state.watch_errors += 1
+            state.watch_logs.append(f"  ERROR {rel_path}: {e}")
+
+    watcher = FolderWatcher(
+        directory=directory,
+        recursive=req.recursive,
+        process_existing=req.process_existing,
+        on_change=on_change,
+    )
+    state.watch_watcher = watcher
+    try:
+        await watcher.run()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        state.watch_running = False
+        state.watch_logs.append("Watch mode stopped")
+
+
+@app.post("/api/watch/start")
+async def watch_start(
+    data: WatchRequest,
+    state: AppState = Depends(get_session),
+    _auth: None = Depends(require_token),
+):
+    """Start watching a directory for image changes and auto-optimize
+    every new/changed file into output_dir. Uses the same compression
+    pipeline as the batch optimizer. Watch and batch-optimize are
+    mutually exclusive per session — both write files and mutate
+    overlapping state, so running them concurrently would be unsafe."""
+    if optimizer is None:
+        return JSONResponse({"error": "Optimizer not initialized"}, status_code=503)
+    if state.is_running:
+        return JSONResponse({"error": "Optimization in progress, please wait"}, status_code=400)
+    if state.scan_running:
+        return JSONResponse({"error": "A scan is in progress, please wait"}, status_code=400)
+    if state.watch_running:
+        return JSONResponse({"error": "Watch mode is already running"}, status_code=400)
+
+    directory = Path(data.directory)
+    if not directory.exists() or not directory.is_dir():
+        return JSONResponse({"error": "Directory does not exist"}, status_code=400)
+    if data.output_dir:
+        od = Path(data.output_dir)
+        if not od.exists():
+            return JSONResponse({"error": "Output directory does not exist"}, status_code=400)
+        if _watch_output_conflicts_with_input(directory, od, data.recursive):
+            return JSONResponse({
+                "error": (
+                    "output_dir can't be the watched directory itself, or a "
+                    "subfolder of it while watching recursively — writing "
+                    "optimized output back into the watched tree makes Watch "
+                    "mode detect its own output as a new/changed file and "
+                    "reprocess it forever. Pick an output folder outside "
+                    "the watched directory (or turn off recursive watching "
+                    "if the output folder must live inside it)."
+                ),
+            }, status_code=400)
+
+    if data.compression_mode not in ("standard", "lossless", "resize_only"):
+        return JSONResponse({"error": "Invalid compression_mode"}, status_code=400)
+    if data.quality not in ("high", "medium", "low"):
+        return JSONResponse({"error": f"Invalid quality: {data.quality!r}"}, status_code=400)
+
+    warning = None
+    if (data.output_format, data.compression_mode) not in optimizer.available_modes():
+        warning = (
+            f"Format {data.output_format!r} in {data.compression_mode} mode isn't available — "
+            f"output may fail. Check the health indicator for missing binaries."
+        )
+
+    state.watch_running = True
+    state.watch_dir = str(directory.resolve())
+    state.watch_output_dir = data.output_dir or ""
+    state.watch_processed = 0
+    state.watch_errors = 0
+    state.watch_logs = []
+    state.watch_task = asyncio.create_task(_watch_loop(state, data))
+
+    return JSONResponse({
+        "ok": True,
+        "watch_running": True,
+        "watch_dir": state.watch_dir,
+        "warning": warning,
+    })
+
+
+@app.post("/api/watch/stop")
+async def watch_stop(
+    state: AppState = Depends(get_session),
+    _auth: None = Depends(require_token),
+):
+    """Stop watch mode. Cooperative: the watcher finishes its current
+    poll sleep, then exits. Already-queued file events are lost (watch
+    is meant to be persistent, not transactional)."""
+    if not state.watch_running:
+        return JSONResponse({"error": "Watch mode is not running"}, status_code=400)
+    if state.watch_watcher:
+        state.watch_watcher.stop()
+    if state.watch_task:
+        state.watch_task.cancel()
+        try:
+            await state.watch_task
+        except asyncio.CancelledError:
+            pass
+    state.watch_running = False
+    state.watch_watcher = None
+    state.watch_task = None
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/watch/status")
+async def watch_status(state: AppState = Depends(get_session)):
+    return JSONResponse({
+        "running": state.watch_running,
+        "dir": state.watch_dir,
+        "output_dir": state.watch_output_dir,
+        "processed": state.watch_processed,
+        "errors": state.watch_errors,
+        "logs": state.watch_logs,
+    })
+
+
+@app.get("/api/watch/events")
+async def watch_events(request: Request, state: AppState = Depends(get_session)):
+    """SSE transport for watch mode — mirrors the batch /api/events
+    pattern. Emits `watch_result` (one per processed file), `watch_log`
+    (status messages), and `watch_status` (periodic counters). A client
+    that drops and reconnects gets the full current state via the first
+    `watch_status` event, then incremental updates from there."""
+    log_cursor = 0
+
+    async def event_stream():
+        nonlocal log_cursor
+        last_emit = time.time()
+
+        yield _sse_format("watch_status", {
+            "running": state.watch_running,
+            "processed": state.watch_processed,
+            "errors": state.watch_errors,
+        }, None)
+
+        while True:
+            for line in state.watch_logs[log_cursor:]:
+                log_cursor += 1
+                yield _sse_format("watch_log", {"line": line}, None)
+                last_emit = time.time()
+
+            if not state.watch_running:
+                await asyncio.sleep(0.05)
+                for line in state.watch_logs[log_cursor:]:
+                    log_cursor += 1
+                    yield _sse_format("watch_log", {"line": line}, None)
+                yield _sse_format("watch_status", {
+                    "running": False,
+                    "processed": state.watch_processed,
+                    "errors": state.watch_errors,
+                }, None)
+                return
+
+            if await request.is_disconnected():
+                return
+
+            if time.time() - last_emit > 5:
+                yield ": keepalive\n\n"
+                last_emit = time.time()
+
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
 
 
 def main():
