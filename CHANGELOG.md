@@ -84,6 +84,15 @@ All notable changes to this project will be documented in this file.
   if Output path is empty (e.g. the main panel is using the temp-folder
   default), a notice explains that Watch Mode needs a real persistent
   output folder and doesn't have a temp-folder mode of its own.
+- **"Reveal in File Explorer" on results** (`POST /api/reveal`). When a
+  run has a persistent `output_dir` (not the temp workspace), each
+  successful result card gets a Reveal button that opens the OS file
+  explorer with that file selected (`explorer /select,` on Windows,
+  `open -R` on macOS, `xdg-open` on the containing folder on Linux),
+  instead of the user hunting for the output folder themselves. Scoped
+  for safety: the endpoint only opens a path that's actually one of the
+  current session's own recorded output files — not an arbitrary
+  client-supplied path.
 - **AVIF output** (`output_format: "avif"`). Selecting AVIF encodes through
   `avifenc` (auto-detected in `bin/` or PATH; without it the `(avif, *)`
   modes drop out of `available_modes()` and the UI warns up front).

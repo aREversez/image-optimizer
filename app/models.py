@@ -99,6 +99,13 @@ class RecentClearRequest(BaseModel):
     key: str
 
 
+class RevealRequest(BaseModel):
+    """Open the OS file explorer with a specific output file selected.
+    path must be one of the current session's own recorded
+    final_output_path values — see /api/reveal for why."""
+    path: str
+
+
 class PreviewRequest(BaseModel):
     """Single-file pre-compression dry run. Carries the same compression
     parameters as OptimizeRequest for one file, but no batch/output

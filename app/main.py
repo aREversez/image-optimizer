@@ -7,6 +7,7 @@ import os
 import secrets
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import time
@@ -22,7 +23,7 @@ from PIL import Image
 if __package__ is None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.models import OptimizeRequest, PreviewRequest, RecentClearRequest, RecentRemoveRequest, ScanRequest, WatchRequest
+from app.models import OptimizeRequest, PreviewRequest, RecentClearRequest, RecentRemoveRequest, RevealRequest, ScanRequest, WatchRequest
 from app.optimizer import HEX_COLOR_RE, Optimizer
 from app.watcher import FolderWatcher
 
@@ -1327,6 +1328,13 @@ async def _process_files(
                     "compressed_size": comp_size,
                     "savings": savings,
                     "savings_percent": round(savings / orig_size * 100, 1) if orig_size > 0 else 0,
+                    # Absolute path to the actual file on disk, so the
+                    # frontend can offer "Reveal in File Explorer" — only
+                    # meaningful when output_dir is a real, persistent
+                    # folder (this whole branch is gated on output_dir
+                    # being set, so dest is always a real path here, not a
+                    # temp workspace file that disappears after cleanup).
+                    "final_output_path": str(dest),
                 }
                 state.logs.append(f"  SKIP {file_info['name']} (already optimized)")
                 state.results.append(skipped_result)
@@ -1382,6 +1390,11 @@ async def _process_files(
                     dest = user_output / rel
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(out_path, dest)
+                    # Same reasoning as the skip_existing branch above:
+                    # only set when there's a real, persistent file on
+                    # disk to reveal (nothing to show when output_dir is
+                    # empty and results live only in the temp workspace).
+                    result["final_output_path"] = str(dest)
                 except Exception as e:
                     state.logs.append(f"  Output copy failed: {e}")
         else:
@@ -2051,6 +2064,48 @@ async def browse_folder(title: str = "Select Folder", _auth: None = Depends(requ
         return JSONResponse({"path": path or ""})
     except Exception as e:
         return JSONResponse({"path": "", "error": str(e)})
+
+
+@app.post("/api/reveal")
+async def reveal_in_explorer(
+    data: RevealRequest, state: AppState = Depends(get_session), _auth: None = Depends(require_token)
+):
+    """Open the OS file explorer with an optimized output file selected.
+
+    data.path must exactly match one of *this session's* recorded
+    final_output_path values (set on results only when a persistent
+    output_dir was used — see process_one). Without that check, this
+    endpoint would be an arbitrary "launch explorer at any path on disk"
+    oracle driven entirely by client-supplied input; requiring it to be a
+    path this app itself just wrote, for this session, keeps it scoped to
+    "reveal something you just compressed" and nothing else.
+    """
+    requested = str(Path(data.path))
+    if not any(r.get("final_output_path") == requested for r in state.results):
+        return JSONResponse({"error": "Not a known output file for this session"}, status_code=400)
+
+    path = Path(requested)
+    if not path.exists():
+        return JSONResponse({"error": "File no longer exists on disk"}, status_code=404)
+
+    try:
+        if sys.platform == "win32":
+            # /select, (comma, no space) + the path as one argument is
+            # explorer.exe's documented syntax for "open the containing
+            # folder with this file highlighted". explorer.exe routinely
+            # returns a non-zero exit code even on success, so this is
+            # fire-and-forget rather than awaited/checked.
+            subprocess.Popen(["explorer", f"/select,{path}"])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", str(path)])
+        else:
+            # No cross-desktop-environment equivalent of "select this file"
+            # on Linux — best effort is opening its containing folder.
+            subprocess.Popen(["xdg-open", str(path.parent)])
+    except OSError as e:
+        return JSONResponse({"error": f"Could not open file explorer: {e}"}, status_code=500)
+
+    return JSONResponse({"success": True})
 
 
 @app.get("/api/state")

@@ -330,6 +330,12 @@ header h1 span { color: var(--accent); }
   border-radius: 4px; cursor: pointer; text-decoration: none; transition: all .2s;
 }
 .result-card .compare-btn:hover { background: var(--border); }
+.result-card .reveal-btn {
+  display: inline-block; margin-top: 6px; margin-left: 6px; padding: 4px 12px; font-size: 11px;
+  background: var(--surface2); color: var(--text2); border: 1px solid var(--border);
+  border-radius: 4px; cursor: pointer; text-decoration: none; transition: all .2s;
+}
+.result-card .reveal-btn:hover { background: var(--border); color: var(--accent); }
 
 /* Sections visibility */
 .section { display: none; }
@@ -1714,12 +1720,18 @@ function renderResultGrid() {
     const savedLine = r.skipped
       ? `<div class="rsaved">Skipped (already optimized)</div>`
       : `<div class="rsaved">Saved ${r.savings_percent}%</div>`;
+    // Only set when this run had a real persistent output_dir (not the
+    // temp workspace) — see final_output_path in process_one.
+    const revealBtn = r.final_output_path
+      ? `<a class="reveal-btn" href="#" data-reveal-path="${escHtml(r.final_output_path)}">Reveal</a>`
+      : '';
     html += `
       <div class="result-card">
         <div class="rname" title="${escHtml(r.name)}">${escHtml(r.name)}</div>
         <div class="rstats">${fmtSize(r.original_size)} → ${fmtSize(r.compressed_size)}</div>
         ${savedLine}
         <a class="compare-btn" href="${previewUrl}" target="_blank">Compare</a>
+        ${revealBtn}
       </div>`;
   }
   resultGrid.innerHTML = html;
@@ -1727,6 +1739,23 @@ function renderResultGrid() {
   const total = STATE.results.length, shown = rows.length;
   resultCountEl.textContent = shown === total ? `${total} file(s)` : `${shown} of ${total} shown`;
 }
+
+resultGrid.addEventListener('click', async (e) => {
+  const btn = e.target.closest('[data-reveal-path]');
+  if (!btn) return;
+  e.preventDefault();
+  try {
+    const r = await apiFetch('/api/reveal', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: btn.dataset.revealPath }),
+    });
+    const d = await r.json();
+    if (d.error) showNotice(d.error, 'err');
+  } catch (err) {
+    showNotice('Could not open file explorer: ' + err.message, 'err');
+  }
+});
 
 resultSortSel.addEventListener('change', () => { STATE.resultSort = resultSortSel.value; renderResultGrid(); });
 resultFilterSel.addEventListener('change', () => { STATE.resultFilter = resultFilterSel.value; renderResultGrid(); });
