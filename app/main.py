@@ -2288,8 +2288,15 @@ async def _watch_loop(state: AppState, req: WatchRequest):
 
     quality_map = {"high": 85, "medium": 75, "low": 60}
     used_names: set[str] = set()
+    # rel_path -> the output file actually written for it, so a detected
+    # rename can find and remove the *old* name's output. A plain set
+    # (used_names) only tells us a filename is taken, not which source it
+    # came from, and the collision guard can shift the actual filename
+    # away from the naive with_suffix() guess (e.g. "_2.png") — this dict
+    # tracks the real path so cleanup targets the right file.
+    output_path_for: dict[str, Path] = {}
 
-    async def on_change(rel_path: str, abs_path: Path):
+    async def on_change(rel_path: str, abs_path: Path, renamed_from: Optional[str] = None):
         if optimizer is None:
             return
         try:
@@ -2309,6 +2316,31 @@ async def _watch_loop(state: AppState, req: WatchRequest):
                 used_names.add(key)
             else:
                 return
+
+            # Rename cleanup: FolderWatcher only sets renamed_from when a
+            # path vanished and this one appeared in the very same scan
+            # with an identical (mtime, size) — a same-content rename, not
+            # an unrelated delete. Remove the old name's output now that a
+            # fresh one is about to be written for the new name, so the
+            # stale copy doesn't sit around forever. A file that's simply
+            # deleted (renamed_from is None for everyone, always) never
+            # reaches this branch — its output is left untouched, since
+            # plenty of people delete the original and keep only the
+            # compressed result.
+            if renamed_from is not None:
+                old_output = output_path_for.pop(renamed_from, None)
+                if old_output is not None and old_output != out_path:
+                    try:
+                        if old_output.exists():
+                            old_output.unlink()
+                        used_names.discard(str(old_output).lower())
+                        state.watch_logs.append(
+                            f"  Renamed: {renamed_from} -> {rel_path} (removed old output {old_output.name})"
+                        )
+                    except OSError as e:
+                        state.watch_logs.append(
+                            f"  WARN: couldn't remove old output for renamed file {renamed_from!r}: {e}"
+                        )
 
             state.watch_logs.append(f"Detected: {rel_path}")
 
@@ -2330,6 +2362,7 @@ async def _watch_loop(state: AppState, req: WatchRequest):
 
             state.watch_processed += 1
             if result.get("success"):
+                output_path_for[rel_path] = out_path
                 savings = result["original_size"] - result["compressed_size"]
                 pct = round(savings / result["original_size"] * 100, 1) if result["original_size"] > 0 else 0
                 state.watch_logs.append(

@@ -5,7 +5,34 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
-- **AVIF output never actually worked.** Verified against the real
+- **Watch mode's settings were silently frozen at "Start Watching" time,
+  with no UI indication.** Watch Mode reuses the same shared Quality /
+  Output Format / Compression Mode / Max Width / Protect Colors /
+  Dithering / Keep EXIF controls as batch optimize, and those stayed
+  fully interactive while a watch was running — changing them looked
+  like it should apply, but `_watch_loop` captures the request once at
+  start and never re-reads live UI state. The freeze-at-start behavior
+  itself is reasonable (re-reading settings mid-run risks a file being
+  processed under a half-changed config), so it's kept; the fix is
+  purely making the UI honest about it: those controls are now disabled
+  and a notice explains they're locked until Watch Mode is stopped and
+  restarted.
+- **Renaming a file being watched reprocessed it under the new name and
+  left the old output behind as an orphan**, since change detection is
+  purely path+mtime+size — a rename looks identical to "new file
+  appeared." Rather than switching to content hashing (a broader, slower
+  change this project has consistently avoided elsewhere — see
+  `skip_existing`'s mtime-based staleness check), `FolderWatcher` now
+  detects same-cycle renames specifically: if a path disappears and a
+  different path appears in the very same poll with an identical
+  (mtime, size), that's reported as a rename (`renamed_from`) rather
+  than an unrelated new file. `_watch_loop` uses this to delete the old
+  output once the new one is written — cleanup only ever fires on a
+  confirmed rename. A file that's simply deleted (nothing reappearing to
+  match it) is deliberately left alone with no cleanup at all: plenty of
+  people delete the original after keeping the compressed output, and a
+  lone disappearance must never be allowed to delete anything.
+
   libavif CLI (avifenc v1.3.0): (1) the intermediate file was written as
   `.src.ppm`, but avifenc only recognizes `input.[jpg|jpeg|png|y4m]` — PPM
   is rejected outright ("Unrecognized file format"), so every single AVIF

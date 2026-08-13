@@ -496,6 +496,9 @@ header h1 span { color: var(--accent); }
   <!-- Config + Action -->
   <div class="card" id="config-section">
     <div class="card-title">Settings</div>
+    <div id="watch-lock-notice" style="display:none;font-size:12px;color:var(--yellow);background:rgba(230,180,60,0.1);border:1px solid rgba(230,180,60,0.3);border-radius:6px;padding:8px 10px;margin-bottom:12px">
+      Locked while Watch Mode is running — it captured these settings when you clicked "Start Watching" and won't pick up changes. Stop Watch Mode to change them, then start again.
+    </div>
     <div class="config-grid" style="margin-bottom:16px">
       <div class="config-group">
         <label title="Controls how much color detail Standard mode is allowed to sacrifice for size. For UI screenshots with text, High usually costs little extra size since screenshots rarely use many colors to begin with.">Quality</label>
@@ -1928,6 +1931,31 @@ async function pollWatchStatus() {
   } catch(e) { /* ignore */ }
 }
 
+// Shared Settings controls (quality/format/mode/max-width/protect-colors/
+// dithering/keep-exif) double as Watch Mode's config — startWatch() reads
+// them once at click time and the backend freezes them for the life of
+// that watch run (see _watch_loop). Nothing here re-reads them, so leaving
+// these interactive while Watch Mode is running would silently mislead
+// anyone who changes format/quality mid-watch expecting it to take effect.
+// Lock them visibly instead, and restore the normal mode-dependent
+// disabled state (via updateModeDependentControls) once Watch Mode stops.
+function applyWatchLock(locked) {
+  const notice = $('watch-lock-notice');
+  notice.style.display = locked ? '' : 'none';
+  const inputs = [
+    ...document.querySelectorAll('input[name="quality"]'),
+    ...document.querySelectorAll('input[name="format"]'),
+    ...document.querySelectorAll('input[name="mode"]'),
+    $('max-width'), $('protect-colors'), $('dithering'), $('keep-exif'),
+  ];
+  if (locked) {
+    inputs.forEach(el => { el.disabled = true; });
+  } else {
+    inputs.forEach(el => { el.disabled = false; });
+    updateModeDependentControls(); // reapply the fine-grained mode/format rules
+  }
+}
+
 function updateWatchUI() {
   if (STATE.watchRunning) {
     watchStartBtn.style.display = 'none';
@@ -1940,6 +1968,7 @@ function updateWatchUI() {
     watchStatusEl.textContent = 'Idle';
     watchLogBox.style.display = 'none';
   }
+  applyWatchLock(STATE.watchRunning);
   watchStatsEl.textContent = STATE.watchProcessed || STATE.watchErrors
     ? `Processed: ${STATE.watchProcessed} | Errors: ${STATE.watchErrors}`
     : '';
