@@ -585,6 +585,9 @@ header h1 span { color: var(--accent); }
       Monitor a folder and auto-optimize new or changed images as they appear.
     </div>
     <div class="input-row" style="margin-bottom:8px">
+      <button class="btn btn-secondary" id="watch-use-current-paths-btn" style="white-space:nowrap">Use Select Images / Output paths</button>
+    </div>
+    <div class="input-row" style="margin-bottom:8px">
       <input type="text" id="watch-dir" placeholder="Watch directory" style="flex:1" />
       <button class="btn btn-secondary" id="watch-browse-dir-btn" style="white-space:nowrap">Browse...</button>
     </div>
@@ -1988,6 +1991,20 @@ function renderWatchLog() {
 
 watchStartBtn.addEventListener('click', startWatch);
 watchStopBtn.addEventListener('click', stopWatch);
+$('watch-use-current-paths-btn').addEventListener('click', () => {
+  const src = dirPath.value.trim();
+  const out = outputDir.value.trim();
+  if (!src && !out) {
+    showNotice('Select Images and Output paths are both empty — set them above first.', 'err');
+    return;
+  }
+  if (src) watchDir.value = src;
+  if (out) {
+    watchOutputDir.value = out;
+  } else {
+    showNotice('Copied the folder to watch, but Output path is empty there too — Watch Mode needs an output folder (no temp-folder option), so set one before starting.', 'err');
+  }
+});
 $('watch-browse-dir-btn').addEventListener('click', async () => {
   const path = await pickFolder();
   if (path) watchDir.value = path;

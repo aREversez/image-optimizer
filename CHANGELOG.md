@@ -77,6 +77,13 @@ All notable changes to this project will be documented in this file.
   identifies which saved batch to resume.
 
 ### Added
+- **Watch Mode: "Use Select Images / Output paths" button.** Watch Mode
+  previously required re-picking or re-typing both folder paths even when
+  they were the exact same ones already set up in the main Select
+  Images / Output panels. One click now copies the current values across;
+  if Output path is empty (e.g. the main panel is using the temp-folder
+  default), a notice explains that Watch Mode needs a real persistent
+  output folder and doesn't have a temp-folder mode of its own.
 - **AVIF output** (`output_format: "avif"`). Selecting AVIF encodes through
   `avifenc` (auto-detected in `bin/` or PATH; without it the `(avif, *)`
   modes drop out of `available_modes()` and the UI warns up front).
