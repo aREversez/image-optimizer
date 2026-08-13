@@ -17,7 +17,11 @@ OUT = ROOT / "dist"
 
 PYINSTALLER_ARGS = [
     sys.executable, "-m", "PyInstaller",
-    "--onedir",
+    # --onefile: one self-contained exe for release uploads. Trades a few
+    # seconds of cold start (the bundle is extracted to a temp dir on
+    # every launch) for a single-file distribution — resources resolve
+    # through sys._MEIPASS exactly like the old --onedir builds.
+    "--onefile",
     "--name", "ImageOptimizer",
     "--noconfirm",
     "--clean",
@@ -42,10 +46,10 @@ def main():
         print(f"Build failed with return code {result.returncode}")
         sys.exit(result.returncode)
 
-    exe_dir = OUT / "ImageOptimizer"
-    print(f"\nDone! Standalone exe at: {exe_dir / 'ImageOptimizer.exe'}")
-    print(f"Total size: {sum(f.stat().st_size for f in exe_dir.rglob('*') if f.is_file()) / 1024 / 1024:.1f} MB")
-    print(f"\nTo distribute: zip the entire '{exe_dir.name}' folder.")
+    exe = OUT / "ImageOptimizer.exe"
+    print(f"\nDone! Standalone exe at: {exe}")
+    print(f"Size: {exe.stat().st_size / 1024 / 1024:.1f} MB")
+    print(f"\nTo distribute: upload {exe.name} directly to the release (single self-contained file).")
 
 
 if __name__ == "__main__":
