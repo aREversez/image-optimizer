@@ -85,6 +85,50 @@ class TestScanDeterministicOrder:
         assert [f["id"] for f in result["files"]] == [str(i) for i in range(12)]
 
 
+class TestScanFileMetadata:
+    """The Files grid offers sorting by modified/created time and size,
+    so every scanned entry must carry size + mtime + ctime."""
+
+    def test_files_carry_size_and_timestamps(self, client, auth_headers, tmp_path):
+        d = tmp_path / "meta"
+        d.mkdir()
+        Image.new("RGB", (50, 50)).save(d / "a.png")
+        r, result = scan_and_wait(client, auth_headers, d, recursive=False)
+        assert r.status_code == 200
+        f = result["files"][0]
+        assert f["size"] > 0
+        assert f["mtime"] > 0
+        assert f["ctime"] > 0
+
+    def test_unreadable_file_entry_still_sorts_safely(self, client, auth_headers, tmp_path, app_module, monkeypatch):
+        """If a scan item fails entirely (on_item_error path), its entry
+        must still carry the sort fields — zeroed, so it lands at the
+        bottom of "newest first" instead of breaking the comparator."""
+        d = tmp_path / "meta2"
+        d.mkdir()
+        Image.new("RGB", (50, 50)).save(d / "boom.png")
+
+        async def exploding_process_item(item):
+            raise RuntimeError("boom")
+
+        # Make the thumbnail step blow up so the worker pool's error
+        # handler builds the entry (the real _gen_thumbnail swallows
+        # errors internally and never triggers that path).
+        real_run = app_module._run_worker_pool
+
+        async def patched_run(items, process_item, **kw):
+            return await real_run(items, exploding_process_item, **kw)
+
+        monkeypatch.setattr(app_module, "_run_worker_pool", patched_run)
+
+        r, result = scan_and_wait(client, auth_headers, d, recursive=False)
+        assert r.status_code == 200
+        f = result["files"][0]
+        assert f["size"] == 0
+        assert f["mtime"] == 0
+        assert f["ctime"] == 0
+
+
 class TestScanTolerance:
     """A single unreadable/corrupt image must not abort the whole scan —
     matches the same per-item error isolation used in the optimize

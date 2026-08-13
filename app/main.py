@@ -766,11 +766,17 @@ async def _scan_and_thumbnail(state: AppState, directory: Path, recursive: bool)
         thumb_path = ws / thumb_rel
         if not thumb_path.exists():
             await asyncio.to_thread(_gen_thumbnail, img_path, thumb_path)
+        st = img_path.stat()
         files[idx] = {
             "id": str(idx),
             "name": rel,
             "path": str(img_path),
-            "size": img_path.stat().st_size,
+            "size": st.st_size,
+            # Powers the Files-grid Sort dropdown: mtime = last modified,
+            # ctime = creation time on Windows (metadata-change time on
+            # POSIX, close enough for "newest first" ordering there).
+            "mtime": st.st_mtime,
+            "ctime": st.st_ctime,
             "thumbnail": f"/api/thumb/{ws.name}/{thumb_rel}",
         }
 
@@ -783,6 +789,8 @@ async def _scan_and_thumbnail(state: AppState, directory: Path, recursive: bool)
             "name": str(img_path),
             "path": str(img_path),
             "size": 0,
+            "mtime": 0,
+            "ctime": 0,
             "thumbnail": "",
             "error": str(e),
         }
@@ -882,11 +890,16 @@ async def upload_files(files: List[UploadFile] = File(...), state: AppState = De
         thumb_path = ws / thumb_rel
         await asyncio.to_thread(_gen_thumbnail, file_path, thumb_path)
 
+        st = file_path.stat()
         result_files.append({
             "id": str(idx),
             "name": name,
             "path": str(file_path),
             "size": size,
+            # Same fields as the scan flow (see process_item above) so the
+            # Files-grid Sort dropdown works for uploads too.
+            "mtime": st.st_mtime,
+            "ctime": st.st_ctime,
             "thumbnail": f"/api/thumb/{state.workspace.name}/{thumb_rel}",
         })
 
@@ -965,12 +978,21 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
                 status_code=400,
             )
         # Reconstruct state.files from batch_state (server may have restarted)
-        state.files = [
-            {"id": f.get("id", secrets.token_urlsafe(8)), "name": f["name"], "path": f["path"],
-             "size": f.get("size", 0), "thumbnail": ""}
-            for f in bs.get("files", [])
-            if Path(f["path"]).exists()
-        ]
+        rebuilt = []
+        for f in bs.get("files", []):
+            p = Path(f["path"])
+            if not p.exists():
+                continue
+            try:
+                st = p.stat()
+                mtime, ctime = st.st_mtime, st.st_ctime
+            except OSError:
+                mtime = ctime = 0
+            rebuilt.append({
+                "id": f.get("id", secrets.token_urlsafe(8)), "name": f["name"], "path": f["path"],
+                "size": f.get("size", 0), "mtime": mtime, "ctime": ctime, "thumbnail": "",
+            })
+        state.files = rebuilt
         if not state.files:
             return JSONResponse(
                 {"error": "Source files no longer available for resume"},
@@ -2723,11 +2745,14 @@ def main():
                 thumb_path = ws / thumb_rel
                 if not thumb_path.exists():
                     _gen_thumbnail(img_path, thumb_path)
+                st = img_path.stat()
                 prescan.files.append({
                     "id": str(idx),
                     "name": rel,
                     "path": str(img_path),
-                    "size": img_path.stat().st_size,
+                    "size": st.st_size,
+                    "mtime": st.st_mtime,
+                    "ctime": st.st_ctime,
                     "thumbnail": f"/api/thumb/{prescan.workspace.name}/{thumb_rel}",
                 })
             prescan.total = len(prescan.files)
