@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [1.0.3] - 2026-08-13
 
 ### Fixed
 - **Watch mode's settings were silently frozen at "Start Watching" time,
@@ -32,8 +32,8 @@ All notable changes to this project will be documented in this file.
   match it) is deliberately left alone with no cleanup at all: plenty of
   people delete the original after keeping the compressed output, and a
   lone disappearance must never be allowed to delete anything.
-
-  libavif CLI (avifenc v1.3.0): (1) the intermediate file was written as
+- **AVIF output was completely broken against the real avifenc binary**,
+  in two independent ways. libavif CLI (avifenc v1.3.0): (1) the intermediate file was written as
   `.src.ppm`, but avifenc only recognizes `input.[jpg|jpeg|png|y4m]` — PPM
   is rejected outright ("Unrecognized file format"), so every single AVIF
   encode failed regardless of quality/mode. (2) The quality flag was
@@ -75,6 +75,19 @@ All notable changes to this project will be documented in this file.
   everything on disk. `POST /api/optimize` with `resume: true` now
   requires `output_dir` up front (400 if missing) since that's what
   identifies which saved batch to resume.
+- **"Reveal Output Folder" opened behind the browser window** (Windows).
+  A bare `explorer <dir>` may silently reuse an already-open window, and
+  Windows' foreground-lock rules stop a window spawned by this background
+  server process from stealing focus — it appeared only as a taskbar
+  flash. Folder-mode reveal now launches `explorer /e,/root,<dir>` (which
+  always spawns a fresh window) and then brings it to the foreground via
+  the documented `AttachThreadInput` + `SetForegroundWindow` workaround
+  (best-effort; the window is open regardless).
+- **Standalone exe builds shipped without the JPEG and AVIF encoders.**
+  `build_exe.py` only bundled `pngquant.exe` and `oxipng.exe`, so a
+  frozen build silently lacked both mozjpeg JPG output and AVIF output
+  added since. `cjpeg-static.exe` and `avifenc.exe` are now included in
+  the PyInstaller data.
 
 ### Added
 - **Watch Mode: "Use Select Images / Output paths" button.** Watch Mode
@@ -84,20 +97,29 @@ All notable changes to this project will be documented in this file.
   if Output path is empty (e.g. the main panel is using the temp-folder
   default), a notice explains that Watch Mode needs a real persistent
   output folder and doesn't have a temp-folder mode of its own.
-- **"Reveal in File Explorer" on results** (`POST /api/reveal`). When a
-  run has a persistent `output_dir` (not the temp workspace), each
-  successful result card gets a Reveal button that opens the OS file
-  explorer with that file selected (`explorer /select,` on Windows,
-  `open -R` on macOS, `xdg-open` on the containing folder on Linux),
-  instead of the user hunting for the output folder themselves. Scoped
-  for safety: the endpoint only opens a path that's actually one of the
-  current session's own recorded output files — not an arbitrary
-  client-supplied path.
+- **"Reveal Output Folder" on results** (`POST /api/reveal`). When a
+  run has a persistent `output_dir` (not the temp workspace), a single
+  Reveal Output Folder button in the Results bar opens the run's output
+  folder in the OS file explorer (`explorer /e,/root,` on Windows,
+  `open` on macOS, `xdg-open` on Linux) — one folder per run, one
+  button, instead of one per image. The backend opens the folder it
+  recorded for this run itself (`state.output_dir`); the client sends
+  no path, so there's nothing to spoof. The endpoint also accepts a
+  specific `final_output_path` for file-level reveal
+  (`explorer /select,` / `open -R`) and rejects anything that isn't one
+  of the current session's own recorded output files.
+- **Files grid sorting.** The Files section's header gains a Sort
+  dropdown: scan order, modified (newest/oldest), created
+  (newest/oldest), size (large/small). Useful without watch mode —
+  sort newest-first to grab the latest screenshots for a manual batch,
+  or largest-first to target the biggest files. Scan/upload/resume
+  file entries now carry `mtime`/`ctime`; sorting is display-only and
+  never changes the selection or the order sent to the server.
 - **AVIF output** (`output_format: "avif"`). Selecting AVIF encodes through
   `avifenc` (auto-detected in `bin/` or PATH; without it the `(avif, *)`
   modes drop out of `available_modes()` and the UI warns up front).
-  Pillow decodes the source (EXIF transpose, alpha composited onto white,
-  optional resize), writes a PPM intermediate, then avifenc encodes the
+  Pillow decodes the source (EXIF transpose, optional resize), writes a
+  PNG intermediate (alpha preserved end-to-end), then avifenc encodes the
   final AVIF. `keep_exif` passes cleaned EXIF via avifenc's `--exif`
   sidecar. Quality map: high=80, medium=60, low=40; lossless uses
   `--lossless`; resize_only encodes at q=90 after downscaling.

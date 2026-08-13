@@ -27,6 +27,10 @@ PYINSTALLER_ARGS = [
     "--add-data", f"{APP / 'templates' / 'favicon.ico'}{';'}app/templates/",
     "--add-data", f"{BIN / 'pngquant.exe'}{';'}bin/",
     "--add-data", f"{BIN / 'oxipng.exe'}{';'}bin/",
+    # JPEG (mozjpeg) and AVIF encoders — without these the frozen build
+    # silently lacks both output formats (see CHANGELOG 1.0.3).
+    "--add-data", f"{BIN / 'cjpeg-static.exe'}{';'}bin/",
+    "--add-data", f"{BIN / 'avifenc.exe'}{';'}bin/",
     str(APP / "__main__.py"),
 ]
 
