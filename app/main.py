@@ -2099,6 +2099,76 @@ async def browse_folder(title: str = "Select Folder", _auth: None = Depends(requ
         return JSONResponse({"path": "", "error": str(e)})
 
 
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+
+    def _focus_new_explorer_window(timeout: float = 3.0):
+        """Best-effort: bring the folder window we just asked explorer to
+        open to the foreground.
+
+        Two Windows behaviors work against us here:
+        1. Plain `explorer <dir>` may silently reuse an already-open window
+           for that folder instead of making a new visible one, so the
+           caller launches with /e,/root, (see reveal_in_explorer) which
+           always spawns a fresh CabinetWClass window.
+        2. Foreground lock: this server process sits behind the browser, and
+           Windows refuses to let a window created by a background process
+           steal focus — it opens behind the browser or just flashes in the
+           taskbar. Attaching our input state to the current foreground
+           thread before SetForegroundWindow is the documented workaround.
+
+        Runs in a worker thread (it polls/sleeps) and is purely cosmetic —
+        the window is open regardless of whether focusing succeeds.
+        """
+        try:
+            user32 = ctypes.windll.user32
+            _EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+            def cabinet_windows() -> list:
+                found = []
+
+                def _cb(hwnd, _lparam):
+                    buf = ctypes.create_unicode_buffer(64)
+                    user32.GetClassNameW(hwnd, buf, 64)
+                    # CabinetWClass = an Explorer folder window (the shell
+                    # taskbar/desktop and dialogs use other classes).
+                    if buf.value == "CabinetWClass":
+                        found.append(hwnd)
+                    return True
+
+                user32.EnumWindows(_EnumWindowsProc(_cb), 0)
+                return found
+
+            before = set(cabinet_windows())
+            deadline = time.monotonic() + timeout
+            new_hwnd = None
+            while new_hwnd is None and time.monotonic() < deadline:
+                time.sleep(0.1)
+                for hwnd in cabinet_windows():
+                    if hwnd not in before:
+                        new_hwnd = hwnd
+                        break
+            if new_hwnd is None:
+                return  # window never appeared (or appeared too late) — give up
+
+            fg_hwnd = user32.GetForegroundWindow()
+            fg_tid = user32.GetWindowThreadProcessId(fg_hwnd, None) if fg_hwnd else 0
+            tgt_tid = user32.GetWindowThreadProcessId(new_hwnd, None)
+            attached = bool(
+                fg_tid and tgt_tid and fg_tid != tgt_tid
+                and user32.AttachThreadInput(fg_tid, tgt_tid, True)
+            )
+            try:
+                user32.ShowWindow(new_hwnd, 9)  # SW_RESTORE, in case it's minimized
+                user32.SetForegroundWindow(new_hwnd)
+            finally:
+                if attached:
+                    user32.AttachThreadInput(fg_tid, tgt_tid, False)
+        except Exception:
+            pass  # cosmetic only — never break the reveal itself
+
+
 @app.post("/api/reveal")
 async def reveal_in_explorer(
     data: RevealRequest, state: AppState = Depends(get_session), _auth: None = Depends(require_token)
@@ -2158,7 +2228,15 @@ async def reveal_in_explorer(
                 subprocess.Popen(["xdg-open", str(target.parent)])
         else:
             if sys.platform == "win32":
-                subprocess.Popen(["explorer", str(target)])
+                # /e,/root, forces a fresh folder window — a bare
+                # `explorer <dir>` may silently reuse an already-open one.
+                subprocess.Popen(["explorer", f"/e,/root,{target}"])
+                # Then pull that window to the front: this process sits
+                # behind the browser, so Windows' foreground lock would
+                # otherwise leave it hidden (see _focus_new_explorer_window).
+                # Fire-and-forget off the event loop — the response doesn't
+                # need to wait for the animation.
+                asyncio.create_task(asyncio.to_thread(_focus_new_explorer_window))
             elif sys.platform == "darwin":
                 subprocess.Popen(["open", str(target)])
             else:

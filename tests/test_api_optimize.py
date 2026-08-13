@@ -264,14 +264,22 @@ class TestRevealInExplorer:
         calls = []
         import app.main as m
         monkeypatch.setattr(m.subprocess, "Popen", lambda *a, **k: calls.append((a, k)))
+        # The win32 focus helper would otherwise poll for a real Explorer
+        # window for up to 3s in CI (and never find one — Popen is mocked).
+        if hasattr(m, "_focus_new_explorer_window"):
+            monkeypatch.setattr(m, "_focus_new_explorer_window", lambda timeout=3.0: None)
 
         r2 = client.post("/api/reveal", json={"path": ""}, headers=auth_headers)
         assert r2.status_code == 200
         assert r2.json()["success"] is True
         assert len(calls) == 1
         # The launched target must be the run's output folder itself —
-        # last argv entry on every platform branch.
-        assert Path(calls[0][0][0][-1]).resolve() == out_dir.resolve()
+        # last argv entry on every platform branch (win32 folder mode
+        # wraps it in "/e,/root,<path>" to force a fresh window).
+        last = calls[0][0][0][-1]
+        if last.startswith("/e,/root,"):
+            last = last.split("/e,/root,", 1)[1]
+        assert Path(last).resolve() == out_dir.resolve()
 
     def test_reveal_empty_path_without_output_dir_rejected(self, client, auth_headers, test_images):
         """A temp-workspace-only run has no persistent folder to reveal."""
