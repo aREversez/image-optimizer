@@ -91,9 +91,11 @@ class Optimizer:
         # AVIF output needs avifenc — all three modes are available when
         # the binary is found. AVIF is a modern, efficient codec that
         # typically produces smaller files than PNG or WebP at equivalent
-        # quality, but encoding is slower. Like JPEG, "lossless" maps to
-        # a very-high-quality pass (AVIF does support true lossless, but
-        # the quality map keeps the UI consistent with other formats).
+        # quality, but encoding is slower. Unlike JPEG (no true lossless
+        # codec exists, so its "lossless"/"resize_only" fall back to a
+        # very-high-quality pass), AVIF has a real --lossless mode, and
+        # both "lossless" and "resize_only" use it — same guarantee as
+        # PNG/WebP: no quality cost beyond whatever resizing was asked for.
         if self.avifenc_path is not None:
             modes |= {("avif", "standard"), ("avif", "lossless"), ("avif", "resize_only")}
         return modes
@@ -776,8 +778,12 @@ class Optimizer:
         Mode semantics:
         - standard    -> avifenc -q from the {high, medium, low} map
         - lossless    -> avifenc --lossless (true lossless AVIF)
-        - resize_only -> resize first, then encode at high quality so savings
-          come from the smaller dimensions.
+        - resize_only -> avifenc --lossless after resizing, same as the
+          lossless branch — AVIF supports true lossless just like PNG/WebP,
+          so (like those two, and unlike JPEG, which has no lossless mode
+          and has to settle for its highest quality instead) "Resize Only"
+          means exactly that: savings come only from the smaller
+          dimensions, never from a quality/palette change.
         """
         original_size = os.path.getsize(input_path)
         result = {
@@ -792,12 +798,12 @@ class Optimizer:
             return result
 
         quality_map = {"high": 80, "medium": 60, "low": 40}
-        if compression_mode == "lossless":
-            q = 100
-        elif compression_mode == "resize_only":
-            q = 90
-        else:
-            q = quality_map.get(quality, 60)
+        # resize_only groups with lossless (not with the quality_map branch
+        # below) — see the docstring: AVIF has a real --lossless mode, so
+        # unlike JPEG there's no reason for "Resize Only" to cost any
+        # quality here.
+        is_lossless = compression_mode in ("lossless", "resize_only")
+        q = quality_map.get(quality, 60) if not is_lossless else None
 
         temp_files: list = []
         try:
@@ -829,14 +835,14 @@ class Optimizer:
                     img.save(intermediate_path, format="PNG")
 
             if progress_callback:
-                mode_desc = "lossless" if compression_mode == "lossless" else f"quality={q}"
+                mode_desc = "lossless" if is_lossless else f"quality={q}"
                 await progress_callback(f"encoding AVIF via avifenc ({mode_desc})...")
             await loop.run_in_executor(None, _prepare_intermediate)
 
             cmd = [
                 str(self.avifenc_path),
             ]
-            if compression_mode == "lossless":
+            if is_lossless:
                 cmd += ["--lossless"]
             else:
                 # avifenc has no long-form "--quality" flag — it's

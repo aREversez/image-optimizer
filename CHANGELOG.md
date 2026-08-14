@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- **AVIF's "Resize Only" mode was silently lossy**, unlike every other
+  format's Resize Only. PNG (skips pngquant, keeps oxipng) and WebP
+  (`lossless: True`) both guarantee Resize Only costs no quality beyond
+  the resize itself; JPEG can't make that guarantee (no true lossless
+  JPEG exists) but says so explicitly in the UI. AVIF fell through the
+  cracks: it silently encoded resize_only at `-q 90` even though avifenc
+  has a real `--lossless` mode (already used correctly for AVIF's own
+  "Lossless" mode) — and the quality loss happened even when max_width
+  was 0 and no resize occurred at all. Confirmed against the real
+  libavif CLI: a resize_only encode with no resize used to come back
+  pixel-different from the source; it's now pixel-identical, matching
+  PNG/WebP. resize_only now shares the same `--lossless` path as
+  AVIF's lossless mode.
+- **Watch mode didn't validate `resize_only` requires a Max Width** —
+  `/api/optimize` and per-file overrides both reject
+  `compression_mode: "resize_only"` with `max_width <= 0`, but
+  `/api/watch/start` let it through. A watch started this way ran
+  indefinitely "processing" every detected file with no resize ever
+  applied — for AVIF this used to mean the silent quality loss above,
+  for every format it was wasted CPU for no size benefit. Watch mode now
+  rejects the same combination with the same error the other two entry
+  points already use.
+
 ## [1.0.3] - 2026-08-13
 
 ### Fixed

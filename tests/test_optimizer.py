@@ -386,6 +386,39 @@ class TestAVIF:
         assert result["success"] is True
         assert out.exists()
 
+    def test_resize_only_avif_uses_lossless_not_quality(self, optimizer, tmp_path, monkeypatch):
+        """Regression test: resize_only used to encode AVIF at -q 90 (lossy)
+        instead of --lossless, silently costing quality that "Resize Only"
+        promises not to touch — unlike JPEG (no true lossless codec exists),
+        AVIF has a real --lossless mode, so there's no excuse for it, and
+        PNG/WebP's resize_only are both genuinely lossless already.
+        Confirmed with the real libavif CLI (avifenc v1.3.0): a
+        resize_only encode with max_width=0 (no resize at all) used to
+        come back pixel-different from the source; with --lossless it's
+        pixel-identical. The test fixture's fake avifenc round-trips
+        losslessly regardless of the flags it's given, so what's actually
+        under test here is the command line built for it."""
+        import asyncio as _asyncio
+        captured = {}
+        real_exec = _asyncio.create_subprocess_exec
+
+        async def spy_exec(*args, **kwargs):
+            captured["argv"] = args
+            return await real_exec(*args, **kwargs)
+
+        monkeypatch.setattr(_asyncio, "create_subprocess_exec", spy_exec)
+
+        src = tmp_path / "input.png"
+        out = tmp_path / "output.avif"
+        Image.new("RGB", (100, 100), (10, 20, 30)).save(src)
+        result = asyncio.run(
+            optimizer.optimize_png(src, out, output_format="avif", compression_mode="resize_only")
+        )
+        assert result["success"] is True
+        argv = captured["argv"]
+        assert "--lossless" in argv, f"resize_only should encode losslessly, got: {argv}"
+        assert "-q" not in argv, f"resize_only should not use a lossy quality flag, got: {argv}"
+
     def test_avif_requires_avifenc(self, tmp_path):
         from app.optimizer import Optimizer
         opt = Optimizer(bin_dir=tmp_path / "nonexistent")

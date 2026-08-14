@@ -2630,6 +2630,20 @@ async def watch_start(
         return JSONResponse({"error": "Invalid compression_mode"}, status_code=400)
     if data.quality not in ("high", "medium", "low"):
         return JSONResponse({"error": f"Invalid quality: {data.quality!r}"}, status_code=400)
+    if data.compression_mode == "resize_only" and data.max_width <= 0:
+        # Same rule as /api/optimize and per-file overrides (see
+        # _validate_overrides) — Resize Only has nothing to do without a
+        # width, and every other entry point already rejects this
+        # combination. Watch mode lacked this check, so starting a watch
+        # with mode=resize_only and a forgotten/zero max_width would run
+        # indefinitely: every detected file gets "processed" with no
+        # resize applied at all — for AVIF this used to mean a pointless
+        # lossy re-encode for zero size benefit (fixed alongside this),
+        # and for every format it's just wasted CPU with no resize.
+        return JSONResponse(
+            {"error": "Resize Only mode requires Max Width (max_width must be > 0)"},
+            status_code=400,
+        )
 
     warning = None
     if (data.output_format, data.compression_mode) not in optimizer.available_modes():
