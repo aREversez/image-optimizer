@@ -332,6 +332,70 @@ def _list_unfinished_batch_states() -> list[dict]:
     return out
 
 
+def _skip_fingerprints_dir() -> Path:
+    d = _config_dir() / "skip_fingerprints"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
+def _skip_fingerprints_file(output_dir: str) -> Path:
+    # Reuses the same output_dir → stable id scheme as batch state (see
+    # _batch_id_for_output_dir) — same reasoning applies: output_dir is
+    # what identifies "this run's destination", stable across restarts,
+    # distinct between unrelated runs.
+    return _skip_fingerprints_dir() / f"{_batch_id_for_output_dir(output_dir)}.json"
+
+
+def _settings_fingerprint(
+    quality: str, compression_mode: str, max_width: int,
+    protected_colors: Optional[list], dithering: bool, keep_exif: bool, output_format: str,
+) -> str:
+    """Fingerprints the effective per-file compression settings that
+    produced (or would produce) a given output. Used by skip_existing to
+    tell "the source hasn't changed AND these are the same settings that
+    made this file last time" apart from "the source happens to be
+    unchanged but the user asked for something different this run" — the
+    two look identical if you only check the source's mtime, which is all
+    the reuse check used to do.
+
+    Order-independent on protected_colors (case/whitespace-normalized) so
+    ["#FF0000", "#00ff00"] and ["#00FF00", "#ff0000"] fingerprint the same,
+    matching how the color-map step itself treats them."""
+    colors = sorted((c or "").strip().lower() for c in (protected_colors or []))
+    payload = json.dumps({
+        "quality": quality,
+        "compression_mode": compression_mode,
+        "max_width": max_width,
+        "protected_colors": colors,
+        "dithering": bool(dithering),
+        "keep_exif": bool(keep_exif),
+        "output_format": output_format,
+    }, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _load_skip_fingerprints(output_dir: str) -> dict:
+    """rel_path -> fingerprint of the settings that produced the current
+    file at that path, for one output_dir. Missing/corrupt file -> {} (an
+    empty map means "nothing recorded", which skip_existing treats as
+    unverifiable and recompresses rather than trusting a stale file blindly
+    — see the reuse check in _process_files)."""
+    try:
+        return json.loads(_skip_fingerprints_file(output_dir).read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_skip_fingerprints(output_dir: str, data: dict):
+    try:
+        _skip_fingerprints_file(output_dir).write_text(json.dumps(data), encoding="utf-8")
+    except OSError:
+        pass  # best-effort — a write failure here just means the next run recompresses instead of reusing
+
+
 # Defaults for everything a config.json can override. CLI flags (where they
 # exist) take priority over the config file, which takes priority over
 # these. Keep this in sync with README's config.json documentation.
@@ -1226,6 +1290,25 @@ async def _process_files(
         for _f in batch_state.get("files", []):
             _bs_lookup[_f["path"]] = _f
 
+    # rel_path -> fingerprint of the settings that produced the file
+    # currently at that path in output_dir. Loaded once here (not
+    # per-file — this file can grow to one entry per image ever produced
+    # into this folder, so re-reading/re-writing it from disk on every
+    # single file would be O(n) work repeated n times) and only written
+    # back to disk if something actually changes. Tracked for every run
+    # with a persistent output_dir, not just skip_existing runs — a very
+    # common pattern is "run normally once, then re-run with
+    # skip_existing checked", and that first normal run needs to have
+    # left a fingerprint behind for the second run to have anything to
+    # verify against. See skip_existing's reuse check below and
+    # _settings_fingerprint for why this exists: mtime alone can't tell
+    # "unchanged source, same settings, safe to reuse" apart from
+    # "unchanged source, but the user asked for different settings this
+    # run" — before this, skip_existing couldn't tell those apart and
+    # silently reused stale output for the latter.
+    _skip_fp = _load_skip_fingerprints(output_dir) if output_dir else {}
+    _skip_fp_dirty = False
+
     ws = state.workspace
     opt_output_dir = ws / "output"
     if opt_output_dir.exists() and not retry:
@@ -1319,20 +1402,33 @@ async def _process_files(
         # leftover from a previous run that was interrupted mid-write — a
         # non-empty file alone isn't proof it's complete.
         # Staleness: reuse is only valid if the *source* hasn't changed since
-        # the existing output was produced. Same filename doesn't mean same
-        # content — e.g. a screenshot re-taken under the same name. There's no
-        # manifest recording "this output came from source hash X" (and we
-        # deliberately don't want to write sidecar files into the user's real
-        # output folder), so this uses the same mtime-newer-than-target check
-        # every incremental build tool uses (make, rsync -u, ...): if the
-        # source's mtime is more recent than the existing output's, treat it
-        # as changed and recompress instead of reusing. For the upload flow
-        # specifically, input_path is a fresh workspace-local copy made at
-        # upload time, so its mtime is always "now" — re-uploading an
-        # unchanged file will (safely, if unnecessarily) recompress rather
-        # than reuse; that's the conservative direction to fail in.
-        # Note: a skipped file is NOT recompressed, so per-file overrides are
-        # intentionally ignored on the skip path (the existing output stands).
+        # the existing output was produced, AND this run's effective
+        # settings match whatever produced it. Same filename doesn't mean
+        # same content — e.g. a screenshot re-taken under the same name —
+        # and an unchanged source doesn't mean the user wants the same
+        # output either: they may have just changed quality/mode/max_width/
+        # format/etc. and re-run with skip_existing still on, expecting
+        # their new settings to apply. mtime alone can't tell those two
+        # cases apart (confirmed empirically: changing max_width between
+        # runs with an untouched source silently kept the old, un-resized
+        # output). There's no manifest recording "this output came from
+        # source hash X" written into the user's real output folder (still
+        # deliberately avoided — see _settings_fingerprint), so the mtime
+        # check (make/rsync -u style: source newer than target => changed)
+        # is combined with a settings fingerprint stored separately under
+        # this app's own config dir. No recorded fingerprint (e.g. the
+        # first skip_existing run against files produced before this
+        # existed) means "unverifiable" — recompress rather than trust it,
+        # same conservative direction the upload-flow mtime case already
+        # fails in.
+        # Note: a skip decision means the file is NOT recompressed at all,
+        # so a per-file override only has an effect on a skipped file
+        # indirectly — by changing its fingerprint and thereby causing a
+        # miss on settings_unchanged below, which forces a recompress
+        # (where the override then genuinely applies). An override whose
+        # values happen to match what's already in place doesn't change
+        # anything either way, by design (nothing to apply that wasn't
+        # already true).
         if skip_existing and output_dir:
             rel = out_path.relative_to(opt_output_dir)
             dest = Path(output_dir) / rel
@@ -1340,8 +1436,14 @@ async def _process_files(
                 input_path.exists() and dest.exists()
                 and input_path.stat().st_mtime <= dest.stat().st_mtime
             )
+            eff_fingerprint = _settings_fingerprint(
+                eff_quality, eff_compression_mode, eff_max_width,
+                eff_protected_colors, eff_dithering, eff_keep_exif, eff_output_format,
+            )
+            settings_unchanged = _skip_fp.get(str(rel)) == eff_fingerprint
             if (
                 source_unchanged
+                and settings_unchanged
                 and dest.stat().st_size > 0
                 and _is_valid_reusable_output(dest, eff_output_format)
             ):
@@ -1428,6 +1530,19 @@ async def _process_files(
                     # disk to reveal (nothing to show when output_dir is
                     # empty and results live only in the temp workspace).
                     result["final_output_path"] = str(dest)
+                    # Record what settings actually produced this file, so
+                    # a later skip_existing run can tell "safe to reuse"
+                    # apart from "source unchanged but settings differ" —
+                    # see the fingerprint check above. Tracked on every
+                    # run with a persistent output_dir (not just
+                    # skip_existing runs) so a plain run followed by a
+                    # skip_existing run has something to verify against.
+                    nonlocal _skip_fp_dirty
+                    _skip_fp[str(rel)] = _settings_fingerprint(
+                        eff_quality, eff_compression_mode, eff_max_width,
+                        eff_protected_colors, eff_dithering, eff_keep_exif, eff_output_format,
+                    )
+                    _skip_fp_dirty = True
                 except Exception as e:
                     state.logs.append(f"  Output copy failed: {e}")
         else:
@@ -1513,6 +1628,13 @@ async def _process_files(
             remaining = [f for f in batch_state.get("files", []) if f["status"] in ("pending", "failed")]
             if not remaining and batch_state.get("output_dir"):
                 _clear_batch_state(batch_state["output_dir"])
+        # Persist any new/updated skip_existing fingerprints from this run
+        # in one write, rather than one disk write per file (see the load
+        # site's comment for why). A cancelled/crashed run still saves
+        # whatever completed before the interruption — those files are
+        # genuinely done and their fingerprints are genuinely accurate.
+        if _skip_fp_dirty:
+            _save_skip_fingerprints(output_dir, _skip_fp)
 
 
 @app.get("/api/progress")

@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **`skip_existing` ignored settings changes between runs.** Its reuse
+  decision was keyed purely on the source file's mtime vs the existing
+  output's — confirmed empirically that re-running against an untouched
+  source with a different `max_width` (or quality/compression_mode/
+  output_format/protected_colors/dithering/keep_exif) silently reused
+  the old output produced under the *previous* settings, with no
+  warning that the new settings had no effect. A settings fingerprint
+  (quality/mode/width/colors/dithering/keep_exif/format) is now stored
+  per output_dir alongside the file it produced (under this app's own
+  config dir, not the user's real output folder), and skip_existing
+  only reuses when both the source is unchanged AND the fingerprint
+  matches this run's effective settings. No recorded fingerprint (e.g.
+  a file that predates this feature) is treated as unverifiable and
+  recompressed rather than trusted — same conservative direction the
+  upload-flow mtime check already fails in. A side effect (correct,
+  not a workaround): a per-file override that actually changes a
+  skipped file's effective settings now forces a real recompress with
+  the override applied, instead of being silently dropped because the
+  file "looked" reusable by mtime alone.
 - **AVIF's "Resize Only" mode was silently lossy**, unlike every other
   format's Resize Only. PNG (skips pngquant, keeps oxipng) and WebP
   (`lossless: True`) both guarantee Resize Only costs no quality beyond

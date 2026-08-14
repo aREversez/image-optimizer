@@ -517,6 +517,72 @@ class TestSkipExisting:
                 "output still holds the stale pre-change pixel data"
             )
 
+    def test_skip_existing_recompresses_when_settings_changed(self, client, auth_headers, test_images, tmp_path):
+        """Regression test: skip_existing used to key its reuse decision
+        purely on the *source*'s mtime vs the existing output's mtime —
+        confirmed empirically that changing max_width between runs with
+        an untouched source silently kept the old, un-resized output,
+        with no error or warning telling the user their new setting had
+        no effect. Any settings change (quality/compression_mode/
+        max_width/output_format/protected_colors/dithering/keep_exif)
+        must now trigger a real recompress instead."""
+        out_dir = tmp_path / "out"
+        scan_and_wait(client, auth_headers, test_images)
+        r, d = optimize_and_wait(client, auth_headers, output_dir=str(out_dir))
+        assert r.status_code == 200 and all(res["success"] for res in d["results"])
+
+        first_file = next(f for f in out_dir.iterdir() if f.is_file())
+        from PIL import Image
+        dims_before = Image.open(first_file).size
+
+        # Same untouched source, skip_existing=True, but this run asks
+        # for a resize the previous run never applied.
+        scan_and_wait(client, auth_headers, test_images)
+        r, d = optimize_and_wait(
+            client, auth_headers, output_dir=str(out_dir),
+            skip_existing=True, max_width=50,
+        )
+        assert r.status_code == 200
+        assert not any(res.get("skipped") for res in d["results"]), (
+            "changed max_width was ignored — stale un-resized output was reused"
+        )
+        dims_after = Image.open(first_file).size
+        assert dims_after[0] <= 50, f"resize wasn't applied: {dims_before} -> {dims_after}"
+
+    def test_skip_existing_recompresses_when_no_fingerprint_recorded(
+        self, client, auth_headers, test_images, tmp_path
+    ):
+        """A file already sitting in output_dir with no recorded settings
+        fingerprint (e.g. it predates this feature, or was placed there
+        by something other than this app) is "unverifiable" — safe
+        default is to recompress rather than trust it blindly, same
+        conservative direction the mtime-only check already fails in for
+        the upload flow."""
+        from PIL import Image
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+        scanned = scan_and_wait(client, auth_headers, test_images)
+        first_name = scanned["files"][0]["name"]
+        # Pre-seed output_dir directly (bypassing the app entirely — no
+        # fingerprint gets recorded this way) with a *newer* mtime than
+        # the source, so the old mtime-only check alone would have
+        # reused this.
+        seed_path = out_dir / first_name
+        seed_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (5, 5), (1, 2, 3)).save(seed_path)
+        import time
+        time.sleep(1.1)
+        seed_path.touch()
+
+        r, d = optimize_and_wait(client, auth_headers, output_dir=str(out_dir), skip_existing=True)
+        assert r.status_code == 200
+        first_result = next(res for res in d["results"] if res["name"] == first_name)
+        assert not first_result.get("skipped"), (
+            "a pre-existing file with no recorded fingerprint should be "
+            "recompressed, not trusted blindly"
+        )
+
     def test_normal_subset_run_with_skip_existing_wipes_stale_outputs(self, client, auth_headers, test_images, tmp_path):
         """Regression: skip_existing must NOT suppress the ws/output wipe on a
         normal (non-retry) run. The wipe is per-batch and only retry should

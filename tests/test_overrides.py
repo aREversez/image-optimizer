@@ -164,21 +164,28 @@ class TestOverridesValidation:
 
 class TestOverridesWithSkipExisting:
     """The cross-cutting case: overrides + skip_existing + a narrowed
-    file_ids selection. Skipped files are reused (override ignored — no
-    recompress), applied files use their effective params, and the ZIP
-    equals exactly the selected files (no stale leak, no double entry)."""
+    file_ids selection. A skipped file needs BOTH an unchanged source AND
+    matching effective settings (including any override) to be reused —
+    an override that changes the effective settings for that specific
+    file must trigger a genuine recompress with the override applied,
+    not a silent skip of stale output. Applied/recompressed files use
+    their effective params, and the ZIP equals exactly the selected
+    files (no stale leak, no double entry)."""
 
-    def test_skipped_file_ignores_override_and_zip_matches_selection(
+    def test_skip_reuses_when_override_matches_existing_settings(
         self, client, auth_headers, test_images, tmp_path
     ):
         out_dir = tmp_path / "out"
         scanned = scan_and_wait(client, auth_headers, test_images)
-        # First run populates output_dir with all 3 files.
+        # First run populates output_dir with all 3 files at the default
+        # quality ("medium").
         r, d = optimize_and_wait(client, auth_headers, output_dir=str(out_dir))
         assert r.status_code == 200 and len(d["results"]) == 3
 
         # Re-scan (fresh workspace), then run a NARROWED selection of 2
-        # files with skip_existing + an override on one of them.
+        # files with skip_existing + a same-value override on one of
+        # them (quality: "medium" is already the effective default, so
+        # this override doesn't actually change anything).
         scan_and_wait(client, auth_headers, test_images)
         keep_ids = [scanned["files"][0]["id"], scanned["files"][1]["id"]]
         keep_names = {
@@ -190,12 +197,12 @@ class TestOverridesWithSkipExisting:
             file_ids=keep_ids,
             output_dir=str(out_dir),
             skip_existing=True,
-            overrides={keep_ids[0]: {"quality": "low"}},  # override on a skipped file
+            overrides={keep_ids[0]: {"quality": "medium"}},  # matches run 1's effective quality
         )
         assert r.status_code == 200
         assert len(d["results"]) == 2
-        # Both were reused (already in out_dir) — override ignored for the
-        # skipped file, exactly as designed.
+        # Both were reused (already in out_dir, and the override didn't
+        # actually change the effective settings for either file).
         assert all(res.get("skipped") for res in d["results"])
         assert {res["id"] for res in d["results"]} == set(keep_ids)
 
@@ -207,3 +214,49 @@ class TestOverridesWithSkipExisting:
         names = {n.replace("\\", "/") for n in ZipFile(BytesIO(zr.content)).namelist()}
         expected = {n.rsplit(".", 1)[0] + ".png" for n in keep_names}
         assert names == expected, (names, expected)
+
+    def test_skip_recompresses_when_override_changes_effective_settings(
+        self, client, auth_headers, test_images, tmp_path
+    ):
+        """Regression test: skip_existing used to key its reuse decision
+        purely on the source file's mtime, so a per-file override that
+        genuinely changes what should be produced (e.g. quality: "low"
+        instead of the original run's "medium") was silently dropped —
+        the stale medium-quality output got reused and the override had
+        no effect at all. It must now be honored: mismatched effective
+        settings mean a real recompress, not a silent skip."""
+        out_dir = tmp_path / "out"
+        scanned = scan_and_wait(client, auth_headers, test_images)
+        r, d = optimize_and_wait(client, auth_headers, output_dir=str(out_dir))
+        assert r.status_code == 200 and len(d["results"]) == 3
+        target_id = scanned["files"][0]["id"]
+        target_name = next(f for f in scanned["files"] if f["id"] == target_id)["name"]
+        stale_mtime_ns = (out_dir / target_name).stat().st_mtime_ns
+
+        import time
+        time.sleep(0.05)  # ensure a genuinely later mtime if recompressed
+
+        scan_and_wait(client, auth_headers, test_images)
+        r, d = optimize_and_wait(
+            client, auth_headers,
+            file_ids=[target_id],
+            output_dir=str(out_dir),
+            skip_existing=True,
+            overrides={target_id: {"quality": "low"}},  # differs from run 1's "medium"
+        )
+        assert r.status_code == 200
+        assert len(d["results"]) == 1
+        assert d["results"][0].get("skipped") is not True, (
+            "an override that changes effective settings must trigger a "
+            "recompress, not a silent reuse of stale output"
+        )
+        assert d["results"][0]["success"] is True
+        # The file was actually rewritten (fresh mtime), not left as the
+        # stale run-1 copy — the fake pngquant test double copies bytes
+        # through unchanged regardless of quality, so mtime is what proves
+        # a real write happened here rather than a skip.
+        new_mtime_ns = (out_dir / target_name).stat().st_mtime_ns
+        assert new_mtime_ns > stale_mtime_ns, (
+            "output file's mtime didn't change — looks like it was reused, "
+            "not recompressed with the override applied"
+        )
