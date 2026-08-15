@@ -478,6 +478,37 @@ class Optimizer:
                     temp_files.append(pngquant_tmp)
                 elif proc.returncode != 0:
                     msg = stderr.decode().strip()
+                    if compression_mode == "screenshot" and not self._is_png(input_path):
+                        # pngquant couldn't hit the 95-100 near-lossless floor
+                        # within 256 colors. For a source that's genuinely
+                        # PNG already, falling through to the plain lossless
+                        # pass below is safe (no format change, and it's
+                        # still covered by the general "don't ship a bigger
+                        # file" guard at the end of this function). But for
+                        # a non-PNG source forced through this PNG-only mode
+                        # (e.g. a JPEG that turns out not to be a UI
+                        # screenshot), that fallback would silently convert
+                        # it to a *lossless* PNG — and lossless PNG can't
+                        # compete with the source format's own lossy
+                        # encoding on content this color-complex. Reproduced
+                        # empirically: a synthetic photo that failed this
+                        # same pngquant call came out ~14x larger as a
+                        # lossless PNG than as the original JPEG. Fail the
+                        # file instead of shipping that.
+                        if progress_callback:
+                            await progress_callback(
+                                "screenshot mode: image too color-complex for a "
+                                "near-lossless palette, skipped (try Standard or "
+                                "Lossless mode instead)"
+                            )
+                        result["success"] = False
+                        result["error"] = (
+                            "Screenshot mode isn't a good fit for this image — its "
+                            "colors are too complex for a near-lossless palette "
+                            "(this usually means it's a photo, not a UI "
+                            "screenshot). Try Standard or Lossless mode instead."
+                        )
+                        return result
                     if progress_callback:
                         await progress_callback(f"pngquant: {msg} (skipped)")
                     result["warning"] = msg

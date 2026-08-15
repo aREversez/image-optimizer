@@ -164,6 +164,89 @@ class TestCompressionModes:
             "fallback must be genuinely lossless, not a lossy leftover"
         )
 
+    def test_screenshot_mode_fails_cleanly_when_non_png_source_is_too_complex_to_quantize(
+        self, tmp_path, optimizer, monkeypatch
+    ):
+        """Bug: a real (non-screenshot) photo run through Screenshot mode
+        got silently balooned to several times its original size. Root
+        cause: Screenshot mode always normalizes non-PNG sources to PNG
+        first (see _ensure_png), and when pngquant can't hit the 95-100
+        near-lossless floor on genuinely photographic content, it exits
+        nonzero — the old code treated that exactly like the
+        pngquant-not-found case and fell through to a plain *lossless*
+        PNG pass, i.e. shipped an uncompressed-ish PNG re-encode of a
+        JPEG, which is inherently much bigger than the JPEG (JPEG's lossy
+        DCT beats PNG's lossless DEFLATE on photo content by a wide
+        margin — reproduced empirically at ~14x on a synthetic photo).
+
+        Fix: when the source isn't already PNG (i.e. Screenshot mode is
+        about to force a real format conversion) and pngquant fails, fail
+        the file instead of silently shipping a bloated conversion."""
+        real_exec = asyncio.create_subprocess_exec
+
+        class _FakePngquantFailure:
+            returncode = 99
+
+            async def communicate(self):
+                return b"", b"pngquant: image quality below min\n"
+
+        async def spy_exec(*args, **kwargs):
+            if str(args[0]).endswith(("pngquant", "pngquant.exe", "pngquant.bat")):
+                return _FakePngquantFailure()
+            return await real_exec(*args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spy_exec)
+
+        src = tmp_path / "photo.jpg"
+        Image.new("RGB", (64, 64), (120, 80, 40)).save(src, format="JPEG")
+        out = tmp_path / "photo.png"
+
+        logs = []
+
+        async def log(msg):
+            logs.append(msg)
+
+        result = asyncio.run(optimizer.optimize_png(
+            src, out, compression_mode="screenshot", progress_callback=log,
+        ))
+        assert result["success"] is False
+        assert "isn't a good fit" in result["error"]
+        assert not out.exists(), "must not ship a bloated PNG conversion on failure"
+        assert any("too color-complex" in m for m in logs)
+
+    def test_screenshot_mode_still_falls_back_to_lossless_when_png_source_fails_to_quantize(
+        self, tmp_path, optimizer, monkeypatch
+    ):
+        """Unlike the non-PNG case above, a source that's already PNG
+        involves no format conversion — falling through to the existing
+        lossless pass on pngquant failure is still the right, safe
+        behavior here (matches the documented fallback for real
+        screenshots with an embedded photo that can't be quantized)."""
+        real_exec = asyncio.create_subprocess_exec
+
+        class _FakePngquantFailure:
+            returncode = 99
+
+            async def communicate(self):
+                return b"", b"pngquant: image quality below min\n"
+
+        async def spy_exec(*args, **kwargs):
+            if str(args[0]).endswith(("pngquant", "pngquant.exe", "pngquant.bat")):
+                return _FakePngquantFailure()
+            return await real_exec(*args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spy_exec)
+
+        src = tmp_path / "src.png"
+        self._make_png(src)
+        out = tmp_path / "out.png"
+
+        result = asyncio.run(optimizer.optimize_png(
+            src, out, compression_mode="screenshot",
+        ))
+        assert result["success"] is True
+        assert out.exists()
+
 
 class TestProtectedColorsAndDithering:
     def test_protected_colors_map_file_passed_to_pngquant(self, tmp_path, fake_bin_dir, optimizer):
