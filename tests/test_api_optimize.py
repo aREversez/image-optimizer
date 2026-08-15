@@ -320,6 +320,20 @@ class TestValidation:
         r, _ = optimize_and_wait(client, auth_headers, compression_mode="turbo")
         assert r.status_code == 400
 
+    def test_screenshot_mode_accepted_for_png(self, client, auth_headers, test_images):
+        scan_and_wait(client, auth_headers, test_images)
+        r, d = optimize_and_wait(client, auth_headers, compression_mode="screenshot", output_format="png")
+        assert r.status_code == 200
+        assert all(res["success"] for res in d["results"])
+
+    def test_screenshot_mode_rejected_for_non_png_format(self, client, auth_headers, test_images):
+        """Screenshot mode is a specifically-tuned pngquant pass, not a
+        general codec setting — it doesn't mean anything for webp/jpg/avif."""
+        scan_and_wait(client, auth_headers, test_images)
+        r, _ = optimize_and_wait(client, auth_headers, compression_mode="screenshot", output_format="webp")
+        assert r.status_code == 400
+        assert "PNG-only" in r.json()["error"]
+
     def test_invalid_protected_color_rejected(self, client, auth_headers, test_images):
         scan_and_wait(client, auth_headers, test_images)
         r, _ = optimize_and_wait(client, auth_headers, protected_colors=["not-a-color"])

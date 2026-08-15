@@ -126,6 +126,27 @@ class TestPreviewOptimize:
         )
         assert r.status_code == 400
 
+    def test_preview_screenshot_mode_requires_png(self, client, auth_headers, test_images):
+        scanned = scan_and_wait(client, auth_headers, test_images)
+        file_id = scanned["files"][0]["id"]
+        r = client.post(
+            "/api/preview-optimize",
+            json={"file_id": file_id, "compression_mode": "screenshot", "output_format": "jpg"},
+            headers=auth_headers,
+        )
+        assert r.status_code == 400
+        assert "PNG-only" in r.json()["error"]
+
+    def test_preview_screenshot_mode_with_png_succeeds(self, client, auth_headers, test_images):
+        scanned = scan_and_wait(client, auth_headers, test_images)
+        file_id = scanned["files"][0]["id"]
+        r = client.post(
+            "/api/preview-optimize",
+            json={"file_id": file_id, "compression_mode": "screenshot", "output_format": "png"},
+            headers=auth_headers,
+        )
+        assert r.status_code == 200
+
     def test_preview_supports_keep_exif_and_formats(self, client, auth_headers, test_images):
         scanned = scan_and_wait(client, auth_headers, test_images)
         file_id = scanned["files"][0]["id"]

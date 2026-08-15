@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
-from PIL import Image
+import pytest
+from PIL import Image, ImageChops, ImageStat
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
@@ -90,6 +92,77 @@ class TestCompressionModes:
 
         asyncio.run(optimizer.optimize_png(src, out, compression_mode="standard", progress_callback=log))
         assert any("color quantization" in m and "skipping" not in m for m in logs)
+
+    def test_screenshot_mode_uses_tight_quality_and_forces_no_dithering(self, tmp_path, optimizer, monkeypatch):
+        """Screenshot mode's whole value proposition is a much tighter
+        pngquant quality floor (95-100, vs Standard's 50-65/65-80/80-100
+        ranges) with dithering hardcoded off regardless of the caller's
+        `dithering` setting — see optimizer.py's screenshot branch for the
+        empirical numbers (measured on a real 4K UI screenshot: ~75% size
+        reduction with dithering off, vs dithering on costing ~75% *more*
+        file size for a *worse* color-error score, not better)."""
+        captured = {}
+        real_exec = asyncio.create_subprocess_exec
+
+        async def spy_exec(*args, **kwargs):
+            if str(args[0]).endswith(("pngquant", "pngquant.exe", "pngquant.bat")):
+                captured["argv"] = args
+            return await real_exec(*args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spy_exec)
+
+        src = tmp_path / "src.png"
+        self._make_png(src)
+        out = tmp_path / "out.png"
+        result = asyncio.run(optimizer.optimize_png(
+            src, out, compression_mode="screenshot",
+            dithering=True,  # explicitly ask for dithering — must be ignored
+        ))
+        assert result["success"] is True
+        argv = captured["argv"]
+        assert "95-100" in argv, f"expected the 95-100 quality floor, got: {argv}"
+        assert "--nofs" in argv, f"dithering must be forced off for screenshot mode, got: {argv}"
+        # Sanity: Standard mode's ranges must never appear here.
+        assert "65-80" not in argv and "80-100" not in argv and "50-65" not in argv
+
+    def test_screenshot_mode_never_resizes_even_with_max_width_set(self, tmp_path, optimizer):
+        """Screenshot mode is explicitly designed to never touch resolution
+        — the whole point is keeping UI text pixel-sharp. max_width must be
+        silently ignored, not error out, so the mode stays a true
+        one-click preset even if a leftover max_width value is present
+        from a previous Standard-mode run."""
+        src = tmp_path / "src.png"
+        self._make_png(src, size=(400, 300))
+        out = tmp_path / "out.png"
+        result = asyncio.run(optimizer.optimize_png(
+            src, out, compression_mode="screenshot", max_width=100,
+        ))
+        assert result["success"] is True
+        assert Image.open(out).size == (400, 300), "screenshot mode must ignore max_width entirely"
+
+    def test_screenshot_mode_falls_back_to_lossless_when_pngquant_unavailable(self, tmp_path, optimizer):
+        """If pngquant can't be found (e.g. removed mid-run), screenshot
+        mode must degrade to a plain lossless pass rather than fail the
+        file outright — same fallback shape as Standard mode without
+        pngquant."""
+        optimizer.pngquant_path = None
+        src = tmp_path / "src.png"
+        self._make_png(src)
+        out = tmp_path / "out.png"
+
+        logs = []
+
+        async def log(msg):
+            logs.append(msg)
+
+        result = asyncio.run(optimizer.optimize_png(
+            src, out, compression_mode="screenshot", progress_callback=log,
+        ))
+        assert result["success"] is True
+        assert any("pngquant not found" in m for m in logs)
+        assert list(Image.open(src).getdata()) == list(Image.open(out).getdata()), (
+            "fallback must be genuinely lossless, not a lossy leftover"
+        )
 
 
 class TestProtectedColorsAndDithering:
@@ -308,7 +381,7 @@ class TestAvailableModes:
         assert opt.cjpeg_path is not None
         assert opt.avifenc_path is not None
         modes = opt.available_modes()
-        assert {("png", "standard"), ("png", "lossless"), ("png", "resize_only"),
+        assert {("png", "standard"), ("png", "lossless"), ("png", "resize_only"), ("png", "screenshot"),
                 ("webp", "standard"), ("webp", "lossless"), ("webp", "resize_only"),
                 ("jpg", "standard"), ("jpg", "lossless"), ("jpg", "resize_only"),
                 ("avif", "standard"), ("avif", "lossless"), ("avif", "resize_only")} == modes
@@ -323,9 +396,10 @@ class TestAvailableModes:
         assert opt.avifenc_path is None
 
         modes = opt.available_modes()
-        # PNG standard — the one mode that actually needs pngquant for its
-        # lossy color quantization step — is dropped.
+        # PNG standard/screenshot — the two modes that actually need
+        # pngquant for their lossy color quantization step — are dropped.
         assert ("png", "standard") not in modes
+        assert ("png", "screenshot") not in modes
         # JPEG needs cjpeg for every mode (it's a genuine JPEG re-encode),
         # so without it the whole (jpg, *) family disappears.
         assert not any(fmt == "jpg" for fmt, _ in modes)
@@ -501,4 +575,83 @@ class TestAVIF:
         )
         assert "--quality" not in argv, "avifenc has no --quality flag — use -q/--qcolor"
         assert "-q" in argv
+
+
+class TestScreenshotModeRealBinaries:
+    """Empirical validation against real pngquant/oxipng (not the fake
+    test doubles) — skipped when they're not on PATH, since they're
+    genuine platform binaries CI can't run. Run this locally on a machine
+    with pngquant/oxipng installed to reproduce the numbers backing the
+    screenshot mode design (see optimizer.py's screenshot branch and
+    CHANGELOG): a real 3840x2160 UI screenshot (flat UI regions + a lot
+    of anti-aliased text + a gradient panel), synthesized here, should
+    compress by roughly 70-80% with near-zero color deviation."""
+
+    @staticmethod
+    def _real_binaries():
+        import shutil as _shutil
+        pq = _shutil.which("pngquant")
+        ox = _shutil.which("oxipng")
+        return pq, ox
+
+    def _make_synthetic_screenshot(self, path):
+        """A rough approximation of a real UI screenshot: flat sidebar/
+        toolbar regions, many small anti-aliased text glyphs (the part
+        that pushes real screenshots' color count into the thousands,
+        defeating a naive "screenshots have <=256 colors" assumption),
+        and a smooth gradient panel (the part most likely to show visible
+        banding under aggressive quantization)."""
+        from PIL import ImageDraw, ImageFont
+        W, H = 3840, 2160
+        img = Image.new("RGB", (W, H), (245, 246, 248))
+        d = ImageDraw.Draw(img)
+        d.rectangle([0, 0, 280, H], fill=(38, 42, 54))
+        d.rectangle([280, 0, W, 70], fill=(255, 255, 255))
+        try:
+            font = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 15
+            )
+        except OSError:
+            font = ImageFont.load_default()
+        for i in range(60):
+            d.text((320, 110 + i * 30), f"{i+1:>4}  some_code_line = {i}", font=font, fill=(60, 64, 74))
+        x0, y0, x1, y1 = 2600, 1300, 3820, 1900
+        for gy in range(y0, y1):
+            t = (gy - y0) / (y1 - y0)
+            d.line([x0, gy, x1, gy], fill=(int(240 - t*80), int(245 - t*60), int(250 - t*20)))
+        img.save(path, format="PNG", compress_level=1)
+        return img
+
+    def test_screenshot_mode_hits_target_compression_with_low_color_error(self, tmp_path):
+        pq, ox = self._real_binaries()
+        if not pq or not ox:
+            pytest.skip("real pngquant/oxipng not on PATH — this validates against the actual binaries, not the CI test doubles")
+
+        from app.optimizer import Optimizer
+        opt = Optimizer(bin_dir=tmp_path)
+        opt.pngquant_path = Path(pq)
+        opt.oxipng_path = Path(ox)
+
+        src = tmp_path / "screenshot.png"
+        self._make_synthetic_screenshot(src)
+        raw_size = src.stat().st_size
+        out = tmp_path / "out.png"
+
+        result = asyncio.run(opt.optimize_png(src, out, compression_mode="screenshot"))
+        assert result["success"] is True
+        reduction = 1 - (out.stat().st_size / raw_size)
+        assert reduction >= 0.65, (
+            f"only {reduction:.1%} reduction on the synthetic screenshot — "
+            "expected roughly 70-80%, see CHANGELOG for the reference numbers"
+        )
+
+        orig = Image.open(src).convert("RGB")
+        compressed = Image.open(out).convert("RGB")
+        diff = ImageChops.difference(orig, compressed)
+        mean_err = sum(ImageStat.Stat(diff).mean) / 3
+        assert mean_err < 0.1, (
+            f"mean per-channel color error {mean_err:.4f} is far higher than the "
+            "~0.007 measured in development — screenshot mode may no longer be "
+            "near-lossless on this kind of content"
+        )
 

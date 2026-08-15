@@ -175,7 +175,7 @@ header h1 span { color: var(--accent); }
   border-radius: var(--radius); color: var(--text); font-size: 14px; outline: none;
   min-width: 180px;
 }
-.config-group.disabled-group { opacity: .45; }
+.config-group.disabled-group, .radio-group.disabled-group { opacity: .45; }
 .radio-group { display: flex; gap: 4px; background: var(--bg); border-radius: var(--radius); padding: 3px; }
 .radio-group label {
   padding: 6px 16px; border-radius: 5px; cursor: pointer; font-size: 13px;
@@ -559,6 +559,13 @@ header h1 span { color: var(--accent); }
             title="Shrinks image dimensions (requires Max Width to be set) and compresses losslessly — keeps full original color accuracy at the smaller size.">
           <label for="mode-resize"
             title="Shrinks image dimensions (requires Max Width to be set) and compresses losslessly — keeps full original color accuracy at the smaller size.">Resize Only</label>
+          <input type="radio" name="mode" id="mode-screenshot" value="screenshot"
+            title="Tuned specifically for software/UI screenshots (PNG only): a much tighter color-quality floor than Standard mode, dithering off, no resize — full resolution and near-zero color deviation, typically ~70-80% smaller. Falls back to Lossless automatically if a particular image is too color-complex (e.g. a screenshot with an embedded photo) to hit that quality floor.">
+          <label for="mode-screenshot"
+            title="Tuned specifically for software/UI screenshots (PNG only): a much tighter color-quality floor than Standard mode, dithering off, no resize — full resolution and near-zero color deviation, typically ~70-80% smaller. Falls back to Lossless automatically if a particular image is too color-complex (e.g. a screenshot with an embedded photo) to hit that quality floor.">Screenshot</label>
+        </div>
+        <div id="screenshot-mode-note" style="display:none;font-size:12px;color:var(--text2);margin-top:8px">
+          Tuned for software/UI screenshots — PNG only, full resolution, no manual tuning needed. Quality, Max Width, Protect Colors, and Dithering don't apply in this mode.
         </div>
       </div>
       <div class="config-group" id="protect-colors-group">
@@ -1341,13 +1348,30 @@ function showConfigSection() {
 // Compression Mode: controls which settings are relevant.
 function updateModeDependentControls() {
   const mode = document.querySelector('input[name="mode"]:checked').value;
+  const isScreenshot = mode === 'screenshot';
+
+  // Screenshot mode is PNG-only (it's a tuned pngquant pass, not a general
+  // codec setting) — lock the format to PNG and disable the others so the
+  // user can't land on a combination the backend would 400 on. Re-enabling
+  // happens naturally below since this whole block re-runs on every mode
+  // change, including switching away from Screenshot.
+  if (isScreenshot) {
+    document.getElementById('fmt-png').checked = true;
+  }
+  document.querySelectorAll('input[name="format"]').forEach(r => {
+    r.disabled = isScreenshot && r.value !== 'png';
+  });
+
   const format = document.querySelector('input[name="format"]:checked').value;
   const isStandard = mode === 'standard';
   const isPng = format === 'png';
 
   // Protect Colors / Dithering: pngquant-specific — only apply in Standard
   // mode AND when the output format is PNG (WebP uses its own encoder and
-  // never touches pngquant, regardless of compression mode).
+  // never touches pngquant, regardless of compression mode). Screenshot
+  // mode uses pngquant too, but with hardcoded internal settings (a much
+  // tighter quality floor, dithering forced off) — these controls don't
+  // apply to it either, same as every other non-Standard mode.
   const pngquantApplies = isStandard && isPng;
   protectColorsInput.disabled = !pngquantApplies;
   ditheringInput.disabled = !pngquantApplies;
@@ -1357,28 +1381,35 @@ function updateModeDependentControls() {
   // Quality: relevant for Standard-mode PNG (pngquant target), Standard-mode
   // WebP/AVIF (Pillow's/avifenc's own quality parameter), and Standard-mode
   // JPEG (cjpeg -quality) — only meaningless when compression mode isn't
-  // Standard (Lossless/Resize Only skip quality entirely for every format).
+  // Standard (Lossless/Resize Only/Screenshot skip quality entirely).
   document.querySelectorAll('input[name="quality"]').forEach(r => r.disabled = !isStandard);
   document.getElementById('quality-group').classList.toggle('disabled-group', !isStandard);
+
+  // Max Width is intentionally NOT tied to compression mode or format in
+  // general — resizing is orthogonal to how colors/encoding are handled,
+  // so it stays enabled for Standard/Lossless/Resize Only. Screenshot mode
+  // is the one exception: it never resizes (the whole point is keeping UI
+  // text pixel-sharp at full resolution — see optimizer.py), and silently
+  // ignores max_width server-side, so leaving the control enabled here
+  // would let the user set a value that quietly does nothing.
+  $('max-width').disabled = isScreenshot;
+  $('max-width').closest('.config-group')?.classList.toggle('disabled-group', isScreenshot);
+
+  const screenshotNote = $('screenshot-mode-note');
+  screenshotNote.style.display = isScreenshot ? 'block' : 'none';
 
   // JPEG is an inherently lossy codec — there's no true lossless pass, so
   // 'Lossless'/'Resize Only' for JPG just encodes at mozjpeg's highest
   // quality (~95) with no palette change. Tell the user that up front
   // instead of implying pixel-perfect output.
   const modeNote = $('mode-note');
-  if (format === 'jpg' && !isStandard) {
+  if (format === 'jpg' && !isStandard && !isScreenshot) {
     modeNote.textContent =
       'JPEG is inherently lossy — "Lossless" and "Resize Only" use mozjpeg\u2019s highest quality (~95) with no palette changes.';
     modeNote.style.display = 'block';
   } else {
     modeNote.style.display = 'none';
   }
-
-  // Max Width is intentionally NOT tied to compression mode or format —
-  // resizing is orthogonal to how colors/encoding are handled. You can
-  // shrink dimensions in Standard mode just as validly as in Lossless/
-  // Resize Only (in fact combining resize with quantization is one of the
-  // strongest ways to cut file size), so it stays enabled in all cases.
 
   updateStartButtonState();
 }

@@ -4,6 +4,40 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Screenshot mode** (`compression_mode: "screenshot"`, PNG only). A
+  dedicated one-click preset for software/UI screenshots, which Standard/
+  Lossless/Resize Only all handle poorly: Standard's default quality
+  ranges visibly shifted colors on gradients/shadows (measured mean
+  color error 0.33, gradient-region error up to 48/255 — clearly visible
+  banding); Lossless alone only cut a synthetic 4K UI screenshot by 43%;
+  Resize Only blurs exactly the UI text a screenshot is usually kept
+  around to reference. Screenshot mode instead runs pngquant at a much
+  tighter quality floor (95-100 vs Standard's 50-65/65-80/80-100) with
+  dithering forced off — screenshots' native color count is naturally
+  close to 256 already (flat UI regions + anti-aliased text edges), so a
+  near-lossless palette fit is achievable without the resolution ever
+  changing. Measured on a synthetic 3840x2160 UI screenshot (flat
+  sidebar/toolbar, ~60 lines of anti-aliased text, a gradient panel):
+  75.3% size reduction with mean color error 0.007 (vs Standard's 0.33)
+  and zero resolution loss. Dithering was measured to make things worse
+  for this content, not better — ~75% larger output for a worse (not
+  better) color-error score, since Floyd-Steinberg spreads noise into
+  what would otherwise be near-free-to-compress flat regions and roughens
+  text edges — so it's hardcoded off rather than left as a per-run choice.
+  If an individual image's true color complexity is too high to hit the
+  95-100 floor within 256 colors (e.g. a screenshot with an embedded
+  photo), pngquant declines and the file falls back to a plain lossless
+  pass automatically — same safety net as the color-deviation-averse
+  behavior everywhere else in the app, never a forced bad result. 32-bit
+  (RGBA-with-opaque-alpha) screenshots need no special handling — both
+  pngquant and oxipng already detect and drop a fully-opaque alpha
+  channel on their own (confirmed identical output size/bytes whether
+  the source is pre-stripped to RGB or left as opaque RGBA).
+  Quality/Max Width/Protect Colors/Dithering don't apply to this mode
+  and are disabled in the UI when it's selected; Output Format is locked
+  to PNG since the whole technique is PNG-specific.
+
 ### Fixed
 - **`skip_existing` ignored settings changes between runs.** Its reuse
   decision was keyed purely on the source file's mtime vs the existing

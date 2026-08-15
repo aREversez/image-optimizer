@@ -73,6 +73,39 @@ class TestWatchStartStop:
         status = client.get("/api/watch/status", headers=auth_headers).json()
         assert status["running"] is False
 
+    def test_watch_rejects_screenshot_mode_with_non_png_format(self, client, auth_headers, tmp_path):
+        watch_dir = tmp_path / "watch"
+        watch_dir.mkdir()
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        r = client.post("/api/watch/start", json={
+            "directory": str(watch_dir),
+            "output_dir": str(output_dir),
+            "output_format": "webp",
+            "compression_mode": "screenshot",
+        }, headers=auth_headers)
+        assert r.status_code == 400
+        assert "PNG-only" in r.json()["error"]
+
+        status = client.get("/api/watch/status", headers=auth_headers).json()
+        assert status["running"] is False
+
+    def test_watch_accepts_screenshot_mode_with_png(self, client, auth_headers, tmp_path):
+        watch_dir = tmp_path / "watch"
+        watch_dir.mkdir()
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        r = client.post("/api/watch/start", json={
+            "directory": str(watch_dir),
+            "output_dir": str(output_dir),
+            "output_format": "png",
+            "compression_mode": "screenshot",
+        }, headers=auth_headers)
+        assert r.status_code == 200
+        client.post("/api/watch/stop", headers=auth_headers)
+
     def test_watch_rejects_when_already_running(self, client, auth_headers, tmp_path):
         watch_dir = tmp_path / "watch"
         watch_dir.mkdir()

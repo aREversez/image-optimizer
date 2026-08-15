@@ -987,8 +987,13 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
     if state.is_running:
         return JSONResponse({"error": "Optimization in progress, please wait"}, status_code=400)
 
-    if data.compression_mode not in ("standard", "lossless", "resize_only"):
+    if data.compression_mode not in ("standard", "lossless", "resize_only", "screenshot"):
         return JSONResponse({"error": "Invalid compression_mode"}, status_code=400)
+    if data.compression_mode == "screenshot" and data.output_format != "png":
+        return JSONResponse(
+            {"error": "Screenshot mode is PNG-only (it's a tuned pngquant pass, not a general codec setting)"},
+            status_code=400,
+        )
     if data.quality not in ("high", "medium", "low"):
         # Previously an unknown quality silently fell back to "medium" deep
         # inside the optimizer — reject it here like the other enum fields
@@ -1101,7 +1106,7 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
     # must fail the request loudly, not half-start a run. See
     # _validate_overrides for the field-value/unknown-key/resize_only rules.
     selected_ids = {f["id"] for f in files_to_process}
-    ov_err = _validate_overrides(data.overrides, selected_ids, data.compression_mode, data.max_width)
+    ov_err = _validate_overrides(data.overrides, selected_ids, data.compression_mode, data.max_width, data.output_format)
     if ov_err:
         return JSONResponse({"error": ov_err}, status_code=400)
 
@@ -1211,15 +1216,18 @@ OVERRIDEABLE_FIELDS = (
 )
 
 
-def _validate_overrides(overrides: dict, selected_ids: set, top_mode: str, top_width: int) -> Optional[str]:
+def _validate_overrides(
+    overrides: dict, selected_ids: set, top_mode: str, top_width: int, top_format: str
+) -> Optional[str]:
     """Validate every per-file override entry. Returns an error string on the
     first problem, or None if all entries are well-formed.
 
     Field-value checks (enum/colors/unknown-keys) run for EVERY entry, even
     ids not in the selection — a typo in an override for a deselected file is
-    still a typo worth reporting. The resize_only+max_width cross-check only
-    runs for selected ids: an override on an unselected file has no effect,
-    so complaining about it would be a false positive."""
+    still a typo worth reporting. The resize_only+max_width and
+    screenshot+PNG-only cross-checks only run for selected ids: an override
+    on an unselected file has no effect, so complaining about it would be a
+    false positive."""
     for fid, ov in overrides.items():
         if not isinstance(ov, dict):
             return f"Override for file {fid!r} must be an object"
@@ -1229,7 +1237,7 @@ def _validate_overrides(overrides: dict, selected_ids: set, top_mode: str, top_w
                     f"Supported: {list(OVERRIDEABLE_FIELDS)}")
         if "quality" in ov and ov["quality"] not in ("high", "medium", "low"):
             return f"Invalid quality in override for file {fid!r}: {ov['quality']!r}"
-        if "compression_mode" in ov and ov["compression_mode"] not in ("standard", "lossless", "resize_only"):
+        if "compression_mode" in ov and ov["compression_mode"] not in ("standard", "lossless", "resize_only", "screenshot"):
             return f"Invalid compression_mode in override for file {fid!r}: {ov['compression_mode']!r}"
         if "output_format" in ov and ov["output_format"] not in ("png", "webp", "jpg", "avif"):
             return f"Invalid output_format in override for file {fid!r}: {ov['output_format']!r}"
@@ -1243,13 +1251,17 @@ def _validate_overrides(overrides: dict, selected_ids: set, top_mode: str, top_w
             bc = [c for c in ov["protected_colors"] if not HEX_COLOR_RE.match(str(c).strip())]
             if bc:
                 return f"Invalid color(s) in override for file {fid!r}: {', '.join(bc)}"
-        # resize_only needs a max_width — check the effective combination, but
-        # only for files actually being processed.
+        # resize_only needs a max_width, and screenshot is PNG-only — check
+        # the effective combination, but only for files actually being
+        # processed.
         if fid in selected_ids:
             eff_mode = ov.get("compression_mode", top_mode)
             eff_width = ov.get("max_width", top_width)
+            eff_format = ov.get("output_format", top_format)
             if eff_mode == "resize_only" and eff_width <= 0:
                 return f"Resize Only mode requires Max Width (override for file {fid!r})"
+            if eff_mode == "screenshot" and eff_format != "png":
+                return f"Screenshot mode is PNG-only (override for file {fid!r})"
     return None
 
 
@@ -1833,8 +1845,13 @@ async def preview_optimize(data: PreviewRequest, state: AppState = Depends(get_s
         return JSONResponse({"error": "Optimizer not initialized"}, status_code=503)
     # Same enum validation as /api/optimize, so a preview reflects what the
     # real run would actually accept (a typo'd mode fails here, not silently).
-    if data.compression_mode not in ("standard", "lossless", "resize_only"):
+    if data.compression_mode not in ("standard", "lossless", "resize_only", "screenshot"):
         return JSONResponse({"error": "Invalid compression_mode"}, status_code=400)
+    if data.compression_mode == "screenshot" and data.output_format != "png":
+        return JSONResponse(
+            {"error": "Screenshot mode is PNG-only (it's a tuned pngquant pass, not a general codec setting)"},
+            status_code=400,
+        )
     if data.quality not in ("high", "medium", "low"):
         return JSONResponse(
             {"error": f"Invalid quality: {data.quality!r}. Supported: 'high', 'medium', 'low'."},
@@ -2748,8 +2765,13 @@ async def watch_start(
                 ),
             }, status_code=400)
 
-    if data.compression_mode not in ("standard", "lossless", "resize_only"):
+    if data.compression_mode not in ("standard", "lossless", "resize_only", "screenshot"):
         return JSONResponse({"error": "Invalid compression_mode"}, status_code=400)
+    if data.compression_mode == "screenshot" and data.output_format != "png":
+        return JSONResponse(
+            {"error": "Screenshot mode is PNG-only (it's a tuned pngquant pass, not a general codec setting)"},
+            status_code=400,
+        )
     if data.quality not in ("high", "medium", "low"):
         return JSONResponse({"error": f"Invalid quality: {data.quality!r}"}, status_code=400)
     if data.compression_mode == "resize_only" and data.max_width <= 0:

@@ -161,6 +161,32 @@ class TestOverridesValidation:
         r, _ = optimize_and_wait(client, auth_headers, overrides={"0": {"compression_mode": "resize_only"}})
         assert r.status_code == 400
 
+    def test_screenshot_override_requires_png_output(self, client, auth_headers, test_images):
+        """A per-file override switching one file to screenshot mode while
+        the top-level output_format is webp must be rejected the same way
+        the top-level combination is — screenshot mode is PNG-only."""
+        scan_and_wait(client, auth_headers, test_images)
+        r, _ = optimize_and_wait(
+            client, auth_headers,
+            output_format="webp",
+            overrides={"0": {"compression_mode": "screenshot"}},
+        )
+        assert r.status_code == 400
+        assert "PNG-only" in r.json()["error"]
+
+    def test_screenshot_override_with_matching_png_format_succeeds(self, client, auth_headers, test_images):
+        """The reverse: an override to screenshot mode is fine as long as
+        the *effective* output_format for that file is png — whether from
+        the top-level setting or from the same override."""
+        scan_and_wait(client, auth_headers, test_images)
+        r, d = optimize_and_wait(
+            client, auth_headers,
+            output_format="png",
+            overrides={"0": {"compression_mode": "screenshot"}},
+        )
+        assert r.status_code == 200
+        assert all(res["success"] for res in d["results"])
+
 
 class TestOverridesWithSkipExisting:
     """The cross-cutting case: overrides + skip_existing + a narrowed
