@@ -144,6 +144,172 @@ class Optimizer:
         except Exception:
             return False
 
+    # (format -> extensions) used by _apply_growth_guard to tell whether a
+    # result is a genuine format conversion (nothing safe to fall back to)
+    # or a same-format optimize (safe to fall back to a stripped copy of
+    # the original).
+    _SAME_FORMAT_EXTS = {
+        "png": {".png"},
+        "jpg": {".jpg", ".jpeg"},
+        "webp": {".webp"},
+    }
+
+    _PNG_METADATA_CHUNKS = (b"eXIf", b"tEXt", b"zTXt", b"iTXt", b"tIME")
+
+    @staticmethod
+    def _strip_png_metadata(data: bytes) -> bytes:
+        """Remove EXIF/text/timestamp chunks from a PNG's bytes, same set
+        pngquant --strip / oxipng --strip safe remove. Color-management
+        chunks (iCCP, gAMA, cHRM, sRGB) are left alone — they're not
+        privacy-sensitive and removing them isn't what --strip is for."""
+        for chunk_type in Optimizer._PNG_METADATA_CHUNKS:
+            data = Optimizer._strip_png_chunks(data, chunk_type)
+        return data
+
+    @staticmethod
+    def _strip_jpeg_metadata(data: bytes) -> bytes:
+        """Remove all APPn metadata segments (Exif, XMP, ICC profile,
+        Photoshop/IPTC, ...) and COM comments from a JPEG's bytes, keeping
+        APP0/JFIF and everything from SOS onward untouched. Matches what
+        the normal cjpeg-from-PPM pipeline already produces (it starts
+        from raw pixels with zero metadata) — this gets the same result
+        on a copy of the original bytes instead of a full re-encode.
+        Malformed input is returned unchanged rather than raising."""
+        if len(data) < 4 or data[0:2] != b"\xff\xd8":
+            return data
+        out = bytearray(data[0:2])
+        pos = 2
+        n = len(data)
+        strip_markers = set(range(0xE1, 0xF0)) | {0xFE}  # APP1-APP15, COM
+        while pos + 2 <= n:
+            if data[pos] != 0xFF:
+                out += data[pos:]
+                return bytes(out)
+            marker = data[pos + 1]
+            if marker == 0xFF:  # fill byte between markers
+                out.append(0xFF)
+                pos += 1
+                continue
+            if marker == 0xD8:  # stray SOI
+                out += data[pos:pos + 2]
+                pos += 2
+                continue
+            if marker == 0xDA:  # SOS — metadata segments are done, entropy
+                # data (with any RST markers) plus EOI follow verbatim.
+                out += data[pos:]
+                return bytes(out)
+            if marker == 0x01 or 0xD0 <= marker <= 0xD7:
+                # standalone markers with no length field (shouldn't
+                # appear before SOS, but handled just in case)
+                out += data[pos:pos + 2]
+                pos += 2
+                continue
+            if pos + 4 > n:
+                break
+            seg_len = int.from_bytes(data[pos + 2:pos + 4], "big")
+            total = 2 + seg_len
+            if pos + total > n:
+                break  # malformed/truncated — bail, append the raw remainder below
+            if marker not in strip_markers:
+                out += data[pos:pos + total]
+            pos += total
+        out += data[pos:]
+        return bytes(out)
+
+    @staticmethod
+    def _strip_webp_metadata(data: bytes) -> bytes:
+        """Remove EXIF/XMP RIFF chunks from a WebP's bytes. VP8/VP8L/VP8X/
+        ALPH/ANIM/ANMF/ICCP chunks are left alone. Malformed input, or
+        input with nothing to strip, is returned unchanged."""
+        if len(data) < 12 or data[0:4] != b"RIFF" or data[8:12] != b"WEBP":
+            return data
+        body = bytearray()
+        pos = 12
+        n = len(data)
+        removed_any = False
+        while pos + 8 <= n:
+            fourcc = data[pos:pos + 4]
+            size = int.from_bytes(data[pos + 4:pos + 8], "little")
+            total = 8 + size + (size & 1)  # chunks are padded to an even length
+            if pos + total > n:
+                body += data[pos:]
+                pos = n
+                break
+            if fourcc in (b"EXIF", b"XMP "):
+                removed_any = True
+            else:
+                body += data[pos:pos + total]
+            pos += total
+        if pos < n:
+            body += data[pos:]
+        if not removed_any:
+            return data
+        riff_size = 4 + len(body)  # "WEBP" + chunks, excluding the 8-byte RIFF header itself
+        return b"RIFF" + riff_size.to_bytes(4, "little") + b"WEBP" + bytes(body)
+
+    def _apply_growth_guard(
+        self,
+        input_path: Path,
+        output_path: Path,
+        output_format: str,
+        result: dict,
+        keep_exif: bool,
+        cleaned_exif: bytes,
+    ) -> None:
+        """If the just-produced output isn't actually smaller than the
+        original, and no format conversion was requested (the source is
+        already `output_format`), replace it with the original's pixel
+        data unchanged but with privacy-relevant metadata (EXIF/GPS, XMP,
+        text comments) stripped the same way the normal pipeline
+        promises — never re-encoded, so the result can only ever be the
+        same size as or smaller than the raw original.
+
+        Skipped for a genuine format conversion (e.g. Screenshot mode
+        forcing jpg -> png): the original bytes wouldn't be a valid file
+        at output_path's extension, so there's nothing safe to fall back
+        to there — that case is handled by each pipeline's own logic
+        instead (see optimize_png's pngquant-failure branch).
+
+        AVIF isn't handled here — its ISOBMFF box structure needs a real
+        box parser to strip safely, which is more machinery than this
+        narrow a case (avifenc rarely loses to an already-AVIF source)
+        justifies right now.
+
+        Best-effort: any failure here is swallowed and the original
+        (larger) result stands rather than turning a successful
+        compression into a failure."""
+        if not result.get("success") or output_format not in ("png", "jpg", "webp"):
+            return
+        if result["compressed_size"] < result["original_size"]:
+            return
+        exts = self._SAME_FORMAT_EXTS.get(output_format, set())
+        if input_path.suffix.lower() not in exts:
+            return
+        try:
+            original_bytes = input_path.read_bytes()
+            if output_format == "png":
+                if original_bytes[:8] != PNG_MAGIC:
+                    return
+                stripped = self._strip_png_metadata(original_bytes)
+            elif output_format == "jpg":
+                stripped = self._strip_jpeg_metadata(original_bytes)
+            else:
+                stripped = self._strip_webp_metadata(original_bytes)
+            output_path.write_bytes(stripped)
+            if keep_exif and cleaned_exif:
+                if output_format == "png":
+                    self._finalize_png_exif(output_path, cleaned_exif)
+                elif output_format == "jpg":
+                    self._finalize_jpeg_exif(output_path, cleaned_exif)
+                # WebP has no standalone EXIF-chunk injector (the normal
+                # pipeline attaches it via Pillow's save(exif=...) during
+                # encode) — this narrow fallback leaves WebP metadata-free
+                # rather than risk a malformed RIFF/VP8X rewrite.
+            result["compressed_size"] = os.path.getsize(output_path)
+            result["kept_original"] = True
+        except Exception:
+            pass
+
     @staticmethod
     def _ensure_png(src: Path, dst: Path):
         """Re-encode any Pillow-readable image (jpg/bmp/tiff/...) into a real PNG.
@@ -568,6 +734,10 @@ class Optimizer:
                 result["success"] = False
                 result["error"] = "output file not generated"
 
+            self._apply_growth_guard(
+                input_path, output_path, "png", result, keep_exif, cleaned_exif
+            )
+
         except Exception as e:
             result["success"] = False
             result["error"] = str(e)
@@ -653,6 +823,10 @@ class Optimizer:
                 result["success"] = True
             else:
                 result["error"] = "output file not generated"
+
+            self._apply_growth_guard(
+                input_path, output_path, "webp", result, keep_exif, cleaned_exif
+            )
         except Exception as e:
             result["success"] = False
             result["error"] = str(e)
@@ -784,6 +958,10 @@ class Optimizer:
                 result["success"] = True
             else:
                 result["error"] = "output file not generated"
+
+            self._apply_growth_guard(
+                input_path, output_path, "jpg", result, keep_exif, cleaned_exif
+            )
         except Exception as e:
             result["success"] = False
             result["error"] = str(e)

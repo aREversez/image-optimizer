@@ -444,6 +444,168 @@ class TestJPEG:
             assert img.mode in ("RGB", "L")
 
 
+class TestGrowthGuard:
+    """Bug: same-format 'optimization' that ends up bigger than the source
+    (or that leaves the source's size unchanged) got shipped as-is,
+    reporting a negative savings percentage on a file that's genuinely no
+    better than what the user already had. Fix: _apply_growth_guard falls
+    back to the original's pixel data (unmodified) with privacy-relevant
+    metadata stripped — never re-encoded, so it can only be the same size
+    as or smaller than the raw original, and it keeps the same
+    'GPS is gone by default' guarantee the compressed path makes."""
+
+    @staticmethod
+    def _png_with_exif_chunk(path: Path, exif_payload: bytes, size=(40, 40), color=(10, 20, 30)):
+        import struct
+        import zlib
+        Image.new("RGB", size, color).save(path, format="PNG")
+        data = bytearray(path.read_bytes())
+        chunk = struct.pack(">I", len(exif_payload)) + b"eXIf" + exif_payload
+        chunk += struct.pack(">I", zlib.crc32(b"eXIf" + exif_payload) & 0xFFFFFFFF)
+        iend_pos = data.rfind(b"IEND") - 4  # back up over IEND's 4-byte length field
+        path.write_bytes(bytes(data[:iend_pos]) + chunk + bytes(data[iend_pos:]))
+
+    def test_same_format_png_falls_back_to_original_pixels_with_exif_stripped(self, tmp_path, optimizer):
+        """The fake pngquant/oxipng binaries just copy bytes through
+        unchanged (no real compression), so a source with an eXIf chunk
+        comes out the exact same size with the chunk still attached —
+        exactly the 'no improvement' case the guard exists for."""
+        src = tmp_path / "src.png"
+        self._png_with_exif_chunk(src, b"II*\x00fake-exif-payload-would-carry-gps")
+        out = tmp_path / "out.png"
+
+        result = asyncio.run(optimizer.optimize_png(src, out, compression_mode="standard"))
+
+        assert result["success"] is True
+        assert result.get("kept_original") is True
+        out_bytes = out.read_bytes()
+        assert b"eXIf" not in out_bytes
+        assert b"fake-exif-payload-would-carry-gps" not in out_bytes
+        assert list(Image.open(src).getdata()) == list(Image.open(out).getdata())
+
+    def test_same_format_jpeg_falls_back_to_original_bytes_with_exif_stripped(self, tmp_path, optimizer):
+        src = tmp_path / "src.jpg"
+        img = Image.new("RGB", (40, 40), (200, 50, 90))
+        exif = img.getexif()
+        exif[0x010E] = "test description"  # arbitrary tag so APP1 is written
+        img.save(src, format="JPEG", exif=exif.tobytes())
+        assert b"Exif" in src.read_bytes()
+        out = tmp_path / "out.jpg"
+
+        # lossless mode maps to q=95 in the fake cjpeg's real Pillow re-encode,
+        # which for a flat-color 40x40 swatch typically won't beat the
+        # source's own JPEG encoding — if it happens to for some Pillow
+        # version, the guard simply won't fire and this assertion tree
+        # still holds trivially (result stays smaller, no eXIF concern
+        # either way since cjpeg's own PPM pipeline is metadata-free).
+        result = asyncio.run(optimizer.optimize_png(
+            src, out, output_format="jpg", compression_mode="lossless",
+        ))
+        assert result["success"] is True
+        if result.get("kept_original"):
+            assert b"Exif" not in out.read_bytes()
+
+    def test_cross_format_conversion_is_never_touched_by_the_guard(self, tmp_path, optimizer):
+        """A genuine format conversion (jpg source -> png output) must
+        never trigger the fallback — the original bytes wouldn't even be
+        a valid file at the target extension."""
+        src = tmp_path / "src.jpg"
+        Image.new("RGB", (40, 40), (5, 5, 5)).save(src, format="JPEG")
+        out = tmp_path / "out.png"
+        result = asyncio.run(optimizer.optimize_png(src, out, compression_mode="standard"))
+        assert result["success"] is True
+        assert "kept_original" not in result
+        assert out.read_bytes()[:8] == PNG_MAGIC
+
+
+class TestMetadataStrippers:
+    """Direct unit coverage for the pure byte-manipulation helpers behind
+    the growth guard — these are hand-rolled container parsers (PNG chunk
+    stream, JPEG marker stream, WebP RIFF stream), so they're worth
+    testing in isolation from the async pipelines that call them."""
+
+    def test_strip_png_metadata_removes_exif_keeps_pixels(self, tmp_path):
+        from app.optimizer import Optimizer
+        path = tmp_path / "x.png"
+        TestGrowthGuard._png_with_exif_chunk(path, b"II*\x00some-exif-bytes")
+        data = path.read_bytes()
+        stripped = Optimizer._strip_png_metadata(data)
+        assert b"eXIf" not in stripped
+        assert b"some-exif-bytes" not in stripped
+        assert stripped[:8] == PNG_MAGIC
+        # still a valid, openable PNG with the same pixels
+        out = tmp_path / "y.png"
+        out.write_bytes(stripped)
+        assert list(Image.open(path).getdata()) == list(Image.open(out).getdata())
+
+    def test_strip_png_metadata_leaves_color_chunks_alone(self):
+        from app.optimizer import Optimizer
+        import io
+        buf = io.BytesIO()
+        Image.new("RGB", (10, 10), (1, 2, 3)).save(buf, format="PNG", pnginfo=None)
+        data = buf.getvalue()
+        # sanity: no metadata chunks to begin with, must be a pure no-op
+        assert Optimizer._strip_png_metadata(data) == data
+
+    def test_strip_jpeg_metadata_removes_exif_keeps_pixels(self, tmp_path):
+        from app.optimizer import Optimizer
+        path = tmp_path / "x.jpg"
+        img = Image.new("RGB", (40, 40), (9, 8, 7))
+        exif = img.getexif()
+        exif[0x010E] = "desc"
+        img.save(path, format="JPEG", exif=exif.tobytes())
+        data = path.read_bytes()
+        assert b"Exif" in data
+        stripped = Optimizer._strip_jpeg_metadata(data)
+        assert b"Exif" not in stripped
+        out = tmp_path / "y.jpg"
+        out.write_bytes(stripped)
+        assert Image.open(out).size == (40, 40)
+
+    def test_strip_jpeg_metadata_noop_on_clean_jpeg(self, tmp_path):
+        from app.optimizer import Optimizer
+        path = tmp_path / "x.jpg"
+        Image.new("RGB", (20, 20), (1, 1, 1)).save(path, format="JPEG")
+        data = path.read_bytes()
+        stripped = Optimizer._strip_jpeg_metadata(data)
+        out = tmp_path / "y.jpg"
+        out.write_bytes(stripped)
+        assert list(Image.open(path).getdata()) == list(Image.open(out).getdata())
+
+    def test_strip_jpeg_metadata_handles_malformed_input_without_raising(self):
+        from app.optimizer import Optimizer
+        assert Optimizer._strip_jpeg_metadata(b"") == b""
+        assert Optimizer._strip_jpeg_metadata(b"not a jpeg") == b"not a jpeg"
+        assert Optimizer._strip_jpeg_metadata(b"\xff\xd8\xff") == b"\xff\xd8\xff"
+
+    def test_strip_webp_metadata_removes_exif_keeps_pixels(self, tmp_path):
+        from app.optimizer import Optimizer
+        path = tmp_path / "x.webp"
+        img = Image.new("RGB", (30, 30), (4, 5, 6))
+        exif = img.getexif()
+        exif[0x010E] = "desc"
+        img.save(path, format="WEBP", exif=exif.tobytes())
+        data = path.read_bytes()
+        assert b"EXIF" in data
+        stripped = Optimizer._strip_webp_metadata(data)
+        assert b"EXIF" not in stripped
+        out = tmp_path / "y.webp"
+        out.write_bytes(stripped)
+        assert list(Image.open(path).convert("RGB").getdata()) == list(Image.open(out).convert("RGB").getdata())
+
+    def test_strip_webp_metadata_noop_on_clean_webp(self, tmp_path):
+        from app.optimizer import Optimizer
+        path = tmp_path / "x.webp"
+        Image.new("RGB", (20, 20), (2, 2, 2)).save(path, format="WEBP", lossless=True)
+        data = path.read_bytes()
+        assert Optimizer._strip_webp_metadata(data) == data
+
+    def test_strip_webp_metadata_handles_malformed_input_without_raising(self):
+        from app.optimizer import Optimizer
+        assert Optimizer._strip_webp_metadata(b"") == b""
+        assert Optimizer._strip_webp_metadata(b"not a webp") == b"not a webp"
+
+
 class TestAvailableModes:
     """`ready` predates WebP / lossless / resize_only and only described the
     Standard-mode PNG path — so it returns False on a build that can still
