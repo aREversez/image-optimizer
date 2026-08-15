@@ -115,17 +115,27 @@ header h1 span { color: var(--accent); }
 
 /* Main Layout */
 .container {
-  max-width: 1400px; margin: 0 auto; padding: 20px 24px;
-  display: grid; grid-template-columns: 380px 1fr; gap: 20px; align-items: start;
+  max-width: 1680px; margin: 0 auto; padding: 20px 24px;
+  display: grid; grid-template-columns: 380px 1fr 340px; gap: 20px; align-items: start;
 }
 .app-sidebar {
   display: flex; flex-direction: column; gap: 20px; position: sticky; top: 20px;
   max-height: calc(100vh - 40px); overflow-y: auto;
 }
 .app-main { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
+.app-right {
+  display: flex; flex-direction: column; gap: 20px; position: sticky; top: 20px;
+}
+/* Between 1000-1300px there's no room for a true third column, so Watch
+   Mode drops to a full-width row under Settings/Files instead of getting
+   squeezed into a column that's too narrow for its inputs. */
+@media (max-width: 1300px) {
+  .container { grid-template-columns: 380px 1fr; }
+  .app-right { grid-column: 1 / -1; position: static; }
+}
 @media (max-width: 1000px) {
   .container { display: flex; flex-direction: column; }
-  .app-sidebar { position: static; }
+  .app-sidebar, .app-right { position: static; }
 }
 
 .card {
@@ -183,6 +193,16 @@ header h1 span { color: var(--accent); }
 }
 .radio-group input { display: none; }
 .radio-group input:checked + label { background: var(--accent); color: #000; font-weight: 500; }
+/* Compression Mode has 4 options and two of them ("Resize Only",
+   "Screenshot") are long enough to overflow a single flex row inside the
+   380px sidebar. Lay it out as a self-contained 2x2 grid instead so it
+   never depends on how much space the row happens to have. */
+#mode-group {
+  display: grid; grid-template-columns: repeat(2, 1fr); gap: 4px;
+}
+#mode-group label {
+  padding: 8px 10px; text-align: center;
+}
 .check-row {
   display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer;
   user-select: none; padding: 8px 0;
@@ -498,6 +518,87 @@ header h1 span { color: var(--accent); }
     </label>
   </div>
 
+  </div>
+
+  <div class="app-main">
+
+  <!-- File List -->
+  <div class="card" id="files-section">
+    <div class="card-title">Files</div>
+    <div class="file-stats">
+      <span id="file-stats-text"></span>
+      <span style="display:flex;align-items:center;gap:10px">
+        <label for="file-sort" style="font-size:12px">Sort</label>
+        <select id="file-sort">
+          <option value="default">Scan order</option>
+          <option value="mtime_desc">Modified (newest first)</option>
+          <option value="mtime_asc">Modified (oldest first)</option>
+          <option value="ctime_desc">Created (newest first)</option>
+          <option value="ctime_asc">Created (oldest first)</option>
+          <option value="size_desc">Size (large to small)</option>
+          <option value="size_asc">Size (small to large)</option>
+        </select>
+        <label style="font-size:13px;cursor:pointer;user-select:none">
+          <input type="checkbox" id="select-all" checked /> Select all
+        </label>
+      </span>
+    </div>
+    <div id="files-empty" style="font-size:13px;color:var(--text2);padding:0 0 16px">Images will appear here after you scan a folder or add files</div>
+    <div class="file-grid" id="file-grid"></div>
+  </div>
+
+  <!-- Progress -->
+  <div class="card" id="progress-section">
+    <div class="card-title">Progress</div>
+    <div class="progress-bar"><div class="progress-bar-fill" id="progress-fill"></div></div>
+    <div class="progress-info">
+      <span id="progress-text">Waiting...</span>
+      <span>
+        <button class="btn btn-secondary btn-sm" id="pause-btn" style="display:none;padding:4px 12px;font-size:12px" title="Pause: stop starting new files (in-flight ones finish). Click Resume to continue.">Pause</button>
+        <button class="btn btn-primary btn-sm" id="resume-btn" style="display:none;padding:4px 12px;font-size:12px">Resume</button>
+        <button class="btn btn-danger btn-sm" id="cancel-btn" style="display:none;padding:4px 12px;font-size:12px">Cancel</button>
+      </span>
+    </div>
+    <div class="log-box" id="log-box"></div>
+  </div>
+
+  <!-- Results -->
+  <div class="card" id="results-section">
+    <div class="card-title">Results</div>
+    <div id="results-empty" style="font-size:13px;color:var(--text2);padding:0 0 16px">No results yet, run Start to see compressed files</div>
+    <div class="result-summary" id="result-summary"></div>
+    <div class="action-bar" style="margin-bottom:12px">
+      <span id="output-path-info" style="font-size:12px;color:var(--text2)"></span>
+      <div class="spacer"></div>
+      <button class="btn btn-secondary" id="retry-btn" style="display:none">Retry Failed</button>
+      <button class="btn btn-secondary" id="reveal-dir-btn" style="display:none" title="Open the output folder in the OS file explorer">Reveal Output Folder</button>
+      <button class="btn btn-primary" id="download-btn" style="display:none">Download All (ZIP)</button>
+      <button class="btn btn-secondary" id="reset-btn">Reset</button>
+    </div>
+    <div class="result-toolbar" id="result-toolbar" style="display:none">
+      <label for="result-sort">Sort</label>
+      <select id="result-sort">
+        <option value="default">Completion order</option>
+        <option value="savings_desc">Compression % (high to low)</option>
+        <option value="savings_asc">Compression % (low to high)</option>
+        <option value="size_desc">Compressed size (large to small)</option>
+        <option value="saved_desc">Bytes saved (most first)</option>
+      </select>
+      <label for="result-filter">Show</label>
+      <select id="result-filter">
+        <option value="all">All</option>
+        <option value="success">Succeeded only</option>
+        <option value="failed">Failed only</option>
+      </select>
+      <span class="count" id="result-count"></span>
+    </div>
+    <div class="result-grid" id="result-grid"></div>
+  </div>
+
+  </div>
+
+  <div class="app-right">
+
   <!-- Config + Action -->
   <div class="card" id="config-section">
     <div class="card-title">Settings</div>
@@ -623,83 +724,6 @@ header h1 span { color: var(--accent); }
       <span style="font-size:12px;color:var(--text2)" id="watch-stats"></span>
     </div>
     <div class="watch-log-box" id="watch-log-box" style="display:none"></div>
-  </div>
-
-  </div>
-
-  <div class="app-main">
-
-  <!-- File List -->
-  <div class="card" id="files-section">
-    <div class="card-title">Files</div>
-    <div class="file-stats">
-      <span id="file-stats-text"></span>
-      <span style="display:flex;align-items:center;gap:10px">
-        <label for="file-sort" style="font-size:12px">Sort</label>
-        <select id="file-sort">
-          <option value="default">Scan order</option>
-          <option value="mtime_desc">Modified (newest first)</option>
-          <option value="mtime_asc">Modified (oldest first)</option>
-          <option value="ctime_desc">Created (newest first)</option>
-          <option value="ctime_asc">Created (oldest first)</option>
-          <option value="size_desc">Size (large to small)</option>
-          <option value="size_asc">Size (small to large)</option>
-        </select>
-        <label style="font-size:13px;cursor:pointer;user-select:none">
-          <input type="checkbox" id="select-all" checked /> Select all
-        </label>
-      </span>
-    </div>
-    <div id="files-empty" style="font-size:13px;color:var(--text2);padding:0 0 16px">Images will appear here after you scan a folder or add files</div>
-    <div class="file-grid" id="file-grid"></div>
-  </div>
-
-  <!-- Progress -->
-  <div class="card" id="progress-section">
-    <div class="card-title">Progress</div>
-    <div class="progress-bar"><div class="progress-bar-fill" id="progress-fill"></div></div>
-    <div class="progress-info">
-      <span id="progress-text">Waiting...</span>
-      <span>
-        <button class="btn btn-secondary btn-sm" id="pause-btn" style="display:none;padding:4px 12px;font-size:12px" title="Pause: stop starting new files (in-flight ones finish). Click Resume to continue.">Pause</button>
-        <button class="btn btn-primary btn-sm" id="resume-btn" style="display:none;padding:4px 12px;font-size:12px">Resume</button>
-        <button class="btn btn-danger btn-sm" id="cancel-btn" style="display:none;padding:4px 12px;font-size:12px">Cancel</button>
-      </span>
-    </div>
-    <div class="log-box" id="log-box"></div>
-  </div>
-
-  <!-- Results -->
-  <div class="card" id="results-section">
-    <div class="card-title">Results</div>
-    <div id="results-empty" style="font-size:13px;color:var(--text2);padding:0 0 16px">No results yet, run Start to see compressed files</div>
-    <div class="result-summary" id="result-summary"></div>
-    <div class="action-bar" style="margin-bottom:12px">
-      <span id="output-path-info" style="font-size:12px;color:var(--text2)"></span>
-      <div class="spacer"></div>
-      <button class="btn btn-secondary" id="retry-btn" style="display:none">Retry Failed</button>
-      <button class="btn btn-secondary" id="reveal-dir-btn" style="display:none" title="Open the output folder in the OS file explorer">Reveal Output Folder</button>
-      <button class="btn btn-primary" id="download-btn" style="display:none">Download All (ZIP)</button>
-      <button class="btn btn-secondary" id="reset-btn">Reset</button>
-    </div>
-    <div class="result-toolbar" id="result-toolbar" style="display:none">
-      <label for="result-sort">Sort</label>
-      <select id="result-sort">
-        <option value="default">Completion order</option>
-        <option value="savings_desc">Compression % (high to low)</option>
-        <option value="savings_asc">Compression % (low to high)</option>
-        <option value="size_desc">Compressed size (large to small)</option>
-        <option value="saved_desc">Bytes saved (most first)</option>
-      </select>
-      <label for="result-filter">Show</label>
-      <select id="result-filter">
-        <option value="all">All</option>
-        <option value="success">Succeeded only</option>
-        <option value="failed">Failed only</option>
-      </select>
-      <span class="count" id="result-count"></span>
-    </div>
-    <div class="result-grid" id="result-grid"></div>
   </div>
 
   </div>
