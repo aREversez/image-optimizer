@@ -602,6 +602,54 @@ def _fmt_size(b: int) -> str:
     return f"{b / (1024 * 1024):.2f} MB"
 
 
+# Strings for the standalone Compare page (see /api/preview below). This
+# page is server-rendered and opened in its own tab/window, so it can't
+# share index.html's client-side I18N dict or read its localStorage — the
+# caller passes its current language as a ?lang= query param instead (see
+# the previewUrl construction in index.html). Keep in step with
+# index.html's I18N when adding a language; only "en"/"zh" exist today.
+PREVIEW_I18N = {
+    "en": {
+        "not_found": "Not found",
+        "title_prefix": "Compare - ",
+        "saved": "saved {pct}%",
+        "side_by_side": "Side by Side",
+        "overlay": "Overlay",
+        "fit": "Fit",
+        "fit_title": "Scale images to fit the window",
+        "zoom100": "100%",
+        "zoom100_title": "Show actual pixels — the real test for whether text stays sharp",
+        "original_label": "Original ({size})",
+        "compressed_label": "Compressed ({size})",
+        "original": "Original",
+        "compressed": "Compressed",
+        "toggle_suffix": " \u2014 click image to toggle (or press space)",
+        "footer_overlay": "Click the image (or press space) to flip between original and compressed",
+        "footer_side": "Original (left) vs Compressed (right)",
+        "zoom_hint": " (scroll to pan around at actual size)",
+    },
+    "zh": {
+        "not_found": "未找到",
+        "title_prefix": "对比 - ",
+        "saved": "节省 {pct}%",
+        "side_by_side": "并排对比",
+        "overlay": "叠加对比",
+        "fit": "适应窗口",
+        "fit_title": "缩放图片以适应窗口",
+        "zoom100": "100%",
+        "zoom100_title": "显示实际像素——检验文字是否保持清晰的真正标准",
+        "original_label": "原图（{size}）",
+        "compressed_label": "压缩后（{size}）",
+        "original": "原图",
+        "compressed": "压缩后",
+        "toggle_suffix": "\u2014点击图片切换（或按空格键）",
+        "footer_overlay": "点击图片（或按空格键）切换原图与压缩后效果",
+        "footer_side": "原图（左）对比压缩后（右）",
+        "zoom_hint": "（可滚动查看实际尺寸下的细节）",
+    },
+}
+
+
 def _is_valid_reusable_output(path: Path, expected_format: str) -> bool:
     """Best-effort corruption check for a skip_existing reuse candidate.
 
@@ -1957,15 +2005,24 @@ async def get_result(ws_name: str, result_path: str, state: AppState = Depends(g
 
 
 @app.get("/api/preview/{ws_name}/{file_id}")
-async def preview(ws_name: str, file_id: str, state: AppState = Depends(get_session)):
+async def preview(ws_name: str, file_id: str, request: Request, state: AppState = Depends(get_session)):
     # Same ownership check as every other workspace-scoped endpoint. Doing
     # it FIRST also closes a reflected-XSS hole: ws_name is an arbitrary
     # URL path segment that gets embedded in the HTML below — without this
     # gate (plus the html.escape on the URLs), a crafted ws_name like
     # `"><script>...` would execute in this app's origin and could then
     # harvest APP_TOKEN from the index page, defeating the CSRF defense.
+    # This page is opened in a new tab (see index.html's `${previewUrl}`,
+    # which appends the caller's current UI language as ?lang=), so it
+    # can't read the main page's localStorage directly — the query param
+    # is how the language choice crosses that boundary. Anything other
+    # than a known key falls back to English; this dict is standalone
+    # from index.html's I18N (different runtime, server- vs client-
+    # rendered) and needs updating in step with it for new languages.
+    lang = request.query_params.get("lang", "en")
+    T = PREVIEW_I18N.get(lang, PREVIEW_I18N["en"])
     if not (state.workspace and state.workspace.name == ws_name):
-        return HTMLResponse("<h2>Not found</h2>", status_code=404)
+        return HTMLResponse(f"<h2>{T['not_found']}</h2>", status_code=404)
     html = """<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <style>
@@ -2002,7 +2059,7 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
             break
 
     if not result:
-        return HTMLResponse("<h2>Not found</h2>", status_code=404)
+        return HTMLResponse(f"<h2>{T['not_found']}</h2>", status_code=404)
 
     import html as _html
 
@@ -2018,44 +2075,60 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 
     safe_name = _html.escape(str(result['name']))
     safe_basename = _html.escape(Path(result['name']).name)
+    title_prefix = _html.escape(T["title_prefix"])
     html = html.replace(
         '<head><meta charset="utf-8">',
-        f'<head><meta charset="utf-8"><title>Compare - {safe_basename}</title>',
+        f'<head><meta charset="utf-8"><title>{title_prefix}{safe_basename}</title>',
         1,
     )
+    orig_size = _fmt_size(result['original_size'])
+    comp_size = _fmt_size(result['compressed_size'])
+    saved_text = _html.escape(T["saved"].format(pct=result.get('savings_percent', 0)))
+    # Static, hardcoded-in-Python strings only (never user/result data) —
+    # safe to embed directly as a JS object literal for the toggle script
+    # below, same trust boundary as the rest of this f-string page.
+    js_i18n = json.dumps({
+        "original": T["original"],
+        "compressed": T["compressed"],
+        "toggle_suffix": T["toggle_suffix"],
+        "footer_overlay": T["footer_overlay"],
+        "footer_side": T["footer_side"],
+        "zoom_hint": T["zoom_hint"],
+    })
     html += f"""
 <div class="bar">
   <span class="title">{safe_name}</span>
-  <span class="stats">{_fmt_size(result['original_size'])} -> {_fmt_size(result['compressed_size'])} | saved {result.get('savings_percent', 0)}%</span>
+  <span class="stats">{orig_size} -> {comp_size} | {saved_text}</span>
   <div class="view-toggle">
-    <button class="view-btn" id="btn-side">Side by Side</button>
-    <button class="view-btn active" id="btn-overlay">Overlay</button>
+    <button class="view-btn" id="btn-side">{_html.escape(T['side_by_side'])}</button>
+    <button class="view-btn active" id="btn-overlay">{_html.escape(T['overlay'])}</button>
   </div>
   <div class="zoom-toggle">
-    <button class="view-btn active" id="btn-fit" title="Scale images to fit the window">Fit</button>
-    <button class="view-btn" id="btn-zoom100" title="Show actual pixels — the real test for whether text stays sharp">100%</button>
+    <button class="view-btn active" id="btn-fit" title="{_html.escape(T['fit_title'])}">{_html.escape(T['fit'])}</button>
+    <button class="view-btn" id="btn-zoom100" title="{_html.escape(T['zoom100_title'])}">{_html.escape(T['zoom100'])}</button>
   </div>
 </div>
 <div class="container" id="side-view" style="display:none">
   <div class="panel">
-    <div class="label">Original ({_fmt_size(result['original_size'])})</div>
+    <div class="label">{_html.escape(T['original_label'].format(size=orig_size))}</div>
     <div class="image-wrap" id="orig-wrap"><img src="{orig_url}" id="orig-img" alt="original"/></div>
   </div>
   <div class="panel">
-    <div class="label">Compressed ({_fmt_size(result['compressed_size'])})</div>
+    <div class="label">{_html.escape(T['compressed_label'].format(size=comp_size))}</div>
     <div class="image-wrap" id="comp-wrap"><img src="{comp_url}" id="comp-img" alt="compressed"/></div>
   </div>
 </div>
 <div class="overlay-view" id="overlay-view">
-  <div class="overlay-label" id="overlay-label">Compressed &mdash; click image to toggle (or press space)</div>
+  <div class="overlay-label" id="overlay-label">{_html.escape(T['compressed'] + T['toggle_suffix'])}</div>
   <div class="overlay-wrap" id="overlay-wrap">
     <img src="{orig_url}" class="overlay-img" id="overlay-orig" alt="original" style="display:none"/>
     <img src="{comp_url}" class="overlay-img" id="overlay-comp" alt="compressed"/>
   </div>
 </div>
-<div class="footer" id="footer-hint">Overlay — click the image (or press space) to flip between original and compressed</div>
+<div class="footer" id="footer-hint">{_html.escape(T['footer_overlay'])}</div>
 <script>
 (function(){{
+  var I18N = {js_i18n};
   var sideBtn = document.getElementById('btn-side');
   var overlayBtn = document.getElementById('btn-overlay');
   var fitBtn = document.getElementById('btn-fit');
@@ -2098,10 +2171,10 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 
   function updateFooter(){{
     var isOverlay = overlayView.style.display !== 'none';
-    var zoomHint = zoomedIn ? ' (scroll to pan around at actual size)' : '';
+    var zoomHint = zoomedIn ? I18N.zoom_hint : '';
     footer.textContent = isOverlay
-      ? 'Click the image (or press space) to flip between original and compressed' + zoomHint
-      : 'Original (left) vs Compressed (right)' + zoomHint;
+      ? I18N.footer_overlay + zoomHint
+      : I18N.footer_side + zoomHint;
   }}
 
   function toggleImage(){{
@@ -2109,7 +2182,7 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
     showingOriginal = !showingOriginal;
     orig.style.display = showingOriginal ? 'block' : 'none';
     comp.style.display = showingOriginal ? 'none' : 'block';
-    label.textContent = (showingOriginal ? 'Original' : 'Compressed') + ' \\u2014 click image to toggle (or press space)';
+    label.textContent = (showingOriginal ? I18N.original : I18N.compressed) + I18N.toggle_suffix;
   }}
   wrap.addEventListener('click', toggleImage);
   document.addEventListener('keydown', function(e){{

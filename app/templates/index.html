@@ -805,6 +805,7 @@ const I18N = {
     'settings.saveFailed': 'Failed to save settings',
     'common.resume': 'Resume',
     'common.dismiss': 'Dismiss',
+    'batchResume.found': 'Found unfinished batch: {done}/{total} completed ({failed} failed). Resume?',
     'common.browseFolder': 'Browse Folder...',
     'common.browse': 'Browse...',
     'common.includeSubfolders': 'Include subfolders',
@@ -821,6 +822,7 @@ const I18N = {
     'input.scanBtn': 'Scan Folder',
     'input.scanning': 'Scanning...',
     'input.findingImages': 'Finding images...',
+    'input.scanningProgress': 'Scanning {current} / {total} images...',
     'input.browseFilesBtn': 'Browse Files...',
     'input.clearAll': 'Clear all',
     'input.noImagesFound': 'No images found',
@@ -966,6 +968,7 @@ const I18N = {
     'settings.saveFailed': '保存设置失败',
     'common.resume': '继续',
     'common.dismiss': '关闭',
+    'batchResume.found': '发现未完成的批次：已完成 {done}/{total}（失败 {failed} 个）。是否继续？',
     'common.browseFolder': '浏览文件夹...',
     'common.browse': '浏览...',
     'common.includeSubfolders': '包含子文件夹',
@@ -982,6 +985,7 @@ const I18N = {
     'input.scanBtn': '扫描文件夹',
     'input.scanning': '扫描中...',
     'input.findingImages': '正在查找图片...',
+    'input.scanningProgress': '正在扫描 {current} / {total} 张图片...',
     'input.browseFilesBtn': '浏览文件...',
     'input.clearAll': '全部清除',
     'input.noImagesFound': '未找到图片',
@@ -1040,7 +1044,7 @@ const I18N = {
     'results.countAll': '共 {total} 个文件',
     'results.countFiltered': '显示 {shown} / {total} 个',
     'config.title': '设置',
-    'config.watchLockNotice': 'Watch Mode 运行期间这些设置被锁定——点击"开始监控"时的设置已被记录，不会再跟随改动。请先停止 Watch Mode 再修改，然后重新开始。',
+    'config.watchLockNotice': 'Watch Mode 运行期间这些设置被锁定——点击\u201c开始监控\u201d时的设置已被记录，不会再跟随改动。请先停止 Watch Mode 再修改，然后重新开始。',
     'config.quality': '质量',
     'config.qualityTitle': '控制 Standard 模式允许牺牲多少色彩细节来换取体积。对于带文字的 UI 截图，选择 High 通常不会增加太多体积，因为截图本身颜色数就不多。',
     'config.qualityHigh': '高',
@@ -1064,8 +1068,8 @@ const I18N = {
     'config.modeScreenshot': '截图模式',
     'config.modeScreenshotTitle': '专为软件/UI 截图调优（仅支持 PNG）：色彩质量下限比 Standard 模式严格得多，关闭抖动、不缩放——保持全分辨率且色彩偏差趋近于零，通常能缩小约 70-80%。如果某张图片颜色过于复杂（比如截图里嵌了一张照片）而无法达到该质量下限，会自动改用 Lossless 模式的行为。',
     'config.screenshotNote': '专为软件/UI 截图调优——仅支持 PNG，保持全分辨率，无需手动调参。此模式下 Quality、Max Width、Protect Colors 和 Dithering 均不生效。',
-    'config.modeNoteJpeg': 'JPEG 本身是有损格式——\u201cLossless\u201d 和 \u201cResize Only\u201d 会使用 mozjpeg 的最高质量（约 95），不改变调色板。',
-    'config.resizeOnlyHint': 'Resize Only 模式需要将 Max Width 设置为\u201c不缩放\u201d以外的值。',
+    'config.modeNoteJpeg': 'JPEG 本身是有损格式——\u201c无损\u201d和\u201c仅缩放\u201d会使用 mozjpeg 的最高质量（约 95），不改变调色板。',
+    'config.resizeOnlyHint': '\u201c仅缩放\u201d模式需要将 Max Width 设置为\u201c不缩放\u201d以外的值。',
     'config.protectColors': '保护颜色',
     'config.protectColorsTitle': '这里列出的颜色在构建压缩调色板时会被优先保留，降低被相近颜色替换的概率。不是 100% 保证。仅在 Standard 模式下生效。',
     'config.protectColorsInputTitle': '这里列出的颜色（十六进制色号，用逗号分隔）在构建压缩调色板时会被优先保留，降低被相近颜色替换的概率。不是 100% 保证——pngquant 仍可能调整调色板的其余部分。仅在 Standard 模式下生效。',
@@ -1075,7 +1079,7 @@ const I18N = {
     'config.enabled': '已启用',
     'watch.title': 'Watch Mode',
     'watch.desc': '监控一个文件夹，自动优化新出现或发生变化的图片。',
-    'watch.useCurrentPaths': '使用"选择图片/输出路径"中的设置',
+    'watch.useCurrentPaths': '使用\u201c选择图片/输出路径\u201d中的设置',
     'watch.dirPlaceholder': '监控目录',
     'watch.outputPlaceholder': '输出目录（必填）',
     'watch.processExisting': '处理已有文件',
@@ -1097,16 +1101,36 @@ const I18N = {
     'notice.enterWatchDir': '请输入要监控的目录',
     'notice.enterOutputDir': '请输入输出目录',
     'notice.watchStartFailedPrefix': '启动监控失败：',
-    'notice.pathsBothEmpty': '"选择图片"和"输出路径"都是空的——请先在上方设置好。',
+    'notice.pathsBothEmpty': '\u201c选择图片\u201d和\u201c输出路径\u201d都是空的——请先在上方设置好。',
     'notice.watchOutputStillEmpty': '已复制监控目录，但那边的输出路径也是空的——Watch Mode 需要一个输出文件夹（没有临时文件夹选项），请先设置好再开始。',
     'notice.resumeFailed': '恢复失败',
     'notice.resumeFailedPrefix': '恢复失败：',
   },
 };
 
+// Best-effort mapping from browser locale to a supported I18N key. Only
+// 'zh'/'en' exist today; anything else (or no match) falls back to 'en'.
+// Extend this alongside I18N when a new language is added.
+function detectBrowserLang() {
+  const candidates = (navigator.languages && navigator.languages.length)
+    ? navigator.languages
+    : [navigator.language || navigator.userLanguage || 'en'];
+  for (const l of candidates) {
+    const base = String(l).toLowerCase();
+    if (base.startsWith('zh')) return 'zh';
+    if (base.startsWith('en')) return 'en';
+  }
+  return 'en';
+}
+
+// Explicit choice (Settings > Language) always wins and persists. With
+// nothing stored yet, the browser's language is used as the initial
+// default — recomputed live rather than cached, so it isn't "sticky" the
+// way an explicit choice is.
 function currentLang() {
   const stored = localStorage.getItem('imgopt.lang');
-  return (stored && I18N[stored]) ? stored : 'en';
+  if (stored && I18N[stored]) return stored;
+  return detectBrowserLang();
 }
 
 // t(key, vars?) — looks up `key` in the current language, falling back to
@@ -1175,7 +1199,7 @@ function showNotice(message, type) {
   type = type || 'info';
   const el = document.createElement('div');
   el.className = `notice ${type}`;
-  el.innerHTML = `<span class="notice-msg"></span><button class="notice-close" aria-label="Dismiss">&times;</button>`;
+  el.innerHTML = `<span class="notice-msg"></span><button class="notice-close" aria-label="${t('common.dismiss')}">&times;</button>`;
   el.querySelector('.notice-msg').textContent = message;
   const remove = () => el.remove();
   el.querySelector('.notice-close').addEventListener('click', remove);
@@ -1187,7 +1211,7 @@ function showPersistentNotice(message, type) {
   dismissPersistentNotice();
   const el = document.createElement('div');
   el.className = `notice ${type || 'info'}`;
-  el.innerHTML = `<span class="notice-msg"></span><button class="notice-close" aria-label="Dismiss">&times;</button>`;
+  el.innerHTML = `<span class="notice-msg"></span><button class="notice-close" aria-label="${t('common.dismiss')}">&times;</button>`;
   el.querySelector('.notice-msg').textContent = message;
   el.querySelector('.notice-close').addEventListener('click', () => dismissPersistentNotice());
   noticeContainer.appendChild(el);
@@ -1405,7 +1429,7 @@ async function pollScanProgress() {
     if (d.total > 0) {
       const pct = Math.round((d.current / d.total) * 100);
       scanProgressFill.style.width = pct + '%';
-      scanProgressText.textContent = `Scanning ${d.current} / ${d.total} images...`;
+      scanProgressText.textContent = t('input.scanningProgress', { current: d.current, total: d.total });
     } else {
       scanProgressText.textContent = t('input.findingImages');
     }
@@ -2209,7 +2233,7 @@ function renderResultGrid() {
         </div>`;
       continue;
     }
-    const previewUrl = `/api/preview/${STATE.wsName}/${r.id}`;
+    const previewUrl = `/api/preview/${STATE.wsName}/${r.id}?lang=${encodeURIComponent(currentLang())}`;
     const savedLine = r.skipped
       ? `<div class="rsaved">${t('results.skipped')}</div>`
       : `<div class="rsaved">${t('results.saved', { pct: r.savings_percent })}</div>`;
@@ -2563,7 +2587,7 @@ async function checkBatchState() {
     const d = await r.json();
     if (!d.has_batch) return;
     _savedBatchState = d;
-    resumeText.textContent = `Found unfinished batch: ${d.done}/${d.total} completed (${d.failed} failed). Resume?`;
+    resumeText.textContent = t('batchResume.found', { done: d.done, total: d.total, failed: d.failed });
     resumeBanner.style.display = 'flex';
   } catch(e) { /* no batch or server error */ }
 }
