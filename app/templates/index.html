@@ -394,11 +394,11 @@ header h1 span { color: var(--accent); }
 .settings-panel h2 button:hover { color: var(--text); }
 .settings-field { margin-bottom: 14px; }
 .settings-field label { display: block; font-size: 12px; font-weight: 600; color: var(--text2); margin-bottom: 4px; }
-.settings-field input {
+.settings-field input, .settings-field select {
   width: 100%; padding: 7px 10px; border: 1px solid var(--border); border-radius: var(--radius);
-  background: var(--bg); color: var(--text); font-size: 13px;
+  background: var(--bg); color: var(--text); font-size: 13px; font-family: inherit;
 }
-.settings-field input:focus { outline: none; border-color: var(--accent); }
+.settings-field input:focus, .settings-field select:focus { outline: none; border-color: var(--accent); }
 .settings-field .field-hint { font-size: 11px; color: var(--text2); margin-top: 2px; }
 .settings-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 18px; }
 .settings-actions .btn { padding: 7px 18px; font-size: 13px; }
