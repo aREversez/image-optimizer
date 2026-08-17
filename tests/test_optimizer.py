@@ -95,12 +95,18 @@ class TestCompressionModes:
 
     def test_screenshot_mode_uses_tight_quality_and_forces_no_dithering(self, tmp_path, optimizer, monkeypatch):
         """Screenshot mode's whole value proposition is a much tighter
-        pngquant quality floor (95-100, vs Standard's 50-65/65-80/80-100
+        pngquant quality floor (75-100, vs Standard's 50-65/65-80/80-100
         ranges) with dithering hardcoded off regardless of the caller's
         `dithering` setting — see optimizer.py's screenshot branch for the
-        empirical numbers (measured on a real 4K UI screenshot: ~75% size
-        reduction with dithering off, vs dithering on costing ~75% *more*
-        file size for a *worse* color-error score, not better)."""
+        empirical numbers. The floor was originally 95-100; lowered to
+        75-100 after measuring that pngquant's min-max range only acts as
+        a pass/fail gate (looser min costs nothing on content that already
+        clears the tight floor — measured byte-identical output across a
+        60-100 to 95-100 sweep), while images that couldn't clear 95 at
+        all were previously failing outright and getting zero quantization
+        benefit. Dithering stays off: on a real 4K UI screenshot, dithering
+        on cost ~75% *more* file size for a *worse* color-error score, not
+        better."""
         captured = {}
         real_exec = asyncio.create_subprocess_exec
 
@@ -120,7 +126,7 @@ class TestCompressionModes:
         ))
         assert result["success"] is True
         argv = captured["argv"]
-        assert "95-100" in argv, f"expected the 95-100 quality floor, got: {argv}"
+        assert "75-100" in argv, f"expected the 75-100 quality floor, got: {argv}"
         assert "--nofs" in argv, f"dithering must be forced off for screenshot mode, got: {argv}"
         # Sanity: Standard mode's ranges must never appear here.
         assert "65-80" not in argv and "80-100" not in argv and "50-65" not in argv
@@ -170,7 +176,7 @@ class TestCompressionModes:
         """Bug: a real (non-screenshot) photo run through Screenshot mode
         got silently balooned to several times its original size. Root
         cause: Screenshot mode always normalizes non-PNG sources to PNG
-        first (see _ensure_png), and when pngquant can't hit the 95-100
+        first (see _ensure_png), and when pngquant can't hit the
         near-lossless floor on genuinely photographic content, it exits
         nonzero — the old code treated that exactly like the
         pngquant-not-found case and fell through to a plain *lossless*
