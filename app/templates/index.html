@@ -21,29 +21,34 @@
   --radius: 8px;
   --shadow: 0 1px 6px rgba(0,0,0,.08);
 }
-/* Dark palette. accent/green/red/yellow stay identical across themes so the
-   brand color and status colors read the same; only the neutral surfaces and
-   text flip. Applied via data-theme="dark" (manual toggle) OR, when the user
+/* Dark palette. green/red/yellow stay identical across themes so the
+   status colors read the same; surfaces, text, and accent shift to
+   cooler slate tones for better contrast and a less muddy feel.
+   Applied via data-theme="dark" (manual toggle) OR, when the user
    hasn't explicitly chosen a theme (no data-theme attribute), via the OS
    prefers-color-scheme media query below. */
 :root[data-theme="dark"] {
-  --bg: #1e1c1a;
-  --surface: #2a2724;
-  --surface2: #332f2b;
-  --border: #413b35;
-  --text: #e8e3dc;
-  --text2: #9a938b;
-  --shadow: 0 1px 6px rgba(0,0,0,.4);
+  --bg: #1a1d21;
+  --surface: #25292e;
+  --surface2: #32383e;
+  --border: #454c54;
+  --text: #eaecf0;
+  --text2: #8e95a0;
+  --accent: #62a3a3;
+  --accent2: #559494;
+  --shadow: 0 1px 6px rgba(0,0,0,.35);
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme]) {
-    --bg: #1e1c1a;
-    --surface: #2a2724;
-    --surface2: #332f2b;
-    --border: #413b35;
-    --text: #e8e3dc;
-    --text2: #9a938b;
-    --shadow: 0 1px 6px rgba(0,0,0,.4);
+    --bg: #1a1d21;
+    --surface: #25292e;
+    --surface2: #32383e;
+    --border: #454c54;
+    --text: #eaecf0;
+    --text2: #8e95a0;
+    --accent: #62a3a3;
+    --accent2: #559494;
+    --shadow: 0 1px 6px rgba(0,0,0,.35);
   }
 }
 * { margin:0; padding:0; box-sizing:border-box; }
@@ -162,7 +167,7 @@ header h1 span { color: var(--accent); }
   padding: 10px 20px; border: none; border-radius: var(--radius); cursor: pointer;
   font-size: 14px; font-weight: 500; transition: all .2s; white-space: nowrap;
 }
-.btn-primary { background: var(--accent); color: #000; }
+.btn-primary { background: var(--accent); color: #fff; }
 .btn-primary:hover { background: var(--accent2); }
 .btn-primary:disabled { opacity: .4; cursor: not-allowed; }
 .btn-secondary { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
@@ -192,7 +197,7 @@ header h1 span { color: var(--accent); }
   color: var(--text2); transition: all .2s; user-select: none;
 }
 .radio-group input { display: none; }
-.radio-group input:checked + label { background: var(--accent); color: #000; font-weight: 500; }
+.radio-group input:checked + label { background: var(--accent); color: #fff; font-weight: 500; }
 /* Compression Mode has 4 options and two of them ("Resize Only",
    "Screenshot") are long enough to overflow a single flex row inside the
    380px sidebar. Lay it out as a self-contained 2x2 grid instead so it
@@ -255,7 +260,7 @@ header h1 span { color: var(--accent); }
   display: flex; align-items: center; justify-content: center;
   font-size: 11px; color: transparent; transition: all .2s;
 }
-.file-card.selected .check { background: var(--accent); border-color: var(--accent); color: #000; }
+.file-card.selected .check { background: var(--accent); border-color: var(--accent); color: #fff; }
 .file-card .preview-btn {
   font-size: 10px; padding: 2px 6px; border-radius: 4px; flex-shrink: 0;
   border: 1px solid var(--border); background: var(--card); color: var(--text2);
@@ -488,7 +493,7 @@ header h1 span { color: var(--accent); }
 
   <!-- Input Section -->
   <div class="card" id="input-section">
-    <div class="card-title" data-i18n="input.title">Select Images</div>
+    <div class="card-title" data-i18n="input.title">Source Path</div>
     <div class="input-row">
       <input type="text" id="dir-path" data-i18n-placeholder="input.dirPlaceholder" placeholder="Folder path to scan, e.g. D:\screenshots" />
       <button class="btn btn-primary" id="scan-btn" data-i18n="input.scanBtn">Scan Folder</button>
@@ -711,7 +716,7 @@ header h1 span { color: var(--accent); }
       Monitor a folder and auto-optimize new or changed images as they appear.
     </div>
     <div class="input-row" style="margin-bottom:8px">
-      <button class="btn btn-secondary" id="watch-use-current-paths-btn" style="white-space:nowrap" data-i18n="watch.useCurrentPaths">Use Select Images / Output paths</button>
+      <button class="btn btn-secondary" id="watch-use-current-paths-btn" style="white-space:nowrap" data-i18n="watch.useCurrentPaths">Use Source / Output paths</button>
     </div>
     <div class="input-row" style="margin-bottom:8px">
       <input type="text" id="watch-dir" data-i18n-placeholder="watch.dirPlaceholder" placeholder="Watch directory" style="flex:1" />
@@ -817,7 +822,7 @@ const I18N = {
     'common.stop': 'Stop',
     'common.selecting': 'Selecting...',
     'common.failed': 'failed',
-    'input.title': 'Select Images',
+    'input.title': 'Source Path',
     'input.dirPlaceholder': 'Folder path to scan, e.g. D:\\screenshots',
     'input.scanBtn': 'Scan Folder',
     'input.scanning': 'Scanning...',
@@ -916,7 +921,7 @@ const I18N = {
     'config.enabled': 'Enabled',
     'watch.title': 'Watch Mode',
     'watch.desc': 'Monitor a folder and auto-optimize new or changed images as they appear.',
-    'watch.useCurrentPaths': 'Use Select Images / Output paths',
+    'watch.useCurrentPaths': 'Use Source / Output paths',
     'watch.dirPlaceholder': 'Watch directory',
     'watch.outputPlaceholder': 'Output directory (required)',
     'watch.processExisting': 'Process existing files',
@@ -938,7 +943,7 @@ const I18N = {
     'notice.enterWatchDir': 'Please enter a watch directory',
     'notice.enterOutputDir': 'Please enter an output directory',
     'notice.watchStartFailedPrefix': 'Watch start failed: ',
-    'notice.pathsBothEmpty': 'Select Images and Output paths are both empty — set them above first.',
+    'notice.pathsBothEmpty': 'Source Path and Output paths are both empty — set them above first.',
     'notice.watchOutputStillEmpty': 'Copied the folder to watch, but Output path is empty there too — Watch Mode needs an output folder (no temp-folder option), so set one before starting.',
     'notice.resumeFailed': 'Resume failed',
     'notice.resumeFailedPrefix': 'Resume failed: ',
@@ -980,7 +985,7 @@ const I18N = {
     'common.stop': '停止',
     'common.selecting': '选择中...',
     'common.failed': '失败',
-    'input.title': '选择图片',
+    'input.title': '源路径',
     'input.dirPlaceholder': '要扫描的文件夹路径，例如 D:\\screenshots',
     'input.scanBtn': '扫描文件夹',
     'input.scanning': '扫描中...',
@@ -1079,7 +1084,7 @@ const I18N = {
     'config.enabled': '已启用',
     'watch.title': 'Watch Mode',
     'watch.desc': '监控一个文件夹，自动优化新出现或发生变化的图片。',
-    'watch.useCurrentPaths': '使用【选择图片/输出路径】中的设置',
+    'watch.useCurrentPaths': '使用【源路径】/【输出路径】中的设置',
     'watch.dirPlaceholder': '监控目录',
     'watch.outputPlaceholder': '输出目录（必填）',
     'watch.processExisting': '处理已有文件',
@@ -1101,7 +1106,7 @@ const I18N = {
     'notice.enterWatchDir': '请输入要监控的目录',
     'notice.enterOutputDir': '请输入输出目录',
     'notice.watchStartFailedPrefix': '启动监控失败：',
-    'notice.pathsBothEmpty': '【选择图片】和【输出路径】都是空的——请先在上方设置好。',
+    'notice.pathsBothEmpty': '【源路径】和【输出路径】都是空的——请先在上方设置好。',
     'notice.watchOutputStillEmpty': '已复制监控目录，但那边的输出路径也是空的——Watch Mode 需要一个输出文件夹（没有临时文件夹选项），请先设置好再开始。',
     'notice.resumeFailed': '恢复失败',
     'notice.resumeFailedPrefix': '恢复失败：',
@@ -1542,7 +1547,7 @@ outputBrowseBtn.addEventListener('click', async () => {
   }
 });
 
-// Browse Folder (Select Images): pick a folder path → auto-scan it.
+// Browse Folder (Source Path): pick a folder path → auto-scan it.
 // This is a local tool — no uploading, just reads files by path.
 const browseFolderBtn = $('browse-folder-btn');
 browseFolderBtn.addEventListener('click', async () => {
