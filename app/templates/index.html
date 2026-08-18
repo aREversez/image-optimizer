@@ -177,7 +177,17 @@ header h1 span { color: var(--accent); }
 
 /* Config */
 .config-grid { display: flex; gap: 24px; flex-wrap: wrap; }
-.config-group { display: flex; flex-direction: column; gap: 6px; }
+/* width: 100% is deliberate, not decorative: without it each group is a
+   flex item sized by flex-basis:auto, which considers the *max-content*
+   width of everything inside it — including hidden-by-default children
+   like #screenshot-mode-note below once they become visible. A long
+   sentence's natural (unwrapped) preferred width is much wider than this
+   panel, so showing that note was pulling the whole group (and the mode
+   buttons inside it) wider than when it's hidden. Pinning the group to
+   100% of the row gives it a definite width up front, so nothing inside
+   it — note text, button labels, anything added later — can ever expand
+   it again; content just wraps/fits within that fixed width instead. */
+.config-group { display: flex; flex-direction: column; gap: 6px; width: 100%; }
 .config-group label { font-size: 12px; color: var(--text2); text-transform: uppercase; letter-spacing: .5px; }
 .config-group select, .config-group input[type="number"] {
   padding: 8px 12px; background: var(--bg); border: 1px solid var(--border);
