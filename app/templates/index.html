@@ -638,12 +638,12 @@ header h1 span { color: var(--accent); }
   <!-- Config + Action -->
   <div class="card" id="config-section">
     <div class="card-title" data-i18n="config.title">Settings</div>
-    <button class="btn btn-secondary btn-sm" id="document-preset-btn" style="padding:4px 12px;font-size:12px;margin-bottom:12px" data-i18n-title="config.documentPresetTitle" title="Sets Quality: High, Max Width: 1920px, Mode: Standard, Dithering: Off — a starting point for screenshots meant to be embedded in a document." data-i18n="config.documentPreset">Document preset</button>
+    <button class="btn btn-secondary btn-sm" id="screenshot-preset-btn" style="padding:4px 12px;font-size:12px;margin-bottom:12px" data-i18n-title="config.screenshotPresetTitle" title="Sets Quality: High, Max Width: 1920px, Mode: Standard, Dithering: Off — a starting point for compressing software screenshots." data-i18n="config.screenshotPreset">Screenshot preset</button>
     <div id="watch-lock-notice" style="display:none;font-size:12px;color:var(--yellow);background:rgba(230,180,60,0.1);border:1px solid rgba(230,180,60,0.3);border-radius:6px;padding:8px 10px;margin-bottom:12px" data-i18n="config.watchLockNotice">
       Locked while Watch Mode is running — it captured these settings when you clicked "Start Watching" and won't pick up changes. Stop Watch Mode to change them, then start again.
     </div>
     <div id="settings-tip" style="display:none;font-size:12px;color:var(--text2);background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:8px 10px;margin-bottom:12px;align-items:flex-start;gap:8px">
-      <span style="flex:1" data-i18n="config.settingsTip">Quality / Max Width / Mode / Dithering are remembered automatically. Recommended for document screenshots: Quality High, Max Width 1920px, Mode Standard.</span>
+      <span style="flex:1" data-i18n="config.settingsTip">Settings are saved automatically. To compress software screenshots, click Screenshot preset.</span>
       <button id="settings-tip-dismiss" class="notice-close" aria-label="Dismiss" style="flex-shrink:0;background:none;border:none;cursor:pointer;color:inherit;font-size:16px;line-height:1;padding:0">&times;</button>
     </div>
     <div class="config-grid" style="margin-bottom:16px">
@@ -910,9 +910,9 @@ const I18N = {
     'results.countFiltered': '{shown} of {total} shown',
     'config.title': 'Settings',
     'config.watchLockNotice': 'Locked while Watch Mode is running — it captured these settings when you clicked "Start Watching" and won\u2019t pick up changes. Stop Watch Mode to change them, then start again.',
-    'config.settingsTip': 'Quality / Max Width / Mode / Dithering are remembered automatically. Recommended for document screenshots: Quality High, Max Width 1920px, Mode Standard.',
-    'config.documentPreset': 'Document preset',
-    'config.documentPresetTitle': 'Sets Quality: High, Max Width: 1920px, Mode: Standard, Dithering: Off — a starting point for screenshots meant to be embedded in a document.',
+    'config.settingsTip': 'Settings are saved automatically. To compress software screenshots, click Screenshot preset.',
+    'config.screenshotPreset': 'Screenshot preset',
+    'config.screenshotPresetTitle': 'Sets Quality: High, Max Width: 1920px, Mode: Standard, Dithering: Off — a starting point for compressing software screenshots.',
     'config.quality': 'Quality',
     'config.qualityTitle': 'Controls how much color detail Standard mode is allowed to sacrifice for size. For UI screenshots with text, High usually costs little extra size since screenshots rarely use many colors to begin with.',
     'config.qualityHigh': 'High',
@@ -1075,9 +1075,9 @@ const I18N = {
     'results.countFiltered': '显示 {shown} / {total} 个',
     'config.title': '设置',
     'config.watchLockNotice': 'Watch Mode 运行期间这些设置被锁定——点击【开始监控】时的设置已被记录，不会再跟随改动。请先停止 Watch Mode 再修改，然后重新开始。',
-    'config.settingsTip': 'Quality / Max Width / Mode / Dithering 会自动记住。压缩文档用截图推荐：Quality High、Max Width 1920px、Mode Standard。',
-    'config.documentPreset': '文档预设',
-    'config.documentPresetTitle': '一键设置 Quality: High、Max Width: 1920px、Mode: Standard、Dithering: Off——适合嵌入文档的截图压缩起点。',
+    'config.settingsTip': '设置将自动保存。如需压缩软件截图，可点击【软件截图预设】。',
+    'config.screenshotPreset': '软件截图预设',
+    'config.screenshotPresetTitle': '一键设置 Quality: High、Max Width: 1920px、Mode: Standard、Dithering: Off——适合压缩软件截图的起点。',
     'config.quality': '质量',
     'config.qualityTitle': '控制 Standard 模式允许牺牲多少色彩细节来换取体积。对于带文字的 UI 截图，选择 High 通常不会增加太多体积，因为截图本身颜色数就不多。',
     'config.qualityHigh': '高',
@@ -1396,13 +1396,13 @@ function loadConfig() {
   });
 })();
 
-// Document preset: one click to Quality High + Max Width 1920px + Mode
+// Screenshot preset: one click to Quality High + Max Width 1920px + Mode
 // Standard + Dithering Off — the combo settled on for screenshots meant to
-// be embedded in a document (see config.documentPresetTitle for the
+// software screenshots (see config.screenshotPresetTitle for the
 // rationale). Dispatches 'change' on each control after setting it so the
 // existing per-control listeners (saveConfig, updateModeDependentControls,
 // updateStartButtonState) fire exactly as if the user had clicked each one.
-function applyDocumentPreset() {
+function applyScreenshotPreset() {
   const setRadio = (name, val) => {
     const el = document.querySelector(`input[name="${name}"][value="${val}"]`);
     if (el && !el.disabled) { el.checked = true; el.dispatchEvent(new Event('change', { bubbles: true })); }
@@ -1418,7 +1418,7 @@ function applyDocumentPreset() {
     ditheringInput.dispatchEvent(new Event('change', { bubbles: true }));
   }
 }
-$('document-preset-btn').addEventListener('click', applyDocumentPreset);
+$('screenshot-preset-btn').addEventListener('click', applyScreenshotPreset);
 
 // Save on any config change. updateModeDependentControls (bound separately
 // for format/mode) also recomputes disabled states; saveConfig is additive.
@@ -2562,7 +2562,7 @@ function applyWatchLock(locked) {
     ...document.querySelectorAll('input[name="format"]'),
     ...document.querySelectorAll('input[name="mode"]'),
     $('max-width'), $('protect-colors'), $('dithering'), $('keep-exif'),
-    $('document-preset-btn'),
+    $('screenshot-preset-btn'),
   ];
   if (locked) {
     inputs.forEach(el => { el.disabled = true; });
