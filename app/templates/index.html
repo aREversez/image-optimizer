@@ -639,11 +639,11 @@ header h1 span { color: var(--accent); }
   <!-- Config + Action -->
   <div class="card" id="config-section">
     <div class="card-title" data-i18n="config.title">Settings</div>
+    <div id="settings-tip" style="font-size:12px;color:var(--text2);margin-bottom:12px" data-i18n="config.settingsTip">Settings are saved automatically.</div>
     <button class="btn btn-secondary btn-sm" id="screenshot-preset-btn" style="padding:4px 12px;font-size:12px;margin-bottom:12px" data-i18n-title="config.screenshotPresetTitle" title="Sets Quality: High, Max Width: 1920px, Mode: Standard, Dithering: Off. A starting point for compressing software screenshots." data-i18n="config.screenshotPreset">Screenshot preset</button>
     <div id="watch-lock-notice" style="display:none;font-size:12px;color:var(--yellow);background:rgba(230,180,60,0.1);border:1px solid rgba(230,180,60,0.3);border-radius:6px;padding:8px 10px;margin-bottom:12px" data-i18n="config.watchLockNotice">
-      Locked while Watch Mode is running — it captured these settings when you clicked "Start Watching" and won't pick up changes. Stop Watch Mode to change them, then start again.
+      Locked while Watch Mode is running. It captured these settings when you clicked "Start Watching" and won't pick up changes. Stop Watch Mode to change them, then start again.
     </div>
-    <div id="settings-tip" style="font-size:12px;color:var(--text2);margin-bottom:12px" data-i18n="config.settingsTip">Settings are saved automatically.</div>
     <div class="config-grid" style="margin-bottom:16px">
       <div class="config-group">
         <label data-i18n-title="config.qualityTitle" title="Controls how much color detail Standard mode is allowed to sacrifice for size. For UI screenshots with text, High usually costs little extra size since screenshots rarely use many colors to begin with." data-i18n="config.quality">Quality</label>
