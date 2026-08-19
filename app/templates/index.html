@@ -641,6 +641,10 @@ header h1 span { color: var(--accent); }
     <div id="watch-lock-notice" style="display:none;font-size:12px;color:var(--yellow);background:rgba(230,180,60,0.1);border:1px solid rgba(230,180,60,0.3);border-radius:6px;padding:8px 10px;margin-bottom:12px" data-i18n="config.watchLockNotice">
       Locked while Watch Mode is running — it captured these settings when you clicked "Start Watching" and won't pick up changes. Stop Watch Mode to change them, then start again.
     </div>
+    <div id="settings-tip" style="display:none;font-size:12px;color:var(--text2);background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:8px 10px;margin-bottom:12px;align-items:flex-start;gap:8px">
+      <span style="flex:1" data-i18n="config.settingsTip">Your Quality / Max Width / Mode / Dithering choices are remembered automatically — no need to reselect them next time. Compressing screenshots for a document? Quality: High + Max Width: 1920px + Mode: Standard is a good starting combo.</span>
+      <button id="settings-tip-dismiss" class="notice-close" aria-label="Dismiss" style="flex-shrink:0;background:none;border:none;cursor:pointer;color:inherit;font-size:16px;line-height:1;padding:0">&times;</button>
+    </div>
     <div class="config-grid" style="margin-bottom:16px">
       <div class="config-group">
         <label data-i18n-title="config.qualityTitle" title="Controls how much color detail Standard mode is allowed to sacrifice for size. For UI screenshots with text, High usually costs little extra size since screenshots rarely use many colors to begin with." data-i18n="config.quality">Quality</label>
@@ -905,6 +909,7 @@ const I18N = {
     'results.countFiltered': '{shown} of {total} shown',
     'config.title': 'Settings',
     'config.watchLockNotice': 'Locked while Watch Mode is running — it captured these settings when you clicked "Start Watching" and won\u2019t pick up changes. Stop Watch Mode to change them, then start again.',
+    'config.settingsTip': 'Your Quality / Max Width / Mode / Dithering choices are remembered automatically — no need to reselect them next time. Compressing screenshots for a document? Quality: High + Max Width: 1920px + Mode: Standard is a good starting combo.',
     'config.quality': 'Quality',
     'config.qualityTitle': 'Controls how much color detail Standard mode is allowed to sacrifice for size. For UI screenshots with text, High usually costs little extra size since screenshots rarely use many colors to begin with.',
     'config.qualityHigh': 'High',
@@ -1067,6 +1072,7 @@ const I18N = {
     'results.countFiltered': '显示 {shown} / {total} 个',
     'config.title': '设置',
     'config.watchLockNotice': 'Watch Mode 运行期间这些设置被锁定——点击【开始监控】时的设置已被记录，不会再跟随改动。请先停止 Watch Mode 再修改，然后重新开始。',
+    'config.settingsTip': '你选择的 Quality / Max Width / Mode / Dithering 会自动记住，下次打开无需重新选择。压缩截图用于文档？可以从 Quality: High + Max Width: 1920px + Mode: Standard 这个组合开始尝试。',
     'config.quality': '质量',
     'config.qualityTitle': '控制 Standard 模式允许牺牲多少色彩细节来换取体积。对于带文字的 UI 截图，选择 High 通常不会增加太多体积，因为截图本身颜色数就不多。',
     'config.qualityHigh': '高',
@@ -1369,6 +1375,23 @@ function loadConfig() {
   if (typeof cfg.skipExisting === 'boolean') $('skip-existing').checked = cfg.skipExisting;
   if (typeof cfg.keepExif === 'boolean') $('keep-exif').checked = cfg.keepExif;
 }
+// One-time settings tip: surfaces two things a new user has no way to
+// discover on their own — that Quality/Max Width/Mode/Dithering persist
+// across reloads (loadConfig above), and a concrete starting combo for the
+// "compressing screenshots to embed in a document" case. Shown once; a
+// standalone localStorage flag (separate from imgopt.config, which holds
+// actual settings values) remembers the dismissal permanently so returning
+// users aren't nagged every session.
+(function initSettingsTip() {
+  if (localStorage.getItem('imgopt.settingsTipDismissed') === '1') return;
+  const tipEl = $('settings-tip');
+  tipEl.style.display = 'flex';
+  $('settings-tip-dismiss').addEventListener('click', () => {
+    localStorage.setItem('imgopt.settingsTipDismissed', '1');
+    tipEl.style.display = 'none';
+  });
+})();
+
 // Save on any config change. updateModeDependentControls (bound separately
 // for format/mode) also recomputes disabled states; saveConfig is additive.
 ['quality', 'format', 'mode'].forEach(name =>
