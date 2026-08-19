@@ -21,29 +21,34 @@
   --radius: 8px;
   --shadow: 0 1px 6px rgba(0,0,0,.08);
 }
-/* Dark palette. accent/green/red/yellow stay identical across themes so the
-   brand color and status colors read the same; only the neutral surfaces and
-   text flip. Applied via data-theme="dark" (manual toggle) OR, when the user
+/* Dark palette. green/red/yellow stay identical across themes so the
+   status colors read the same; surfaces, text, and accent shift to
+   cooler slate tones for better contrast and a less muddy feel.
+   Applied via data-theme="dark" (manual toggle) OR, when the user
    hasn't explicitly chosen a theme (no data-theme attribute), via the OS
    prefers-color-scheme media query below. */
 :root[data-theme="dark"] {
-  --bg: #1e1c1a;
-  --surface: #2a2724;
-  --surface2: #332f2b;
-  --border: #413b35;
-  --text: #e8e3dc;
-  --text2: #9a938b;
-  --shadow: 0 1px 6px rgba(0,0,0,.4);
+  --bg: #1a1d21;
+  --surface: #25292e;
+  --surface2: #32383e;
+  --border: #454c54;
+  --text: #eaecf0;
+  --text2: #8e95a0;
+  --accent: #62a3a3;
+  --accent2: #559494;
+  --shadow: 0 1px 6px rgba(0,0,0,.35);
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme]) {
-    --bg: #1e1c1a;
-    --surface: #2a2724;
-    --surface2: #332f2b;
-    --border: #413b35;
-    --text: #e8e3dc;
-    --text2: #9a938b;
-    --shadow: 0 1px 6px rgba(0,0,0,.4);
+    --bg: #1a1d21;
+    --surface: #25292e;
+    --surface2: #32383e;
+    --border: #454c54;
+    --text: #eaecf0;
+    --text2: #8e95a0;
+    --accent: #62a3a3;
+    --accent2: #559494;
+    --shadow: 0 1px 6px rgba(0,0,0,.35);
   }
 }
 * { margin:0; padding:0; box-sizing:border-box; }
@@ -115,17 +120,28 @@ header h1 span { color: var(--accent); }
 
 /* Main Layout */
 .container {
-  max-width: 1400px; margin: 0 auto; padding: 20px 24px;
-  display: grid; grid-template-columns: 380px 1fr; gap: 20px; align-items: start;
+  max-width: 1680px; margin: 0 auto; padding: 20px 24px;
+  display: grid; grid-template-columns: 380px 1fr 340px; gap: 20px; align-items: start;
 }
 .app-sidebar {
   display: flex; flex-direction: column; gap: 20px; position: sticky; top: 20px;
   max-height: calc(100vh - 40px); overflow-y: auto;
 }
 .app-main { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
+.app-right {
+  display: flex; flex-direction: column; gap: 20px; position: sticky; top: 20px;
+}
+/* Between 1000-1300px there's no room for a true third column, so Watch
+   Mode drops to a full-width row under Settings/Files instead of getting
+   squeezed into a column that's too narrow for its inputs. */
+@media (max-width: 1300px) {
+  .container { grid-template-columns: 380px 1fr; }
+  .app-sidebar { position: static; }
+  .app-right { grid-column: 1 / -1; position: static; }
+}
 @media (max-width: 1000px) {
   .container { display: flex; flex-direction: column; }
-  .app-sidebar { position: static; }
+  .app-sidebar, .app-right { position: static; }
 }
 
 .card {
@@ -162,7 +178,16 @@ header h1 span { color: var(--accent); }
 
 /* Config */
 .config-grid { display: flex; gap: 24px; flex-wrap: wrap; }
-.config-group { display: flex; flex-direction: column; gap: 6px; }
+/* width: 100% is deliberate, not decorative: without it each group is a
+   flex item sized by flex-basis:auto, which considers the *max-content*
+   width of everything inside it, including any hidden-by-default child
+   that later becomes visible (this bit us once already — a conditional
+   note inside the Compression Mode group whose un-wrapped text was wider
+   than the panel, which pulled the whole group, mode buttons included,
+   wider whenever it showed). Pinning the group to 100% of the row gives
+   it a definite width up front, so nothing inside it can ever expand it
+   again; content just wraps/fits within that fixed width instead. */
+.config-group { display: flex; flex-direction: column; gap: 6px; width: 100%; }
 .config-group label { font-size: 12px; color: var(--text2); text-transform: uppercase; letter-spacing: .5px; }
 .config-group select, .config-group input[type="number"] {
   padding: 8px 12px; background: var(--bg); border: 1px solid var(--border);
@@ -175,14 +200,36 @@ header h1 span { color: var(--accent); }
   border-radius: var(--radius); color: var(--text); font-size: 14px; outline: none;
   min-width: 180px;
 }
-.config-group.disabled-group { opacity: .45; }
+.config-group.disabled-group, .radio-group.disabled-group { opacity: .45; }
 .radio-group { display: flex; gap: 4px; background: var(--bg); border-radius: var(--radius); padding: 3px; }
 .radio-group label {
   padding: 6px 16px; border-radius: 5px; cursor: pointer; font-size: 13px;
   color: var(--text2); transition: all .2s; user-select: none;
 }
 .radio-group input { display: none; }
-.radio-group input:checked + label { background: var(--accent); color: #000; font-weight: 500; }
+/* Selection is shown by background contrast alone, not font-weight — a
+   bolder font is measurably wider than regular weight for the same
+   string, so toggling it on :checked shifted layout around it (most
+   visibly in #mode-group's 2-column grid below: selecting "Screenshot"
+   widened its column and shoved the other pill wider too). Background
+   + white text already reads clearly as "selected" without that risk. */
+.radio-group input:checked + label { background: var(--accent); color: #000; }
+/* Compression Mode has 4 options and two of them ("Resize Only",
+   "Screenshot") are long enough to overflow a single flex row inside the
+   380px sidebar. Lay it out as a self-contained 2x2 grid instead so it
+   never depends on how much space the row happens to have.
+   minmax(0, 1fr) (rather than plain 1fr) keeps both columns strictly
+   equal-width regardless of label length, instead of a grid column's
+   default min-width:auto letting its widest cell's content dictate the
+   column's minimum size — belt-and-suspenders against the same class of
+   shift the font-weight fix above addresses, e.g. for a future
+   translation whose mode names vary more in length than en/zh do. */
+#mode-group {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px;
+}
+#mode-group label {
+  padding: 8px 10px; text-align: center;
+}
 .check-row {
   display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer;
   user-select: none; padding: 8px 0;
@@ -374,11 +421,11 @@ header h1 span { color: var(--accent); }
 .settings-panel h2 button:hover { color: var(--text); }
 .settings-field { margin-bottom: 14px; }
 .settings-field label { display: block; font-size: 12px; font-weight: 600; color: var(--text2); margin-bottom: 4px; }
-.settings-field input {
+.settings-field input, .settings-field select {
   width: 100%; padding: 7px 10px; border: 1px solid var(--border); border-radius: var(--radius);
-  background: var(--bg); color: var(--text); font-size: 13px;
+  background: var(--bg); color: var(--text); font-size: 13px; font-family: inherit;
 }
-.settings-field input:focus { outline: none; border-color: var(--accent); }
+.settings-field input:focus, .settings-field select:focus { outline: none; border-color: var(--accent); }
 .settings-field .field-hint { font-size: 11px; color: var(--text2); margin-top: 2px; }
 .settings-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 18px; }
 .settings-actions .btn { padding: 7px 18px; font-size: 13px; }
@@ -395,50 +442,58 @@ header h1 span { color: var(--accent); }
 <body>
 
 <header>
-  <h1 style="display:flex;align-items:center;gap:10px"><svg width="28" height="28" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg"><rect x="20" y="20" width="216" height="216" rx="34" fill="#588b8b"/><path d="M64 176 L118 106 L152 142 L184 96 L216 176 Z" fill="#f5f2ed"/><circle cx="86" cy="80" r="18" fill="#f5f2ed"/></svg>Image Optimizer</h1>
+  <h1 style="display:flex;align-items:center;gap:10px"><svg width="28" height="28" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg"><rect x="20" y="20" width="216" height="216" rx="34" fill="#588b8b"/><path d="M64 176 L118 106 L152 142 L184 96 L216 176 Z" fill="#f5f2ed"/><circle cx="86" cy="80" r="18" fill="#f5f2ed"/></svg><span data-i18n="app.title">Image Optimizer</span></h1>
   <div class="header-right">
-    <span id="health-status"><span class="status-dot warn"></span>Checking...</span>
+    <span id="health-status"><span class="status-dot warn"></span><span id="health-status-text" data-i18n="health.checking">Checking...</span></span>
     <span id="workspace-info"></span>
-    <button class="settings-btn" id="settings-btn" title="Settings" aria-label="Open settings">&#9881;</button>
-    <button class="theme-toggle" id="theme-toggle" title="Toggle light / dark theme" aria-label="Toggle theme"></button>
+    <button class="settings-btn" id="settings-btn" data-i18n-title="header.settingsTitle" title="Settings" aria-label="Open settings">&#9881;</button>
+    <button class="theme-toggle" id="theme-toggle" data-i18n-title="header.themeToggleTitle" title="Toggle light / dark theme" aria-label="Toggle theme"></button>
   </div>
 </header>
 
 <!-- Settings modal -->
 <div class="settings-overlay" id="settings-overlay">
   <div class="settings-panel">
-    <h2>Settings <button id="settings-close" aria-label="Close settings">&times;</button></h2>
+    <h2><span data-i18n="settings.title">Settings</span> <button id="settings-close" aria-label="Close settings">&times;</button></h2>
     <div class="settings-field">
-      <label for="setting-host">Host</label>
+      <label for="setting-language" data-i18n="settings.language">Language</label>
+      <select id="setting-language">
+        <option value="en">English</option>
+        <option value="zh">中文</option>
+      </select>
+      <div class="field-hint" data-i18n="settings.languageHint">Applies immediately</div>
+    </div>
+    <div class="settings-field">
+      <label for="setting-host" data-i18n="settings.host">Host</label>
       <input type="text" id="setting-host" placeholder="127.0.0.1">
-      <div class="field-hint">Requires restart to take effect</div>
+      <div class="field-hint" data-i18n="settings.restartHint">Requires restart to take effect</div>
     </div>
     <div class="settings-field">
-      <label for="setting-port">Port</label>
+      <label for="setting-port" data-i18n="settings.port">Port</label>
       <input type="number" id="setting-port" min="1" max="65535" placeholder="8090">
-      <div class="field-hint">Requires restart to take effect</div>
+      <div class="field-hint" data-i18n="settings.restartHint">Requires restart to take effect</div>
     </div>
     <div class="settings-field">
-      <label for="setting-concurrent-workers">Concurrent Workers</label>
+      <label for="setting-concurrent-workers" data-i18n="settings.concurrentWorkers">Concurrent Workers</label>
       <input type="number" id="setting-concurrent-workers" min="1" placeholder="4">
-      <div class="field-hint">Number of images compressed in parallel. Requires restart</div>
+      <div class="field-hint" data-i18n="settings.concurrentWorkersHint">Number of images compressed in parallel. Requires restart</div>
     </div>
     <div class="settings-field">
-      <label for="setting-thumbnail-workers">Thumbnail Workers</label>
+      <label for="setting-thumbnail-workers" data-i18n="settings.thumbnailWorkers">Thumbnail Workers</label>
       <input type="number" id="setting-thumbnail-workers" min="1" placeholder="4">
-      <div class="field-hint">Number of thumbnails generated in parallel. Requires restart</div>
+      <div class="field-hint" data-i18n="settings.thumbnailWorkersHint">Number of thumbnails generated in parallel. Requires restart</div>
     </div>
     <div class="settings-field">
-      <label for="setting-cleanup-delay">Workspace Cleanup Delay (seconds)</label>
+      <label for="setting-cleanup-delay" data-i18n="settings.cleanupDelay">Workspace Cleanup Delay (seconds)</label>
       <input type="number" id="setting-cleanup-delay" min="0" step="0.5" placeholder="10">
     </div>
     <div class="settings-field">
-      <label for="setting-idle-timeout">Session Idle Timeout (hours)</label>
+      <label for="setting-idle-timeout" data-i18n="settings.idleTimeout">Session Idle Timeout (hours)</label>
       <input type="number" id="setting-idle-timeout" min="0" step="0.5" placeholder="4">
     </div>
     <div class="settings-actions">
-      <button class="btn" id="settings-cancel" style="background:var(--surface2)">Cancel</button>
-      <button class="btn" id="settings-save" style="background:var(--accent);color:#fff">Save</button>
+      <button class="btn" id="settings-cancel" style="background:var(--surface2)" data-i18n="settings.cancel">Cancel</button>
+      <button class="btn" id="settings-save" style="background:var(--accent);color:#fff" data-i18n="settings.save">Save</button>
     </div>
   </div>
 </div>
@@ -449,8 +504,8 @@ header h1 span { color: var(--accent); }
 <div id="batch-resume-banner" style="display:none;background:#fff3cd;border:1px solid #ffc107;border-radius:8px;padding:12px 20px;margin:0 24px;display:none;align-items:center;gap:12px;font-size:14px">
   <span id="batch-resume-text"></span>
   <div style="margin-left:auto;display:flex;gap:8px">
-    <button class="btn btn-primary btn-sm" id="batch-resume-btn" style="padding:4px 16px;font-size:13px">Resume</button>
-    <button class="btn btn-secondary btn-sm" id="batch-dismiss-btn" style="padding:4px 12px;font-size:13px">Dismiss</button>
+    <button class="btn btn-primary btn-sm" id="batch-resume-btn" style="padding:4px 16px;font-size:13px" data-i18n="common.resume">Resume</button>
+    <button class="btn btn-secondary btn-sm" id="batch-dismiss-btn" style="padding:4px 12px;font-size:13px" data-i18n="common.dismiss">Dismiss</button>
   </div>
 </div>
 
@@ -460,12 +515,12 @@ header h1 span { color: var(--accent); }
 
   <!-- Input Section -->
   <div class="card" id="input-section">
-    <div class="card-title">Select Images</div>
+    <div class="card-title" data-i18n="input.title">Source Path</div>
     <div class="input-row">
-      <input type="text" id="dir-path" placeholder="Folder path to scan, e.g. D:\screenshots" />
-      <button class="btn btn-primary" id="scan-btn">Scan Folder</button>
-      <button class="btn btn-secondary" id="browse-folder-btn">Browse Folder...</button>
-      <button class="btn btn-secondary" id="browse-files-btn">Browse Files...</button>
+      <input type="text" id="dir-path" data-i18n-placeholder="input.dirPlaceholder" placeholder="Folder path to scan, e.g. D:\screenshots" />
+      <button class="btn btn-primary" id="scan-btn" data-i18n="input.scanBtn">Scan Folder</button>
+      <button class="btn btn-secondary" id="browse-folder-btn" data-i18n="common.browseFolder">Browse Folder...</button>
+      <button class="btn btn-secondary" id="browse-files-btn" data-i18n="input.browseFilesBtn">Browse Files...</button>
     </div>
     <div class="recent-chips" id="recent-scan-dirs"></div>
     <div id="scan-progress-wrap" style="display:none;margin-bottom:12px">
@@ -474,148 +529,30 @@ header h1 span { color: var(--accent); }
     </div>
     <div style="margin-bottom:12px;display:flex;align-items:center;gap:8px;font-size:13px">
       <label style="cursor:pointer;user-select:none;display:flex;align-items:center;gap:4px">
-        <input type="checkbox" id="recursive-scan" /> Include subfolders
+        <input type="checkbox" id="recursive-scan" /> <span data-i18n="common.includeSubfolders">Include subfolders</span>
       </label>
     </div>
     <input type="file" id="file-input" accept="image/png,image/jpeg,image/bmp,image/tiff,image/webp" multiple style="display:none" />
   </div>
 
-  <!-- Output Path -->
+  <!-- Target Path -->
   <div class="card" id="output-section">
-    <div class="card-title">Output Path (optional)</div>
+    <div class="card-title" data-i18n="output.title">Output Path (optional)</div>
     <div class="input-row">
-      <input type="text" id="output-dir" placeholder="Type or paste the output folder path, or leave empty for temp folder" />
-      <button class="btn btn-secondary" id="output-browse-btn">Browse Folder...</button>
+      <input type="text" id="output-dir" data-i18n-placeholder="output.placeholder" placeholder="Type or paste the output folder path, or leave empty for temp folder" />
+      <button class="btn btn-secondary" id="output-browse-btn" data-i18n="common.browseFolder">Browse Folder...</button>
     </div>
     <div class="recent-chips" id="recent-output-dirs"></div>
     <label class="check-row" style="margin-top:8px;cursor:pointer;user-select:none;font-size:13px;display:flex;align-items:center;gap:4px"
+      data-i18n-title="output.skipExistingTitle"
       title="When re-running against the same output folder, files already optimized there are reused instead of being recompressed. Only applies when an output folder is set.">
-      <input type="checkbox" id="skip-existing" /> Skip files already in the output folder
+      <input type="checkbox" id="skip-existing" /> <span data-i18n="output.skipExisting">Skip files already in the output folder</span>
     </label>
     <label class="check-row" style="margin-top:8px;cursor:pointer;user-select:none;font-size:13px;display:flex;align-items:center;gap:4px"
-      title="Keep a curated subset of EXIF metadata (camera make/model, date, exposure) in the output. GPS coordinates, Orientation (already baked into the pixels), and bulky MakerNote are dropped. Off by default — turn on only if you need the metadata preserved.">
-      <input type="checkbox" id="keep-exif" /> Keep EXIF metadata (camera info, date; GPS stripped)
+      data-i18n-title="output.keepExifTitle"
+      title="Keep a curated subset of EXIF metadata (camera make/model, date, exposure) in the output. GPS coordinates, Orientation (already baked into the pixels), and bulky MakerNote are dropped. Off by default; turn on only if you need the metadata preserved.">
+      <input type="checkbox" id="keep-exif" /> <span data-i18n="output.keepExif">Keep EXIF metadata (camera info, date; GPS stripped)</span>
     </label>
-  </div>
-
-  <!-- Config + Action -->
-  <div class="card" id="config-section">
-    <div class="card-title">Settings</div>
-    <div id="watch-lock-notice" style="display:none;font-size:12px;color:var(--yellow);background:rgba(230,180,60,0.1);border:1px solid rgba(230,180,60,0.3);border-radius:6px;padding:8px 10px;margin-bottom:12px">
-      Locked while Watch Mode is running — it captured these settings when you clicked "Start Watching" and won't pick up changes. Stop Watch Mode to change them, then start again.
-    </div>
-    <div class="config-grid" style="margin-bottom:16px">
-      <div class="config-group">
-        <label title="Controls how much color detail Standard mode is allowed to sacrifice for size. For UI screenshots with text, High usually costs little extra size since screenshots rarely use many colors to begin with.">Quality</label>
-        <div class="radio-group" id="quality-group">
-          <input type="radio" name="quality" id="q-high" value="high"
-            title="Controls how much color detail Standard mode is allowed to sacrifice for size. For UI screenshots with text, High usually costs little extra size since screenshots rarely use many colors to begin with.">
-          <label for="q-high"
-            title="Controls how much color detail Standard mode is allowed to sacrifice for size. For UI screenshots with text, High usually costs little extra size since screenshots rarely use many colors to begin with.">High</label>
-          <input type="radio" name="quality" id="q-med" value="medium" checked><label for="q-med">Medium</label>
-          <input type="radio" name="quality" id="q-low" value="low"><label for="q-low">Low</label>
-        </div>
-      </div>
-      <div class="config-group">
-        <label title="Shrinking dimensions is the one setting that can genuinely blur small text — screenshots with UI text often look best left at 'No resize' or scaled down only slightly.">Max Width</label>
-        <select id="max-width"
-          title="Shrinking dimensions is the one setting that can genuinely blur small text — screenshots with UI text often look best left at 'No resize' or scaled down only slightly.">
-          <option value="0">No resize</option>
-          <option value="1920">1920px</option>
-          <option value="1500">1500px</option>
-          <option value="1200">1200px</option>
-        </select>
-      </div>
-      <div class="config-group">
-        <label>Output Format</label>
-        <div class="radio-group" id="format-group">
-          <input type="radio" name="format" id="fmt-png" value="png" checked><label for="fmt-png">PNG</label>
-          <input type="radio" name="format" id="fmt-jpg" value="jpg"
-            title="Re-compresses images with mozjpeg's cjpeg while KEEPING the JPEG format — the way to shrink a batch of JPGs without converting them. Quality applies in Standard mode; 'Lossless' maps to the highest mozjpeg quality (~95) since JPEG is inherently lossy. Requires cjpeg in the bin/ directory.">
-          <label for="fmt-jpg"
-            title="Re-compresses images with mozjpeg's cjpeg while KEEPING the JPEG format — the way to shrink a batch of JPGs without converting them. Quality applies in Standard mode; 'Lossless' maps to the highest mozjpeg quality (~95) since JPEG is inherently lossy. Requires cjpeg in the bin/ directory.">JPG</label>
-          <input type="radio" name="format" id="fmt-webp" value="webp"
-            title="WebP typically produces smaller files than PNG at similar visual quality. Uses its own encoder (not pngquant/oxipng) — Quality/Protect Colors/Dithering don't apply, only Compression Mode's lossy-vs-lossless choice does.">
-          <label for="fmt-webp"
-            title="WebP typically produces smaller files than PNG at similar visual quality. Uses its own encoder (not pngquant/oxipng) — Quality/Protect Colors/Dithering don't apply, only Compression Mode's lossy-vs-lossless choice does.">WebP</label>
-          <input type="radio" name="format" id="fmt-avif" value="avif"
-            title="AVIF is a modern codec that typically produces the smallest files at equivalent quality. Slower encoding than PNG/WebP. Requires avifenc in the bin/ directory or PATH.">
-          <label for="fmt-avif"
-            title="AVIF is a modern codec that typically produces the smallest files at equivalent quality. Slower encoding than PNG/WebP. Requires avifenc in the bin/ directory or PATH.">AVIF</label>
-        </div>
-      </div>
-      <div class="config-group">
-        <label title="Choose how compression is achieved.">Compression Mode</label>
-        <div class="radio-group" id="mode-group">
-          <input type="radio" name="mode" id="mode-standard" value="standard" checked
-            title="Best compression. Reduces the image to a smaller color palette before compressing — may cause slight color shifts on small or unique-colored details.">
-          <label for="mode-standard"
-            title="Best compression. Reduces the image to a smaller color palette before compressing — may cause slight color shifts on small or unique-colored details.">Standard</label>
-          <input type="radio" name="mode" id="mode-lossless" value="lossless"
-            title="No color changes at all. Compresses without touching pixel values — larger files than Standard, but pixel-perfect.">
-          <label for="mode-lossless"
-            title="No color changes at all. Compresses without touching pixel values — larger files than Standard, but pixel-perfect.">Lossless</label>
-          <input type="radio" name="mode" id="mode-resize" value="resize_only"
-            title="Shrinks image dimensions (requires Max Width to be set) and compresses losslessly — keeps full original color accuracy at the smaller size.">
-          <label for="mode-resize"
-            title="Shrinks image dimensions (requires Max Width to be set) and compresses losslessly — keeps full original color accuracy at the smaller size.">Resize Only</label>
-        </div>
-      </div>
-      <div class="config-group" id="protect-colors-group">
-        <label title="Colors listed here are prioritized when building the compressed palette, reducing the chance they get replaced by a similar color. Not a 100% guarantee. Only applies in Standard mode.">Protect Colors</label>
-        <input type="text" id="protect-colors" placeholder="#2ecc71, #ff0000"
-          title="Colors listed here (hex codes, comma-separated) are prioritized when building the compressed palette, reducing the chance they get replaced by a similar color. Not a 100% guarantee — pngquant may still adjust the rest of the palette. Only applies in Standard mode.">
-      </div>
-      <div class="config-group" id="dithering-group">
-        <label title="Smooths color transitions by mixing nearby palette colors in a fine pattern. For screenshots with UI text, turning this off usually keeps text edges cleaner. Only applies in Standard mode.">Dithering</label>
-        <label class="check-row"
-          title="Smooths color transitions by mixing nearby palette colors in a fine pattern. Usually helps gradients and photos, but can make flat-color graphics and text edges (icons, UI screenshots) look slightly grainy. Turn off for cleaner text and flat colors. Only applies in Standard mode.">
-          <input type="checkbox" id="dithering" checked /> Enabled
-        </label>
-      </div>
-    </div>
-    <div id="mode-hint" style="display:none;font-size:12px;color:var(--red);margin:-8px 0 16px"></div>
-    <div id="mode-note" style="display:none;font-size:12px;color:var(--yellow);margin:-8px 0 16px"></div>
-    <div class="action-bar">
-      <div class="spacer"></div>
-      <span style="font-size:13px;color:var(--text2)" id="file-count-info"></span>
-      <button class="btn btn-primary" id="start-btn" disabled>Start</button>
-    </div>
-  </div>
-
-  <!-- Watch Mode -->
-  <div class="card" id="watch-section">
-    <div class="card-title">Watch Mode</div>
-    <div style="font-size:12px;color:var(--text2);margin-bottom:10px">
-      Monitor a folder and auto-optimize new or changed images as they appear.
-    </div>
-    <div class="input-row" style="margin-bottom:8px">
-      <button class="btn btn-secondary" id="watch-use-current-paths-btn" style="white-space:nowrap">Use Select Images / Output paths</button>
-    </div>
-    <div class="input-row" style="margin-bottom:8px">
-      <input type="text" id="watch-dir" placeholder="Watch directory" style="flex:1" />
-      <button class="btn btn-secondary" id="watch-browse-dir-btn" style="white-space:nowrap">Browse...</button>
-    </div>
-    <div class="input-row" style="margin-bottom:8px">
-      <input type="text" id="watch-output-dir" placeholder="Output directory (required)" style="flex:1" />
-      <button class="btn btn-secondary" id="watch-browse-output-btn" style="white-space:nowrap">Browse...</button>
-    </div>
-    <div style="display:flex;gap:12px;margin-bottom:10px">
-      <label style="font-size:13px;cursor:pointer;user-select:none;display:flex;align-items:center;gap:4px">
-        <input type="checkbox" id="watch-recursive" checked /> Include subfolders
-      </label>
-      <label style="font-size:13px;cursor:pointer;user-select:none;display:flex;align-items:center;gap:4px">
-        <input type="checkbox" id="watch-process-existing" /> Process existing files
-      </label>
-    </div>
-    <div class="watch-status" id="watch-status">Idle</div>
-    <div class="action-bar" style="margin-top:8px">
-      <button class="btn btn-primary" id="watch-start-btn">Start Watching</button>
-      <button class="btn btn-danger" id="watch-stop-btn" style="display:none">Stop</button>
-      <div class="spacer"></div>
-      <span style="font-size:12px;color:var(--text2)" id="watch-stats"></span>
-    </div>
-    <div class="watch-log-box" id="watch-log-box" style="display:none"></div>
   </div>
 
   </div>
@@ -624,39 +561,39 @@ header h1 span { color: var(--accent); }
 
   <!-- File List -->
   <div class="card" id="files-section">
-    <div class="card-title">Files</div>
+    <div class="card-title" data-i18n="files.title">Files</div>
     <div class="file-stats">
       <span id="file-stats-text"></span>
       <span style="display:flex;align-items:center;gap:10px">
-        <label for="file-sort" style="font-size:12px">Sort</label>
+        <label for="file-sort" style="font-size:12px" data-i18n="common.sort">Sort</label>
         <select id="file-sort">
-          <option value="default">Scan order</option>
-          <option value="mtime_desc">Modified (newest first)</option>
-          <option value="mtime_asc">Modified (oldest first)</option>
-          <option value="ctime_desc">Created (newest first)</option>
-          <option value="ctime_asc">Created (oldest first)</option>
-          <option value="size_desc">Size (large to small)</option>
-          <option value="size_asc">Size (small to large)</option>
+          <option value="default" data-i18n="files.sort.default">Scan order</option>
+          <option value="mtime_desc" data-i18n="files.sort.mtimeDesc">Modified (newest first)</option>
+          <option value="mtime_asc" data-i18n="files.sort.mtimeAsc">Modified (oldest first)</option>
+          <option value="ctime_desc" data-i18n="files.sort.ctimeDesc">Created (newest first)</option>
+          <option value="ctime_asc" data-i18n="files.sort.ctimeAsc">Created (oldest first)</option>
+          <option value="size_desc" data-i18n="files.sort.sizeDesc">Size (large to small)</option>
+          <option value="size_asc" data-i18n="files.sort.sizeAsc">Size (small to large)</option>
         </select>
         <label style="font-size:13px;cursor:pointer;user-select:none">
-          <input type="checkbox" id="select-all" checked /> Select all
+          <input type="checkbox" id="select-all" checked /> <span data-i18n="files.selectAll">Select all</span>
         </label>
       </span>
     </div>
-    <div id="files-empty" style="font-size:13px;color:var(--text2);padding:0 0 16px">Images will appear here after you scan a folder or add files</div>
+    <div id="files-empty" style="font-size:13px;color:var(--text2);padding:0 0 16px" data-i18n="files.empty">Images will appear here after you scan a folder or add files</div>
     <div class="file-grid" id="file-grid"></div>
   </div>
 
   <!-- Progress -->
   <div class="card" id="progress-section">
-    <div class="card-title">Progress</div>
+    <div class="card-title" data-i18n="progress.title">Progress</div>
     <div class="progress-bar"><div class="progress-bar-fill" id="progress-fill"></div></div>
     <div class="progress-info">
-      <span id="progress-text">Waiting...</span>
+      <span id="progress-text" data-i18n="progress.waiting">Waiting...</span>
       <span>
-        <button class="btn btn-secondary btn-sm" id="pause-btn" style="display:none;padding:4px 12px;font-size:12px" title="Pause: stop starting new files (in-flight ones finish). Click Resume to continue.">Pause</button>
-        <button class="btn btn-primary btn-sm" id="resume-btn" style="display:none;padding:4px 12px;font-size:12px">Resume</button>
-        <button class="btn btn-danger btn-sm" id="cancel-btn" style="display:none;padding:4px 12px;font-size:12px">Cancel</button>
+        <button class="btn btn-secondary btn-sm" id="pause-btn" style="display:none;padding:4px 12px;font-size:12px" data-i18n-title="progress.pauseTitle" title="Pause: stop starting new files (in-flight ones finish). Click Resume to continue." data-i18n="common.pause">Pause</button>
+        <button class="btn btn-primary btn-sm" id="resume-btn" style="display:none;padding:4px 12px;font-size:12px" data-i18n="common.resume">Resume</button>
+        <button class="btn btn-danger btn-sm" id="cancel-btn" style="display:none;padding:4px 12px;font-size:12px" data-i18n="common.cancel">Cancel</button>
       </span>
     </div>
     <div class="log-box" id="log-box"></div>
@@ -664,35 +601,168 @@ header h1 span { color: var(--accent); }
 
   <!-- Results -->
   <div class="card" id="results-section">
-    <div class="card-title">Results</div>
-    <div id="results-empty" style="font-size:13px;color:var(--text2);padding:0 0 16px">No results yet, run Start to see compressed files</div>
+    <div class="card-title" data-i18n="results.title">Results</div>
+    <div id="results-empty" style="font-size:13px;color:var(--text2);padding:0 0 16px" data-i18n="results.empty">No results yet, run Start to see compressed files</div>
     <div class="result-summary" id="result-summary"></div>
     <div class="action-bar" style="margin-bottom:12px">
       <span id="output-path-info" style="font-size:12px;color:var(--text2)"></span>
       <div class="spacer"></div>
-      <button class="btn btn-secondary" id="retry-btn" style="display:none">Retry Failed</button>
-      <button class="btn btn-secondary" id="reveal-dir-btn" style="display:none" title="Open the output folder in the OS file explorer">Reveal Output Folder</button>
-      <button class="btn btn-primary" id="download-btn" style="display:none">Download All (ZIP)</button>
-      <button class="btn btn-secondary" id="reset-btn">Reset</button>
+      <button class="btn btn-secondary" id="retry-btn" style="display:none" data-i18n="results.retry">Retry Failed</button>
+      <button class="btn btn-secondary" id="reveal-dir-btn" style="display:none" data-i18n-title="results.revealTitle" title="Open the output folder in the OS file explorer" data-i18n="results.reveal">Reveal Output Folder</button>
+      <button class="btn btn-primary" id="download-btn" style="display:none" data-i18n="results.download">Download All (ZIP)</button>
+      <button class="btn btn-secondary" id="reset-btn" data-i18n="common.reset">Reset</button>
     </div>
     <div class="result-toolbar" id="result-toolbar" style="display:none">
-      <label for="result-sort">Sort</label>
+      <label for="result-sort" data-i18n="common.sort">Sort</label>
       <select id="result-sort">
-        <option value="default">Completion order</option>
-        <option value="savings_desc">Compression % (high to low)</option>
-        <option value="savings_asc">Compression % (low to high)</option>
-        <option value="size_desc">Compressed size (large to small)</option>
-        <option value="saved_desc">Bytes saved (most first)</option>
+        <option value="default" data-i18n="results.sort.default">Completion order</option>
+        <option value="savings_desc" data-i18n="results.sort.savingsDesc">Compression % (high to low)</option>
+        <option value="savings_asc" data-i18n="results.sort.savingsAsc">Compression % (low to high)</option>
+        <option value="size_desc" data-i18n="results.sort.sizeDesc">Compressed size (large to small)</option>
+        <option value="saved_desc" data-i18n="results.sort.savedDesc">Bytes saved (most first)</option>
       </select>
-      <label for="result-filter">Show</label>
+      <label for="result-filter" data-i18n="results.show">Show</label>
       <select id="result-filter">
-        <option value="all">All</option>
-        <option value="success">Succeeded only</option>
-        <option value="failed">Failed only</option>
+        <option value="all" data-i18n="results.filter.all">All</option>
+        <option value="success" data-i18n="results.filter.success">Succeeded only</option>
+        <option value="failed" data-i18n="results.filter.failed">Failed only</option>
       </select>
       <span class="count" id="result-count"></span>
     </div>
     <div class="result-grid" id="result-grid"></div>
+  </div>
+
+  </div>
+
+  <div class="app-right">
+
+  <!-- Config + Action -->
+  <div class="card" id="config-section">
+    <div class="card-title" data-i18n="config.title">Settings</div>
+    <div id="settings-tip" style="font-size:12px;color:var(--text2);margin-bottom:12px" data-i18n="config.settingsTip">Settings are saved automatically.</div>
+    <button class="btn btn-secondary btn-sm" id="screenshot-preset-btn" style="padding:4px 12px;font-size:12px;margin-bottom:12px" data-i18n-title="config.screenshotPresetTitle" title="Sets Quality: High, Max Width: 1920px, Mode: Standard, Dithering: Off. A starting point for compressing software screenshots." data-i18n="config.screenshotPreset">Screenshot preset</button>
+    <div id="watch-lock-notice" style="display:none;font-size:12px;color:var(--yellow);background:rgba(230,180,60,0.1);border:1px solid rgba(230,180,60,0.3);border-radius:6px;padding:8px 10px;margin-bottom:12px" data-i18n="config.watchLockNotice">
+      Locked while Watch Mode is running. It captured these settings when you clicked "Start Watching" and won't pick up changes. Stop Watch Mode to change them, then start again.
+    </div>
+    <div class="config-grid" style="margin-bottom:16px">
+      <div class="config-group">
+        <label data-i18n-title="config.qualityTitle" title="Controls how much color detail Standard mode is allowed to sacrifice for size. For UI screenshots with text, High usually costs little extra size since screenshots rarely use many colors to begin with." data-i18n="config.quality">Quality</label>
+        <div class="radio-group" id="quality-group">
+          <input type="radio" name="quality" id="q-high" value="high"
+            title="Controls how much color detail Standard mode is allowed to sacrifice for size. For UI screenshots with text, High usually costs little extra size since screenshots rarely use many colors to begin with.">
+          <label for="q-high" data-i18n="config.qualityHigh"
+            title="Controls how much color detail Standard mode is allowed to sacrifice for size. For UI screenshots with text, High usually costs little extra size since screenshots rarely use many colors to begin with.">High</label>
+          <input type="radio" name="quality" id="q-med" value="medium" checked><label for="q-med" data-i18n="config.qualityMedium">Medium</label>
+          <input type="radio" name="quality" id="q-low" value="low"><label for="q-low" data-i18n="config.qualityLow">Low</label>
+        </div>
+      </div>
+      <div class="config-group">
+        <label data-i18n-title="config.maxWidthTitle" title="Shrinking dimensions is the one setting that can genuinely blur small text. Screenshots with UI text often look best left at 'No resize' or scaled down only slightly." data-i18n="config.maxWidth">Max Width</label>
+        <select id="max-width"
+          data-i18n-title="config.maxWidthTitle"
+          title="Shrinking dimensions is the one setting that can genuinely blur small text. Screenshots with UI text often look best left at 'No resize' or scaled down only slightly.">
+          <option value="0" data-i18n="config.noResize">No resize</option>
+          <option value="1920">1920px</option>
+          <option value="1500">1500px</option>
+          <option value="1200">1200px</option>
+        </select>
+      </div>
+      <div class="config-group">
+        <label data-i18n="config.outputFormat">Output Format</label>
+        <div class="radio-group" id="format-group">
+          <input type="radio" name="format" id="fmt-png" value="png" checked><label for="fmt-png">PNG</label>
+          <input type="radio" name="format" id="fmt-jpg" value="jpg"
+            title="Re-compresses images with mozjpeg's cjpeg while KEEPING the JPEG format, the way to shrink a batch of JPGs without converting them. Quality applies in Standard mode; 'Lossless' maps to the highest mozjpeg quality (~95) since JPEG is inherently lossy. Requires cjpeg in the bin/ directory.">
+          <label for="fmt-jpg" data-i18n-title="config.fmtJpgTitle"
+            title="Re-compresses images with mozjpeg's cjpeg while KEEPING the JPEG format, the way to shrink a batch of JPGs without converting them. Quality applies in Standard mode; 'Lossless' maps to the highest mozjpeg quality (~95) since JPEG is inherently lossy. Requires cjpeg in the bin/ directory.">JPG</label>
+          <input type="radio" name="format" id="fmt-webp" value="webp"
+            title="WebP typically produces smaller files than PNG at similar visual quality. Uses its own encoder (not pngquant/oxipng), so Quality/Protect Colors/Dithering don't apply; only Compression Mode's lossy-vs-lossless choice does.">
+          <label for="fmt-webp" data-i18n-title="config.fmtWebpTitle"
+            title="WebP typically produces smaller files than PNG at similar visual quality. Uses its own encoder (not pngquant/oxipng), so Quality/Protect Colors/Dithering don't apply; only Compression Mode's lossy-vs-lossless choice does.">WebP</label>
+          <input type="radio" name="format" id="fmt-avif" value="avif"
+            title="AVIF is a modern codec that typically produces the smallest files at equivalent quality. Slower encoding than PNG/WebP. Requires avifenc in the bin/ directory or PATH.">
+          <label for="fmt-avif" data-i18n-title="config.fmtAvifTitle"
+            title="AVIF is a modern codec that typically produces the smallest files at equivalent quality. Slower encoding than PNG/WebP. Requires avifenc in the bin/ directory or PATH.">AVIF</label>
+        </div>
+      </div>
+      <div class="config-group">
+        <label data-i18n-title="config.modeTitle" title="Choose how compression is achieved." data-i18n="config.compressionMode">Compression Mode</label>
+        <div class="radio-group" id="mode-group">
+          <input type="radio" name="mode" id="mode-standard" value="standard" checked
+            title="Best compression. Reduces the image to a smaller color palette before compressing; may cause slight color shifts on small or unique-colored details.">
+          <label for="mode-standard" data-i18n-title="config.modeStandardTitle" data-i18n="config.modeStandard"
+            title="Best compression. Reduces the image to a smaller color palette before compressing; may cause slight color shifts on small or unique-colored details.">Standard</label>
+          <input type="radio" name="mode" id="mode-lossless" value="lossless"
+            title="No color changes at all. Compresses without touching pixel values; larger files than Standard, but pixel-perfect.">
+          <label for="mode-lossless" data-i18n-title="config.modeLosslessTitle" data-i18n="config.modeLossless"
+            title="No color changes at all. Compresses without touching pixel values; larger files than Standard, but pixel-perfect.">Lossless</label>
+          <input type="radio" name="mode" id="mode-resize" value="resize_only"
+            title="Shrinks image dimensions (requires Max Width to be set) and compresses losslessly, keeping full original color accuracy at the smaller size.">
+          <label for="mode-resize" data-i18n-title="config.modeResizeTitle" data-i18n="config.modeResize"
+            title="Shrinks image dimensions (requires Max Width to be set) and compresses losslessly, keeping full original color accuracy at the smaller size.">Resize Only</label>
+          <input type="radio" name="mode" id="mode-screenshot" value="screenshot"
+            title="Tuned specifically for software/UI screenshots (PNG only): a much tighter color-quality floor than Standard mode, dithering off, no resize. Full resolution and near-zero color deviation, typically ~70-80% smaller. Falls back to Lossless automatically if a particular image is too color-complex (e.g. a screenshot with an embedded photo) to hit that quality floor.">
+          <label for="mode-screenshot" data-i18n-title="config.modeScreenshotTitle" data-i18n="config.modeScreenshot"
+            title="Tuned specifically for software/UI screenshots (PNG only): a much tighter color-quality floor than Standard mode, dithering off, no resize. Full resolution and near-zero color deviation, typically ~70-80% smaller. Falls back to Lossless automatically if a particular image is too color-complex (e.g. a screenshot with an embedded photo) to hit that quality floor.">Screenshot</label>
+        </div>
+      </div>
+      <div class="config-group" id="protect-colors-group">
+        <label data-i18n-title="config.protectColorsTitle" title="Colors listed here are prioritized when building the compressed palette, reducing the chance they get replaced by a similar color. Not a 100% guarantee. Only applies in Standard mode." data-i18n="config.protectColors">Protect Colors</label>
+        <input type="text" id="protect-colors" placeholder="#2ecc71, #ff0000"
+          data-i18n-title="config.protectColorsInputTitle"
+          title="Colors listed here (hex codes, comma-separated) are prioritized when building the compressed palette, reducing the chance they get replaced by a similar color. Not a 100% guarantee; pngquant may still adjust the rest of the palette. Only applies in Standard mode.">
+      </div>
+      <div class="config-group" id="dithering-group">
+        <label data-i18n-title="config.ditheringTitle" title="Smooths color transitions by mixing nearby palette colors in a fine pattern. For screenshots with UI text, turning this off usually keeps text edges cleaner. Only applies in Standard mode." data-i18n="config.dithering">Dithering</label>
+        <label class="check-row"
+          data-i18n-title="config.ditheringInputTitle"
+          title="Smooths color transitions by mixing nearby palette colors in a fine pattern. Usually helps gradients and photos, but can make flat-color graphics and text edges (icons, UI screenshots) look slightly grainy. Turn off for cleaner text and flat colors. Only applies in Standard mode.">
+          <input type="checkbox" id="dithering" checked /> <span data-i18n="config.enabled">Enabled</span>
+        </label>
+      </div>
+    </div>
+    <div id="mode-hint" style="display:none;font-size:12px;color:var(--red);margin:-8px 0 16px"></div>
+    <div id="mode-note" style="display:none;font-size:12px;color:var(--yellow);margin:-8px 0 16px"></div>
+    <div class="action-bar">
+      <div class="spacer"></div>
+      <span style="font-size:13px;color:var(--text2)" id="file-count-info"></span>
+      <button class="btn btn-primary" id="start-btn" disabled data-i18n="common.start">Start</button>
+    </div>
+  </div>
+
+  <!-- Watch Mode -->
+  <div class="card" id="watch-section">
+    <div class="card-title" data-i18n="watch.title">Watch Mode</div>
+    <div style="font-size:12px;color:var(--text2);margin-bottom:10px" data-i18n="watch.desc">
+      Monitor a folder and auto-optimize new or changed images as they appear.
+    </div>
+    <div class="input-row" style="margin-bottom:8px">
+      <button class="btn btn-secondary" id="watch-use-current-paths-btn" style="white-space:nowrap" data-i18n="watch.useCurrentPaths">Use Source / Output paths</button>
+    </div>
+    <div class="input-row" style="margin-bottom:8px">
+      <input type="text" id="watch-dir" data-i18n-placeholder="watch.dirPlaceholder" placeholder="Watch directory" style="flex:1" />
+      <button class="btn btn-secondary" id="watch-browse-dir-btn" style="white-space:nowrap" data-i18n="common.browse">Browse...</button>
+    </div>
+    <div class="input-row" style="margin-bottom:8px">
+      <input type="text" id="watch-output-dir" data-i18n-placeholder="watch.outputPlaceholder" placeholder="Output directory (required)" style="flex:1" />
+      <button class="btn btn-secondary" id="watch-browse-output-btn" style="white-space:nowrap" data-i18n="common.browse">Browse...</button>
+    </div>
+    <div style="display:flex;gap:12px;margin-bottom:10px">
+      <label style="font-size:13px;cursor:pointer;user-select:none;display:flex;align-items:center;gap:4px">
+        <input type="checkbox" id="watch-recursive" checked /> <span data-i18n="common.includeSubfolders">Include subfolders</span>
+      </label>
+      <label style="font-size:13px;cursor:pointer;user-select:none;display:flex;align-items:center;gap:4px">
+        <input type="checkbox" id="watch-process-existing" /> <span data-i18n="watch.processExisting">Process existing files</span>
+      </label>
+    </div>
+    <div class="watch-status" id="watch-status" data-i18n="watch.idle">Idle</div>
+    <div class="action-bar" style="margin-top:8px">
+      <button class="btn btn-primary" id="watch-start-btn" data-i18n="watch.start">Start Watching</button>
+      <button class="btn btn-danger" id="watch-stop-btn" style="display:none" data-i18n="common.stop">Stop</button>
+      <div class="spacer"></div>
+      <span style="font-size:12px;color:var(--text2)" id="watch-stats"></span>
+    </div>
+    <div class="watch-log-box" id="watch-log-box" style="display:none"></div>
   </div>
 
   </div>
@@ -727,6 +797,414 @@ const STATE = {
 // DOM refs
 const $ = id => document.getElementById(id);
 
+// ---------------------------------------------------------------------
+// i18n
+// ---------------------------------------------------------------------
+// Extensible dictionary: add a new language by adding a key to I18N and an
+// <option> in #setting-language. Keys are dot-namespaced by section.
+// Scope: front-end UI text only — server-pushed log lines (Watch Mode
+// activity, per-file progress messages) stay in English regardless of the
+// selected UI language, since those originate from the Python backend.
+const I18N = {
+  en: {
+    'app.title': 'Image Optimizer',
+    'health.checking': 'Checking...',
+    'health.connectionFailed': 'Connection failed',
+    'header.settingsTitle': 'Settings',
+    'header.themeToggleTitle': 'Toggle light / dark theme',
+    'settings.title': 'Settings',
+    'settings.language': 'Language',
+    'settings.languageHint': 'Applies immediately',
+    'settings.host': 'Host',
+    'settings.port': 'Port',
+    'settings.restartHint': 'Requires restart to take effect',
+    'settings.concurrentWorkers': 'Concurrent Workers',
+    'settings.concurrentWorkersHint': 'Number of images compressed in parallel. Requires restart',
+    'settings.thumbnailWorkers': 'Thumbnail Workers',
+    'settings.thumbnailWorkersHint': 'Number of thumbnails generated in parallel. Requires restart',
+    'settings.cleanupDelay': 'Workspace Cleanup Delay (seconds)',
+    'settings.idleTimeout': 'Session Idle Timeout (hours)',
+    'settings.cancel': 'Cancel',
+    'settings.save': 'Save',
+    'settings.saved': 'Settings saved.',
+    'settings.savedRestartNote': ' Some changes require a restart to take effect.',
+    'settings.saveFailed': 'Failed to save settings',
+    'common.resume': 'Resume',
+    'common.dismiss': 'Dismiss',
+    'batchResume.found': 'Found unfinished batch: {done}/{total} completed ({failed} failed). Resume?',
+    'common.browseFolder': 'Browse Folder...',
+    'common.browse': 'Browse...',
+    'common.includeSubfolders': 'Include subfolders',
+    'common.sort': 'Sort',
+    'common.pause': 'Pause',
+    'common.cancel': 'Cancel',
+    'common.reset': 'Reset',
+    'common.start': 'Start',
+    'common.stop': 'Stop',
+    'common.selecting': 'Selecting...',
+    'common.failed': 'failed',
+    'input.title': 'Source Path',
+    'input.dirPlaceholder': 'Folder path to scan, e.g. D:\\screenshots',
+    'input.scanBtn': 'Scan Folder',
+    'input.scanning': 'Scanning...',
+    'input.findingImages': 'Finding images...',
+    'input.scanningProgress': 'Scanning {current} / {total} images...',
+    'input.browseFilesBtn': 'Browse Files...',
+    'input.clearAll': 'Clear all',
+    'input.noImagesFound': 'No images found',
+    'output.title': 'Target Path (optional)',
+    'output.placeholder': 'Type or paste the output folder path, or leave empty for temp folder',
+    'output.skipExistingTitle': 'When re-running against the same output folder, files already optimized there are reused instead of being recompressed. Only applies when an output folder is set.',
+    'output.skipExisting': 'Skip files already in the output folder',
+    'output.keepExifTitle': 'Keep a curated subset of EXIF metadata (camera make/model, date, exposure) in the output. GPS coordinates, Orientation (already baked into the pixels), and bulky MakerNote are dropped. Off by default; turn on only if you need the metadata preserved.',
+    'output.keepExif': 'Keep EXIF metadata (camera info, date; GPS stripped)',
+    'output.prefix': 'Output: ',
+    'files.title': 'Files',
+    'files.sort.default': 'Scan order',
+    'files.sort.mtimeDesc': 'Modified (newest first)',
+    'files.sort.mtimeAsc': 'Modified (oldest first)',
+    'files.sort.ctimeDesc': 'Created (newest first)',
+    'files.sort.ctimeAsc': 'Created (oldest first)',
+    'files.sort.sizeDesc': 'Size (large to small)',
+    'files.sort.sizeAsc': 'Size (small to large)',
+    'files.selectAll': 'Select all',
+    'files.empty': 'Images will appear here after you scan a folder or add files',
+    'files.stats': '{count} file(s), {size} total',
+    'files.preview': 'Preview',
+    'files.previewTitle': 'Run a single-file dry run with the current settings to project the compressed size. Does not affect results or the download ZIP.',
+    'files.overrideTitle': 'Per-file settings (override the global quality/mode for just this file)',
+    'files.overrideMode': 'Mode',
+    'files.overrideWidth': 'Width',
+    'files.inherit': 'inherit',
+    'progress.title': 'Progress',
+    'progress.waiting': 'Waiting...',
+    'progress.complete': 'Complete',
+    'progress.pauseTitle': 'Pause: stop starting new files (in-flight ones finish). Click Resume to continue.',
+    'results.title': 'Results',
+    'results.empty': 'No results yet, run Start to see compressed files',
+    'results.retry': 'Retry Failed',
+    'results.revealTitle': 'Open the output folder in the OS file explorer',
+    'results.reveal': 'Reveal Output Folder',
+    'results.download': 'Download All (ZIP)',
+    'results.sort.default': 'Completion order',
+    'results.sort.savingsDesc': 'Compression % (high to low)',
+    'results.sort.savingsAsc': 'Compression % (low to high)',
+    'results.sort.sizeDesc': 'Compressed size (large to small)',
+    'results.sort.savedDesc': 'Bytes saved (most first)',
+    'results.show': 'Show',
+    'results.filter.all': 'All',
+    'results.filter.success': 'Succeeded only',
+    'results.filter.failed': 'Failed only',
+    'results.failedLabel': 'Failed',
+    'results.skipped': 'Skipped (already optimized)',
+    'results.saved': 'Saved {pct}%',
+    'results.compare': 'Compare',
+    'results.stat.files': 'Files',
+    'results.stat.compression': 'Compression',
+    'results.stat.original': 'Original',
+    'results.stat.compressed': 'Compressed',
+    'results.stat.saved': 'Saved',
+    'results.countAll': '{total} file(s)',
+    'results.countFiltered': '{shown} of {total} shown',
+    'config.title': 'Settings',
+    'config.watchLockNotice': 'Locked while Watch Mode is running. It captured these settings when you clicked "Start Watching" and won\u2019t pick up changes. Stop Watch Mode to change them, then start again.',
+    'config.settingsTip': 'Settings are saved automatically.',
+    'config.screenshotPreset': 'Screenshot preset',
+    'config.screenshotPresetTitle': 'Sets Quality: High, Max Width: 1920px, Mode: Standard, Dithering: Off. A starting point for compressing software screenshots.',
+    'config.quality': 'Quality',
+    'config.qualityTitle': 'Controls how much color detail Standard mode is allowed to sacrifice for size. For UI screenshots with text, High usually costs little extra size since screenshots rarely use many colors to begin with.',
+    'config.qualityHigh': 'High',
+    'config.qualityMedium': 'Medium',
+    'config.qualityLow': 'Low',
+    'config.maxWidth': 'Max Width',
+    'config.maxWidthTitle': "Shrinking dimensions is the one setting that can genuinely blur small text. Screenshots with UI text often look best left at 'No resize' or scaled down only slightly.",
+    'config.noResize': 'No resize',
+    'config.outputFormat': 'Output Format',
+    'config.fmtJpgTitle': "Re-compresses images with mozjpeg's cjpeg while KEEPING the JPEG format, the way to shrink a batch of JPGs without converting them. Quality applies in Standard mode; 'Lossless' maps to the highest mozjpeg quality (~95) since JPEG is inherently lossy. Requires cjpeg in the bin/ directory.",
+    'config.fmtWebpTitle': "WebP typically produces smaller files than PNG at similar visual quality. Uses its own encoder (not pngquant/oxipng), so Quality/Protect Colors/Dithering don't apply; only Compression Mode's lossy-vs-lossless choice does.",
+    'config.fmtAvifTitle': 'AVIF is a modern codec that typically produces the smallest files at equivalent quality. Slower encoding than PNG/WebP. Requires avifenc in the bin/ directory or PATH.',
+    'config.compressionMode': 'Compression Mode',
+    'config.modeTitle': 'Choose how compression is achieved.',
+    'config.modeStandard': 'Standard',
+    'config.modeStandardTitle': 'Best compression. Reduces the image to a smaller color palette before compressing; may cause slight color shifts on small or unique-colored details.',
+    'config.modeLossless': 'Lossless',
+    'config.modeLosslessTitle': 'No color changes at all. Compresses without touching pixel values; larger files than Standard, but pixel-perfect.',
+    'config.modeResize': 'Resize Only',
+    'config.modeResizeTitle': 'Shrinks image dimensions (requires Max Width to be set) and compresses losslessly, keeping full original color accuracy at the smaller size.',
+    'config.modeScreenshot': 'Screenshot',
+    'config.modeScreenshotTitle': 'Tuned specifically for software/UI screenshots (PNG only): a much tighter color-quality floor than Standard mode, dithering off, no resize. Full resolution and near-zero color deviation, typically ~70-80% smaller. Falls back to Lossless automatically if a particular image is too color-complex (e.g. a screenshot with an embedded photo) to hit that quality floor.',
+    'config.modeNoteJpeg': 'JPEG is inherently lossy, so "Lossless" and "Resize Only" use mozjpeg\u2019s highest quality (~95) with no palette changes.',
+    'config.resizeOnlyHint': 'Resize Only mode needs a Max Width other than "No resize".',
+    'config.protectColors': 'Protect Colors',
+    'config.protectColorsTitle': 'Colors listed here are prioritized when building the compressed palette, reducing the chance they get replaced by a similar color. Not a 100% guarantee. Only applies in Standard mode.',
+    'config.protectColorsInputTitle': 'Colors listed here (hex codes, comma-separated) are prioritized when building the compressed palette, reducing the chance they get replaced by a similar color. Not a 100% guarantee; pngquant may still adjust the rest of the palette. Only applies in Standard mode.',
+    'config.dithering': 'Dithering',
+    'config.ditheringTitle': 'Smooths color transitions by mixing nearby palette colors in a fine pattern. For screenshots with UI text, turning this off usually keeps text edges cleaner. Only applies in Standard mode.',
+    'config.ditheringInputTitle': 'Smooths color transitions by mixing nearby palette colors in a fine pattern. Usually helps gradients and photos, but can make flat-color graphics and text edges (icons, UI screenshots) look slightly grainy. Turn off for cleaner text and flat colors. Only applies in Standard mode.',
+    'config.enabled': 'Enabled',
+    'watch.title': 'Watch Mode',
+    'watch.desc': 'Monitor a folder and auto-optimize new or changed images as they appear.',
+    'watch.useCurrentPaths': 'Use Source Path / Target Path settings',
+    'watch.dirPlaceholder': 'Watch directory',
+    'watch.outputPlaceholder': 'Output directory (required)',
+    'watch.processExisting': 'Process existing files',
+    'watch.idle': 'Idle',
+    'watch.watching': 'Watching\u2026',
+    'watch.start': 'Start Watching',
+    'notice.enterFolderPath': 'Please enter a folder path',
+    'notice.folderPickerUnavailable': 'Folder picker unavailable: {error}. Type the path manually instead.',
+    'notice.folderPickerFailed': 'Folder picker failed: {error}',
+    'notice.scanFailedPrefix': 'Scan failed: ',
+    'notice.lostConnectionScanning': 'Lost connection while scanning: {error}',
+    'notice.uploadFailed': 'Upload failed: {error}',
+    'notice.waitForCurrentRun': 'Wait for the current run to finish before previewing.',
+    'notice.previewFailed': 'Preview failed',
+    'notice.startFailedPrefix': 'Start failed: ',
+    'notice.retryFailedPrefix': 'Retry failed: ',
+    'notice.noFailedFiles': 'No failed files to retry',
+    'notice.explorerOpenFailed': 'Could not open file explorer: {error}',
+    'notice.enterWatchDir': 'Please enter a watch directory',
+    'notice.enterOutputDir': 'Please enter an output directory',
+    'notice.watchStartFailedPrefix': 'Watch start failed: ',
+    'notice.pathsBothEmpty': 'Source Path and Target Path are both empty. Set them above first.',
+    'notice.watchOutputStillEmpty': 'Copied the folder to watch, but Output path is empty there too. Watch Mode needs an output folder (no temp-folder option), so set one before starting.',
+    'notice.resumeFailed': 'Resume failed',
+    'notice.resumeFailedPrefix': 'Resume failed: ',
+  },
+  zh: {
+    'app.title': '图片优化工具',
+    'health.checking': '检测中...',
+    'health.connectionFailed': '连接失败',
+    'header.settingsTitle': '设置',
+    'header.themeToggleTitle': '切换浅色/深色主题',
+    'settings.title': '设置',
+    'settings.language': '语言',
+    'settings.languageHint': '立即生效',
+    'settings.host': '主机地址',
+    'settings.port': '端口',
+    'settings.restartHint': '需要重启后生效',
+    'settings.concurrentWorkers': '并发处理数',
+    'settings.concurrentWorkersHint': '并行压缩的图片数量，需要重启后生效',
+    'settings.thumbnailWorkers': '缩略图并发数',
+    'settings.thumbnailWorkersHint': '并行生成缩略图的数量，需要重启后生效',
+    'settings.cleanupDelay': '工作区清理延迟（秒）',
+    'settings.idleTimeout': '会话空闲超时（小时）',
+    'settings.cancel': '取消',
+    'settings.save': '保存',
+    'settings.saved': '设置已保存。',
+    'settings.savedRestartNote': '部分改动需要重启后才能生效。',
+    'settings.saveFailed': '保存设置失败',
+    'common.resume': '继续',
+    'common.dismiss': '关闭',
+    'batchResume.found': '发现未完成的批次：已完成 {done}/{total}（失败 {failed} 个）。是否继续？',
+    'common.browseFolder': '浏览文件夹...',
+    'common.browse': '浏览...',
+    'common.includeSubfolders': '包含子文件夹',
+    'common.sort': '排序',
+    'common.pause': '暂停',
+    'common.cancel': '取消',
+    'common.reset': '重置',
+    'common.start': '开始',
+    'common.stop': '停止',
+    'common.selecting': '选择中...',
+    'common.failed': '失败',
+    'input.title': '源路径',
+    'input.dirPlaceholder': '要扫描的文件夹路径，例如 D:\\screenshots',
+    'input.scanBtn': '扫描文件夹',
+    'input.scanning': '扫描中...',
+    'input.findingImages': '正在查找图片...',
+    'input.scanningProgress': '正在扫描 {current} / {total} 张图片...',
+    'input.browseFilesBtn': '浏览文件...',
+    'input.clearAll': '全部清除',
+    'input.noImagesFound': '未找到图片',
+    'output.title': '目标路径（可选）',
+    'output.placeholder': '输入或粘贴输出文件夹路径，留空则使用临时文件夹',
+    'output.skipExistingTitle': '再次对同一输出文件夹运行时，已经优化过的文件会被直接复用，而不是重新压缩。仅在设置了输出文件夹时生效。',
+    'output.skipExisting': '跳过输出文件夹中已存在的文件',
+    'output.keepExifTitle': '在输出文件中保留一部分精选的 EXIF 元数据（相机型号、日期、曝光参数）。GPS 坐标、方向信息（已经烘焙进像素中）以及体积较大的 MakerNote 会被丢弃。默认关闭，只有确实需要保留这些元数据时才开启。',
+    'output.keepExif': '保留 EXIF 元数据（相机信息、日期；GPS 已剥离）',
+    'output.prefix': '输出路径：',
+    'files.title': '文件',
+    'files.sort.default': '扫描顺序',
+    'files.sort.mtimeDesc': '修改时间（最新优先）',
+    'files.sort.mtimeAsc': '修改时间（最早优先）',
+    'files.sort.ctimeDesc': '创建时间（最新优先）',
+    'files.sort.ctimeAsc': '创建时间（最早优先）',
+    'files.sort.sizeDesc': '大小（从大到小）',
+    'files.sort.sizeAsc': '大小（从小到大）',
+    'files.selectAll': '全选',
+    'files.empty': '扫描文件夹或添加文件后，图片会显示在这里',
+    'files.stats': '{count} 个文件，共 {size}',
+    'files.preview': '预览',
+    'files.previewTitle': '使用当前设置对单个文件进行试运行，预估压缩后的大小。不影响最终结果或下载的 ZIP。',
+    'files.overrideTitle': '单文件设置（仅为这个文件覆盖全局的质量/模式设置）',
+    'files.overrideMode': '模式',
+    'files.overrideWidth': '宽度',
+    'files.inherit': '继承',
+    'progress.title': '进度',
+    'progress.waiting': '等待中...',
+    'progress.complete': '已完成',
+    'progress.pauseTitle': '暂停：不再开始处理新文件（正在处理的文件会完成）。点击继续可恢复。',
+    'results.title': '结果',
+    'results.empty': '暂无结果，点击开始以查看压缩后的文件',
+    'results.retry': '重试失败项',
+    'results.revealTitle': '在系统文件管理器中打开输出文件夹',
+    'results.reveal': '打开输出文件夹',
+    'results.download': '下载全部（ZIP）',
+    'results.sort.default': '完成顺序',
+    'results.sort.savingsDesc': '压缩率（从高到低）',
+    'results.sort.savingsAsc': '压缩率（从低到高）',
+    'results.sort.sizeDesc': '压缩后大小（从大到小）',
+    'results.sort.savedDesc': '节省字节数（从多到少）',
+    'results.show': '筛选',
+    'results.filter.all': '全部',
+    'results.filter.success': '仅成功',
+    'results.filter.failed': '仅失败',
+    'results.failedLabel': '失败',
+    'results.skipped': '已跳过（已优化过）',
+    'results.saved': '节省 {pct}%',
+    'results.compare': '对比',
+    'results.stat.files': '文件数',
+    'results.stat.compression': '压缩率',
+    'results.stat.original': '原始大小',
+    'results.stat.compressed': '压缩后大小',
+    'results.stat.saved': '节省',
+    'results.countAll': '共 {total} 个文件',
+    'results.countFiltered': '显示 {shown} / {total} 个',
+    'config.title': '设置',
+    'config.watchLockNotice': 'Watch Mode 运行期间这些设置被锁定，点击【开始监控】时的设置已被记录，不会再跟随改动。请先停止 Watch Mode 再修改，然后重新开始。',
+    'config.settingsTip': '设置将自动保存。',
+    'config.screenshotPreset': '软件截图预设',
+    'config.screenshotPresetTitle': '一键设置 Quality: High、Max Width: 1920px、Mode: Standard、Dithering: Off，适合压缩软件截图的起点。',
+    'config.quality': '质量',
+    'config.qualityTitle': '控制 Standard 模式允许牺牲多少色彩细节来换取体积。对于带文字的 UI 截图，选择 High 通常不会增加太多体积，因为截图本身颜色数就不多。',
+    'config.qualityHigh': '高',
+    'config.qualityMedium': '中',
+    'config.qualityLow': '低',
+    'config.maxWidth': '最大宽度',
+    'config.maxWidthTitle': "缩小尺寸是唯一真正可能让小字变模糊的设置，带 UI 文字的截图通常保持【不缩放】或只轻微缩小效果最好。",
+    'config.noResize': '不缩放',
+    'config.outputFormat': '输出格式',
+    'config.fmtJpgTitle': '使用 mozjpeg 的 cjpeg 重新压缩图片，同时保持 JPEG 格式，在不转换格式的前提下压缩一批 JPG 图片。Quality 设置在 Standard 模式下生效；Lossless 对应 mozjpeg 的最高质量（约 95），因为 JPEG 本身是有损格式。需要在 bin/ 目录下提供 cjpeg。',
+    'config.fmtWebpTitle': 'WebP 在视觉质量相近的情况下通常比 PNG 文件更小。使用独立的编码器（非 pngquant/oxipng），Quality/Protect Colors/Dithering 不生效，只有 Compression Mode 的有损/无损选择会影响结果。',
+    'config.fmtAvifTitle': 'AVIF 是一种现代编码格式，同等质量下通常能生成体积最小的文件。编码速度比 PNG/WebP 慢。需要在 bin/ 目录或 PATH 中提供 avifenc。',
+    'config.compressionMode': '压缩模式',
+    'config.modeTitle': '选择压缩的实现方式。',
+    'config.modeStandard': '标准',
+    'config.modeStandardTitle': '压缩效果最好。压缩前先把图片缩减到更小的调色板，可能导致细小或特殊颜色区域出现轻微色差。',
+    'config.modeLossless': '无损',
+    'config.modeLosslessTitle': '完全不改变颜色。压缩时不触碰像素值，文件比 Standard 模式大，但像素级精确无损。',
+    'config.modeResize': '仅缩放',
+    'config.modeResizeTitle': '缩小图片尺寸（需要设置 Max Width）并做无损压缩，在更小的尺寸下保留完整的原始色彩精度。',
+    'config.modeScreenshot': '截图模式',
+    'config.modeScreenshotTitle': '专为软件/UI 截图调优（仅支持 PNG）：色彩质量下限比 Standard 模式严格得多，关闭抖动、不缩放，保持全分辨率且色彩偏差趋近于零，通常能缩小约 70-80%。如果某张图片颜色过于复杂（比如截图里嵌了一张照片）而无法达到该质量下限，会自动改用 Lossless 模式的行为。',
+    'config.modeNoteJpeg': 'JPEG 本身是有损格式，【无损】和【仅缩放】会使用 mozjpeg 的最高质量（约 95），不改变调色板。',
+    'config.resizeOnlyHint': '【仅缩放】模式需要将 Max Width 设置为【不缩放】以外的值。',
+    'config.protectColors': '保护颜色',
+    'config.protectColorsTitle': '这里列出的颜色在构建压缩调色板时会被优先保留，降低被相近颜色替换的概率。不是 100% 保证。仅在 Standard 模式下生效。',
+    'config.protectColorsInputTitle': '这里列出的颜色（十六进制色号，用逗号分隔）在构建压缩调色板时会被优先保留，降低被相近颜色替换的概率。不是 100% 保证，pngquant 仍可能调整调色板的其余部分。仅在 Standard 模式下生效。',
+    'config.dithering': '抖动',
+    'config.ditheringTitle': '通过在细微图案中混合相邻调色板颜色来平滑色彩过渡。对于带 UI 文字的截图，关闭此项通常能让文字边缘更清晰。仅在 Standard 模式下生效。',
+    'config.ditheringInputTitle': '通过在细微图案中混合相邻调色板颜色来平滑色彩过渡。通常对渐变和照片有帮助，但可能让纯色图形和文字边缘（图标、UI 截图）显得略微粗糙。关闭可让文字和纯色区域更清晰。仅在 Standard 模式下生效。',
+    'config.enabled': '已启用',
+    'watch.title': 'Watch Mode',
+    'watch.desc': '监控一个文件夹，自动优化新出现或发生变化的图片。',
+    'watch.useCurrentPaths': '使用【源路径】/【目标路径】中的设置',
+    'watch.dirPlaceholder': '监控目录',
+    'watch.outputPlaceholder': '输出目录（必填）',
+    'watch.processExisting': '处理已有文件',
+    'watch.idle': '空闲',
+    'watch.watching': '监控中\u2026',
+    'watch.start': '开始监控',
+    'notice.enterFolderPath': '请输入文件夹路径',
+    'notice.folderPickerUnavailable': '文件夹选择器不可用：{error}。请手动输入路径。',
+    'notice.folderPickerFailed': '文件夹选择失败：{error}',
+    'notice.scanFailedPrefix': '扫描失败：',
+    'notice.lostConnectionScanning': '扫描过程中连接中断：{error}',
+    'notice.uploadFailed': '上传失败：{error}',
+    'notice.waitForCurrentRun': '请等待当前任务完成后再进行预览。',
+    'notice.previewFailed': '预览失败',
+    'notice.startFailedPrefix': '启动失败：',
+    'notice.retryFailedPrefix': '重试失败：',
+    'notice.noFailedFiles': '没有需要重试的失败文件',
+    'notice.explorerOpenFailed': '无法打开文件管理器：{error}',
+    'notice.enterWatchDir': '请输入要监控的目录',
+    'notice.enterOutputDir': '请输入输出目录',
+    'notice.watchStartFailedPrefix': '启动监控失败：',
+    'notice.pathsBothEmpty': '【源路径】和【目标路径】都是空的，请先在上方设置好。',
+    'notice.watchOutputStillEmpty': '已复制监控目录，但那边的输出路径也是空的，Watch Mode 需要一个输出文件夹（没有临时文件夹选项），请先设置好再开始。',
+    'notice.resumeFailed': '恢复失败',
+    'notice.resumeFailedPrefix': '恢复失败：',
+  },
+};
+
+// Best-effort mapping from browser locale to a supported I18N key. Only
+// 'zh'/'en' exist today; anything else (or no match) falls back to 'en'.
+// Extend this alongside I18N when a new language is added.
+function detectBrowserLang() {
+  const candidates = (navigator.languages && navigator.languages.length)
+    ? navigator.languages
+    : [navigator.language || navigator.userLanguage || 'en'];
+  for (const l of candidates) {
+    const base = String(l).toLowerCase();
+    if (base.startsWith('zh')) return 'zh';
+    if (base.startsWith('en')) return 'en';
+  }
+  return 'en';
+}
+
+// Explicit choice (Settings > Language) always wins and persists. With
+// nothing stored yet, the browser's language is used as the initial
+// default — recomputed live rather than cached, so it isn't "sticky" the
+// way an explicit choice is.
+function currentLang() {
+  const stored = localStorage.getItem('imgopt.lang');
+  if (stored && I18N[stored]) return stored;
+  return detectBrowserLang();
+}
+
+// t(key, vars?) — looks up `key` in the current language, falling back to
+// English then to the key itself so a missing translation never renders as
+// blank. `vars` does simple {name} interpolation for values that come from
+// the app itself (never raw user/server text, which stays untranslated on
+// purpose — see the i18n scope note above).
+function t(key, vars) {
+  const lang = currentLang();
+  let str = (I18N[lang] && I18N[lang][key]) || I18N.en[key] || key;
+  if (vars) {
+    for (const k in vars) str = str.split(`{${k}}`).join(vars[k]);
+  }
+  return str;
+}
+
+// Applies the current language to every element carrying a data-i18n*
+// attribute. Safe to call repeatedly (e.g. right after a language change).
+function applyI18n() {
+  document.documentElement.lang = currentLang() === 'zh' ? 'zh-CN' : 'en';
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    el.textContent = t(el.getAttribute('data-i18n'));
+  });
+  document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
+    el.placeholder = t(el.getAttribute('data-i18n-placeholder'));
+  });
+  document.querySelectorAll('[data-i18n-title]').forEach(el => {
+    el.title = t(el.getAttribute('data-i18n-title'));
+  });
+}
+
+// Applies the stored language, then re-renders whatever dynamic (JS
+// generated) content is already on screen so a mid-session language switch
+// doesn't leave stale English behind in file/result cards, watch status,
+// etc. Each call is guarded — these renderers are idempotent over current
+// STATE, safe to call again even if nothing has been scanned/run yet.
+function applyStoredLang() {
+  applyI18n();
+  if (typeof renderFileGrid === 'function' && STATE.files.length) renderFileGrid(STATE.files);
+  if (typeof renderResultGrid === 'function' && STATE.results.length) renderResultGrid();
+  if (typeof updateModeDependentControls === 'function') updateModeDependentControls();
+  if (typeof updateStartButtonState === 'function') updateStartButtonState();
+}
+
 // Wraps fetch() to attach the per-session app token (see APP_TOKEN in the
 // page <head>) as a custom header. Only needed for state-changing/sensitive
 // endpoints — image-serving endpoints (thumb/result/source-file/download)
@@ -751,7 +1229,7 @@ function showNotice(message, type) {
   type = type || 'info';
   const el = document.createElement('div');
   el.className = `notice ${type}`;
-  el.innerHTML = `<span class="notice-msg"></span><button class="notice-close" aria-label="Dismiss">&times;</button>`;
+  el.innerHTML = `<span class="notice-msg"></span><button class="notice-close" aria-label="${t('common.dismiss')}">&times;</button>`;
   el.querySelector('.notice-msg').textContent = message;
   const remove = () => el.remove();
   el.querySelector('.notice-close').addEventListener('click', remove);
@@ -763,7 +1241,7 @@ function showPersistentNotice(message, type) {
   dismissPersistentNotice();
   const el = document.createElement('div');
   el.className = `notice ${type || 'info'}`;
-  el.innerHTML = `<span class="notice-msg"></span><button class="notice-close" aria-label="Dismiss">&times;</button>`;
+  el.innerHTML = `<span class="notice-msg"></span><button class="notice-close" aria-label="${t('common.dismiss')}">&times;</button>`;
   el.querySelector('.notice-msg').textContent = message;
   el.querySelector('.notice-close').addEventListener('click', () => dismissPersistentNotice());
   noticeContainer.appendChild(el);
@@ -900,6 +1378,30 @@ function loadConfig() {
   if (typeof cfg.skipExisting === 'boolean') $('skip-existing').checked = cfg.skipExisting;
   if (typeof cfg.keepExif === 'boolean') $('keep-exif').checked = cfg.keepExif;
 }
+// Screenshot preset: one click to Quality High + Max Width 1920px + Mode
+// Standard + Dithering Off — the combo settled on for screenshots meant to
+// software screenshots (see config.screenshotPresetTitle for the
+// rationale). Dispatches 'change' on each control after setting it so the
+// existing per-control listeners (saveConfig, updateModeDependentControls,
+// updateStartButtonState) fire exactly as if the user had clicked each one.
+function applyScreenshotPreset() {
+  const setRadio = (name, val) => {
+    const el = document.querySelector(`input[name="${name}"][value="${val}"]`);
+    if (el && !el.disabled) { el.checked = true; el.dispatchEvent(new Event('change', { bubbles: true })); }
+  };
+  setRadio('quality', 'high');
+  setRadio('mode', 'standard');
+  if (!$('max-width').disabled) {
+    $('max-width').value = '1920';
+    $('max-width').dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  if (!ditheringInput.disabled) {
+    ditheringInput.checked = false;
+    ditheringInput.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+}
+$('screenshot-preset-btn').addEventListener('click', applyScreenshotPreset);
+
 // Save on any config change. updateModeDependentControls (bound separately
 // for format/mode) also recomputes disabled states; saveConfig is additive.
 ['quality', 'format', 'mode'].forEach(name =>
@@ -933,7 +1435,7 @@ async function checkHealth() {
     // make Start invalid. updateStartButtonState() owns that button.
     return allOk;
   } catch(e) {
-    healthStatus.innerHTML = '<span class="status-dot err"></span>Connection failed';
+    healthStatus.innerHTML = '<span class="status-dot err"></span>' + t('health.connectionFailed');
     return false;
   }
 }
@@ -948,10 +1450,10 @@ async function scanPath(path) {
   dismissPersistentNotice();
   const recursive = $('recursive-scan').checked;
   scanBtn.disabled = true;
-  scanBtn.textContent = 'Scanning...';
+  scanBtn.textContent = t('input.scanning');
   scanProgressWrap.style.display = 'block';
   scanProgressFill.style.width = '0%';
-  scanProgressText.textContent = 'Finding images...';
+  scanProgressText.textContent = t('input.findingImages');
   try {
     const r = await apiFetch('/api/scan', {
       method: 'POST',
@@ -962,14 +1464,14 @@ async function scanPath(path) {
     if (d.error) { showNotice(d.error, 'err'); resetScanUI(); return; }
     scanPollTimer = setInterval(pollScanProgress, 250);
   } catch(e) {
-    showNotice('Scan failed: ' + e.message, 'err');
+    showNotice(t('notice.scanFailedPrefix') + e.message, 'err');
     resetScanUI();
   }
 }
 
 function resetScanUI() {
   scanBtn.disabled = false;
-  scanBtn.textContent = 'Scan Folder';
+  scanBtn.textContent = t('input.scanBtn');
   scanProgressWrap.style.display = 'none';
   if (scanPollTimer) { clearInterval(scanPollTimer); scanPollTimer = null; }
 }
@@ -981,13 +1483,13 @@ async function pollScanProgress() {
     if (d.total > 0) {
       const pct = Math.round((d.current / d.total) * 100);
       scanProgressFill.style.width = pct + '%';
-      scanProgressText.textContent = `Scanning ${d.current} / ${d.total} images...`;
+      scanProgressText.textContent = t('input.scanningProgress', { current: d.current, total: d.total });
     } else {
-      scanProgressText.textContent = 'Finding images...';
+      scanProgressText.textContent = t('input.findingImages');
     }
     if (!d.running) {
       resetScanUI();
-      if (d.error) { showNotice('Scan failed: ' + d.error, 'err'); return; }
+      if (d.error) { showNotice(t('notice.scanFailedPrefix') + d.error, 'err'); return; }
       STATE.files = d.files;
       STATE.wsName = d.files[0]?.thumbnail?.split('/')[3] || '';
       renderFiles();
@@ -996,7 +1498,7 @@ async function pollScanProgress() {
     }
   } catch(e) {
     resetScanUI();
-    showNotice('Lost connection while scanning: ' + e.message, 'err');
+    showNotice(t('notice.lostConnectionScanning', { error: e.message }), 'err');
   }
 }
 
@@ -1024,7 +1526,7 @@ function renderRecentChips(container, paths, onPick, onRemove, onClearAll) {
   if (paths.length > 1) {
     const clearAll = document.createElement('span');
     clearAll.className = 'recent-chip';
-    clearAll.textContent = 'Clear all';
+    clearAll.textContent = t('input.clearAll');
     clearAll.style.cssText = 'font-size:12px;color:var(--text2);cursor:pointer';
     clearAll.addEventListener('click', onClearAll);
     container.appendChild(clearAll);
@@ -1051,7 +1553,7 @@ async function loadRecentPaths() {
 
 scanBtn.addEventListener('click', () => {
   const path = dirPath.value.trim();
-  if (!path) { showNotice('Please enter a folder path', 'err'); return; }
+  if (!path) { showNotice(t('notice.enterFolderPath'), 'err'); return; }
   scanPath(path);
 });
 
@@ -1066,12 +1568,12 @@ async function pickFolder() {
     const r = await apiFetch('/api/browse-folder');
     const d = await r.json();
     if (d.error) {
-      showNotice(`Folder picker unavailable: ${d.error}. Type the path manually instead.`, 'err');
+      showNotice(t('notice.folderPickerUnavailable', { error: d.error }), 'err');
       return '';
     }
     return d.path || ''; // '' also covers the user simply cancelling the dialog
   } catch(e) {
-    showNotice('Folder picker failed: ' + e.message, 'err');
+    showNotice(t('notice.folderPickerFailed', { error: e.message }), 'err');
     return '';
   }
 }
@@ -1081,7 +1583,7 @@ async function pickFolder() {
 // real path we need to write files to.
 outputBrowseBtn.addEventListener('click', async () => {
   outputBrowseBtn.disabled = true;
-  outputBrowseBtn.textContent = 'Selecting...';
+  outputBrowseBtn.textContent = t('common.selecting');
   try {
     const path = await pickFolder();
     if (path) outputDir.value = path;
@@ -1090,16 +1592,16 @@ outputBrowseBtn.addEventListener('click', async () => {
     // ignore — user can still type a path manually
   } finally {
     outputBrowseBtn.disabled = false;
-    outputBrowseBtn.textContent = 'Browse Folder...';
+    outputBrowseBtn.textContent = t('common.browseFolder');
   }
 });
 
-// Browse Folder (Select Images): pick a folder path → auto-scan it.
+// Browse Folder (Source Path): pick a folder path → auto-scan it.
 // This is a local tool — no uploading, just reads files by path.
 const browseFolderBtn = $('browse-folder-btn');
 browseFolderBtn.addEventListener('click', async () => {
   browseFolderBtn.disabled = true;
-  browseFolderBtn.textContent = 'Selecting...';
+  browseFolderBtn.textContent = t('common.selecting');
   try {
     const path = await pickFolder();
     if (path) {
@@ -1107,10 +1609,10 @@ browseFolderBtn.addEventListener('click', async () => {
       await scanPath(path);
     }
   } catch(e) {
-    showNotice('Folder picker failed: ' + e.message, 'err');
+    showNotice(t('notice.folderPickerFailed', { error: e.message }), 'err');
   } finally {
     browseFolderBtn.disabled = false;
-    browseFolderBtn.textContent = 'Browse Folder...';
+    browseFolderBtn.textContent = t('common.browseFolder');
   }
 });
 
@@ -1135,7 +1637,7 @@ async function uploadFiles(files) {
     renderFiles();
     showConfigSection();
   } catch(e) {
-    showNotice('Upload failed: ' + e.message, 'err');
+    showNotice(t('notice.uploadFailed', { error: e.message }), 'err');
   }
 }
 
@@ -1155,7 +1657,7 @@ function renderFiles() {
   }
   if (!files.length) {
     fileGrid.innerHTML = '';
-    filesEmpty.textContent = 'No images found';
+    filesEmpty.textContent = t('input.noImagesFound');
     filesEmpty.style.display = '';
     fileStatsText.textContent = '';
     selectAll.checked = true;
@@ -1178,34 +1680,34 @@ function renderFiles() {
           <div class="fmeta">
             <span class="fsize" title="${fmtSize(f.size)}">${fmtSize(f.size)}</span>
             <button class="preview-btn" type="button"
-              title="Run a single-file dry run with the current settings to project the compressed size. Does not affect results or the download ZIP."
-              onclick="event.stopPropagation(); previewFile('${f.id}', this)">Preview</button>
+              title="${t('files.previewTitle')}"
+              onclick="event.stopPropagation(); previewFile('${f.id}', this)">${t('files.preview')}</button>
           </div>
           <div class="check">✓</div>
-          <button class="card-gear" type="button" title="Per-file settings (override the global quality/mode for just this file)"
+          <button class="card-gear" type="button" title="${t('files.overrideTitle')}"
             onclick="event.stopPropagation(); toggleFileOverride('${f.id}', this)">⚙</button>
         </div>
         <div class="file-override" data-id="${f.id}" hidden onclick="event.stopPropagation()">
           <div class="fo-row">
-            <span class="fo-label">Quality</span>
+            <span class="fo-label">${t('config.quality')}</span>
             <select data-field="quality" onchange="setFileOverride('${f.id}')">
-              <option value="">inherit</option><option value="high">high</option><option value="medium">medium</option><option value="low">low</option>
+              <option value="">${t('files.inherit')}</option><option value="high">${t('config.qualityHigh')}</option><option value="medium">${t('config.qualityMedium')}</option><option value="low">${t('config.qualityLow')}</option>
             </select>
           </div>
           <div class="fo-row">
-            <span class="fo-label">Mode</span>
+            <span class="fo-label">${t('files.overrideMode')}</span>
             <select data-field="compression_mode" onchange="setFileOverride('${f.id}')">
-              <option value="">inherit</option><option value="standard">standard</option><option value="lossless">lossless</option><option value="resize_only">resize only</option>
+              <option value="">${t('files.inherit')}</option><option value="standard">${t('config.modeStandard')}</option><option value="lossless">${t('config.modeLossless')}</option><option value="resize_only">${t('config.modeResize')}</option>
             </select>
           </div>
           <div class="fo-row">
-            <span class="fo-label">Width</span>
-            <input type="number" min="0" data-field="max_width" placeholder="inherit" oninput="setFileOverride('${f.id}')">
+            <span class="fo-label">${t('files.overrideWidth')}</span>
+            <input type="number" min="0" data-field="max_width" placeholder="${t('files.inherit')}" oninput="setFileOverride('${f.id}')">
           </div>
           <div class="fo-row">
-            <span class="fo-label">Format</span>
+            <span class="fo-label">${t('config.outputFormat')}</span>
             <select data-field="output_format" onchange="setFileOverride('${f.id}')">
-              <option value="">inherit</option><option value="png">png</option><option value="webp">webp</option><option value="jpg">jpg</option>
+              <option value="">${t('files.inherit')}</option><option value="png">PNG</option><option value="webp">WebP</option><option value="jpg">JPG</option>
             </select>
           </div>
         </div>
@@ -1214,7 +1716,7 @@ function renderFiles() {
   }
   fileGrid.innerHTML = html;
   const total = files.reduce((s, f) => s + f.size, 0);
-  fileStatsText.textContent = `${files.length} file(s), ${fmtSize(total)} total`;
+  fileStatsText.textContent = t('files.stats', { count: files.length, size: fmtSize(total) });
   selectAll.checked = !fileGrid.querySelector('.file-card:not(.selected)');
 }
 
@@ -1252,7 +1754,7 @@ function toggleFile(id) {
 // Reads the same controls runOptimize uses so the projection matches what
 // a real run would produce for this file.
 async function previewFile(id, btn) {
-  if (STATE.isRunning) { showNotice('Wait for the current run to finish before previewing.', 'err'); return; }
+  if (STATE.isRunning) { showNotice(t('notice.waitForCurrentRun'), 'err'); return; }
   const quality = document.querySelector('input[name="quality"]:checked').value;
   const maxWidth = parseInt($('max-width').value);
   const format = document.querySelector('input[name="format"]:checked').value;
@@ -1275,17 +1777,17 @@ async function previewFile(id, btn) {
     });
     const d = await r.json();
     if (!r.ok || d.error) {
-      btn.textContent = 'failed';
-      showNotice(d.error || 'Preview failed', 'err');
+      btn.textContent = t('common.failed');
+      showNotice(d.error || t('notice.previewFailed'), 'err');
     } else {
       // Show projected size + savings; reverts after a few seconds.
       btn.textContent = `${fmtSize(d.compressed_size)} (-${d.savings_percent}%)`;
     }
   } catch (e) {
-    btn.textContent = 'failed';
+    btn.textContent = t('common.failed');
   } finally {
     btn.disabled = false;
-    setTimeout(() => { if (btn.textContent !== 'Preview') btn.textContent = 'Preview'; }, 4000);
+    setTimeout(() => { if (btn.textContent !== t('files.preview')) btn.textContent = t('files.preview'); }, 4000);
   }
 }
 
@@ -1341,13 +1843,30 @@ function showConfigSection() {
 // Compression Mode: controls which settings are relevant.
 function updateModeDependentControls() {
   const mode = document.querySelector('input[name="mode"]:checked').value;
+  const isScreenshot = mode === 'screenshot';
+
+  // Screenshot mode is PNG-only (it's a tuned pngquant pass, not a general
+  // codec setting) — lock the format to PNG and disable the others so the
+  // user can't land on a combination the backend would 400 on. Re-enabling
+  // happens naturally below since this whole block re-runs on every mode
+  // change, including switching away from Screenshot.
+  if (isScreenshot) {
+    document.getElementById('fmt-png').checked = true;
+  }
+  document.querySelectorAll('input[name="format"]').forEach(r => {
+    r.disabled = isScreenshot && r.value !== 'png';
+  });
+
   const format = document.querySelector('input[name="format"]:checked').value;
   const isStandard = mode === 'standard';
   const isPng = format === 'png';
 
   // Protect Colors / Dithering: pngquant-specific — only apply in Standard
   // mode AND when the output format is PNG (WebP uses its own encoder and
-  // never touches pngquant, regardless of compression mode).
+  // never touches pngquant, regardless of compression mode). Screenshot
+  // mode uses pngquant too, but with hardcoded internal settings (a much
+  // tighter quality floor, dithering forced off) — these controls don't
+  // apply to it either, same as every other non-Standard mode.
   const pngquantApplies = isStandard && isPng;
   protectColorsInput.disabled = !pngquantApplies;
   ditheringInput.disabled = !pngquantApplies;
@@ -1357,28 +1876,31 @@ function updateModeDependentControls() {
   // Quality: relevant for Standard-mode PNG (pngquant target), Standard-mode
   // WebP/AVIF (Pillow's/avifenc's own quality parameter), and Standard-mode
   // JPEG (cjpeg -quality) — only meaningless when compression mode isn't
-  // Standard (Lossless/Resize Only skip quality entirely for every format).
+  // Standard (Lossless/Resize Only/Screenshot skip quality entirely).
   document.querySelectorAll('input[name="quality"]').forEach(r => r.disabled = !isStandard);
   document.getElementById('quality-group').classList.toggle('disabled-group', !isStandard);
+
+  // Max Width is intentionally NOT tied to compression mode or format in
+  // general — resizing is orthogonal to how colors/encoding are handled,
+  // so it stays enabled for Standard/Lossless/Resize Only. Screenshot mode
+  // is the one exception: it never resizes (the whole point is keeping UI
+  // text pixel-sharp at full resolution — see optimizer.py), and silently
+  // ignores max_width server-side, so leaving the control enabled here
+  // would let the user set a value that quietly does nothing.
+  $('max-width').disabled = isScreenshot;
+  $('max-width').closest('.config-group')?.classList.toggle('disabled-group', isScreenshot);
 
   // JPEG is an inherently lossy codec — there's no true lossless pass, so
   // 'Lossless'/'Resize Only' for JPG just encodes at mozjpeg's highest
   // quality (~95) with no palette change. Tell the user that up front
   // instead of implying pixel-perfect output.
   const modeNote = $('mode-note');
-  if (format === 'jpg' && !isStandard) {
-    modeNote.textContent =
-      'JPEG is inherently lossy — "Lossless" and "Resize Only" use mozjpeg\u2019s highest quality (~95) with no palette changes.';
+  if (format === 'jpg' && !isStandard && !isScreenshot) {
+    modeNote.textContent = t('config.modeNoteJpeg');
     modeNote.style.display = 'block';
   } else {
     modeNote.style.display = 'none';
   }
-
-  // Max Width is intentionally NOT tied to compression mode or format —
-  // resizing is orthogonal to how colors/encoding are handled. You can
-  // shrink dimensions in Standard mode just as validly as in Lossless/
-  // Resize Only (in fact combining resize with quantization is one of the
-  // strongest ways to cut file size), so it stays enabled in all cases.
 
   updateStartButtonState();
 }
@@ -1395,7 +1917,7 @@ function updateStartButtonState() {
   const maxWidth = parseInt($('max-width').value);
   const resizeOnlyNeedsWidth = mode === 'resize_only' && maxWidth <= 0;
   if (resizeOnlyNeedsWidth) {
-    modeHint.textContent = 'Resize Only mode needs a Max Width other than "No resize".';
+    modeHint.textContent = t('config.resizeOnlyHint');
     modeHint.style.display = 'block';
   } else {
     modeHint.style.display = 'none';
@@ -1478,7 +2000,7 @@ async function runOptimize(ids, opts) {
     startSSE();
     loadRecentPaths();
   } catch(e) {
-    showNotice((retry ? 'Retry failed: ' : 'Start failed: ') + e.message, 'err');
+    showNotice((retry ? t('notice.retryFailedPrefix') : t('notice.startFailedPrefix')) + e.message, 'err');
     STATE.isRunning = false;
     cancelBtn.style.display = 'none';
     pauseBtn.style.display = 'none';
@@ -1496,7 +2018,7 @@ startBtn.addEventListener('click', () => {
 
 retryBtn.addEventListener('click', () => {
   const failedIds = STATE.results.filter(r => !r.success).map(r => r.id).filter(id => id != null);
-  if (!failedIds.length) { showNotice('No failed files to retry', 'info'); return; }
+  if (!failedIds.length) { showNotice(t('notice.noFailedFiles'), 'info'); return; }
   runOptimize(failedIds, { retry: true });
 });
 
@@ -1692,23 +2214,23 @@ function showResults() {
   resultSummary.innerHTML = `
     <div class="result-stat">
       <div class="value accent">${results.length}</div>
-      <div class="label">Files</div>
+      <div class="label">${t('results.stat.files')}</div>
     </div>
     <div class="result-stat">
       <div class="value green">${pct}%</div>
-      <div class="label">Compression</div>
+      <div class="label">${t('results.stat.compression')}</div>
     </div>
     <div class="result-stat">
       <div class="value accent">${fmtSize(totalOrig)}</div>
-      <div class="label">Original</div>
+      <div class="label">${t('results.stat.original')}</div>
     </div>
     <div class="result-stat">
       <div class="value green">${fmtSize(totalComp)}</div>
-      <div class="label">Compressed</div>
+      <div class="label">${t('results.stat.compressed')}</div>
     </div>
     <div class="result-stat">
       <div class="value accent">${fmtSize(saved)}</div>
-      <div class="label">Saved</div>
+      <div class="label">${t('results.stat.saved')}</div>
     </div>
   `;
 
@@ -1719,7 +2241,7 @@ function showResults() {
   // Show output path info
   const outputDir = $('output-dir').value.trim();
   if (outputDir) {
-    $('output-path-info').textContent = 'Output: ' + outputDir;
+    $('output-path-info').textContent = t('output.prefix') + outputDir;
   } else {
     $('output-path-info').textContent = '';
   }
@@ -1732,7 +2254,7 @@ function showResults() {
   retryBtn.style.display = failed.length > 0 ? 'inline-block' : 'none';
   retryBtn.disabled = false;
   updateStartButtonState();
-  progressText.textContent = 'Complete';
+  progressText.textContent = t('progress.complete');
 }
 
 // Render the result cards applying the current filter then sort. Reads from
@@ -1758,26 +2280,26 @@ function renderResultGrid() {
       html += `
         <div class="result-card" style="opacity:.5">
           <div class="rname" title="${escHtml(r.name || '')}">✗ ${escHtml(r.name || '')}</div>
-          <div class="rstats">${escHtml(r.error || 'Failed')}</div>
+          <div class="rstats">${escHtml(r.error) || t('results.failedLabel')}</div>
         </div>`;
       continue;
     }
-    const previewUrl = `/api/preview/${STATE.wsName}/${r.id}`;
+    const previewUrl = `/api/preview/${STATE.wsName}/${r.id}?lang=${encodeURIComponent(currentLang())}`;
     const savedLine = r.skipped
-      ? `<div class="rsaved">Skipped (already optimized)</div>`
-      : `<div class="rsaved">Saved ${r.savings_percent}%</div>`;
+      ? `<div class="rsaved">${t('results.skipped')}</div>`
+      : `<div class="rsaved">${t('results.saved', { pct: r.savings_percent })}</div>`;
     html += `
       <div class="result-card">
         <div class="rname" title="${escHtml(r.name)}">${escHtml(r.name)}</div>
         <div class="rstats">${fmtSize(r.original_size)} → ${fmtSize(r.compressed_size)}</div>
         ${savedLine}
-        <a class="compare-btn" href="${previewUrl}" target="_blank">Compare</a>
+        <a class="compare-btn" href="${previewUrl}" target="_blank">${t('results.compare')}</a>
       </div>`;
   }
   resultGrid.innerHTML = html;
 
   const total = STATE.results.length, shown = rows.length;
-  resultCountEl.textContent = shown === total ? `${total} file(s)` : `${shown} of ${total} shown`;
+  resultCountEl.textContent = shown === total ? t('results.countAll', { total }) : t('results.countFiltered', { shown, total });
 }
 
 // Reveal the run's output folder in the OS file explorer. One button for
@@ -1795,7 +2317,7 @@ revealDirBtn.addEventListener('click', async () => {
     const d = await r.json();
     if (d.error) showNotice(d.error, 'err');
   } catch (err) {
-    showNotice('Could not open file explorer: ' + err.message, 'err');
+    showNotice(t('notice.explorerOpenFailed', { error: err.message }), 'err');
   }
 });
 
@@ -1823,7 +2345,7 @@ resetBtn.addEventListener('click', async () => {
   STATE.results = [];
   STATE.wsName = '';
   fileGrid.innerHTML = '';
-  filesEmpty.textContent = 'Images will appear here after you scan a folder or add files';
+  filesEmpty.textContent = t('files.empty');
   filesEmpty.style.display = '';
   resultGrid.innerHTML = '';
   resultSummary.innerHTML = '';
@@ -1843,7 +2365,7 @@ resetBtn.addEventListener('click', async () => {
   $('output-path-info').textContent = '';
   logBox.innerHTML = '';
   progressFill.style.width = '0%';
-  progressText.textContent = 'Waiting...';
+  progressText.textContent = t('progress.waiting');
 });
 
 // Restore server-side session state after a page refresh — the server
@@ -1899,8 +2421,8 @@ const watchDir = $('watch-dir'),
 async function startWatch() {
   const dir = watchDir.value.trim();
   const outputDir = watchOutputDir.value.trim();
-  if (!dir) { showNotice('Please enter a watch directory', 'err'); return; }
-  if (!outputDir) { showNotice('Please enter an output directory', 'err'); return; }
+  if (!dir) { showNotice(t('notice.enterWatchDir'), 'err'); return; }
+  if (!outputDir) { showNotice(t('notice.enterOutputDir'), 'err'); return; }
 
   const quality = document.querySelector('input[name="quality"]:checked').value;
   const maxWidth = parseInt($('max-width').value);
@@ -1931,7 +2453,7 @@ async function startWatch() {
     updateWatchUI();
     startWatchSSE();
   } catch(e) {
-    showNotice('Watch start failed: ' + e.message, 'err');
+    showNotice(t('notice.watchStartFailedPrefix') + e.message, 'err');
   }
 }
 
@@ -2022,6 +2544,7 @@ function applyWatchLock(locked) {
     ...document.querySelectorAll('input[name="format"]'),
     ...document.querySelectorAll('input[name="mode"]'),
     $('max-width'), $('protect-colors'), $('dithering'), $('keep-exif'),
+    $('screenshot-preset-btn'),
   ];
   if (locked) {
     inputs.forEach(el => { el.disabled = true; });
@@ -2035,12 +2558,12 @@ function updateWatchUI() {
   if (STATE.watchRunning) {
     watchStartBtn.style.display = 'none';
     watchStopBtn.style.display = '';
-    watchStatusEl.innerHTML = '<span class="status-dot ok"></span>Watching\u2026';
+    watchStatusEl.innerHTML = '<span class="status-dot ok"></span>' + t('watch.watching');
     watchLogBox.style.display = '';
   } else {
     watchStartBtn.style.display = '';
     watchStopBtn.style.display = 'none';
-    watchStatusEl.textContent = 'Idle';
+    watchStatusEl.textContent = t('watch.idle');
     watchLogBox.style.display = 'none';
   }
   applyWatchLock(STATE.watchRunning);
@@ -2067,14 +2590,14 @@ $('watch-use-current-paths-btn').addEventListener('click', () => {
   const src = dirPath.value.trim();
   const out = outputDir.value.trim();
   if (!src && !out) {
-    showNotice('Select Images and Output paths are both empty — set them above first.', 'err');
+    showNotice(t('notice.pathsBothEmpty'), 'err');
     return;
   }
   if (src) watchDir.value = src;
   if (out) {
     watchOutputDir.value = out;
   } else {
-    showNotice('Copied the folder to watch, but Output path is empty there too — Watch Mode needs an output folder (no temp-folder option), so set one before starting.', 'err');
+    showNotice(t('notice.watchOutputStillEmpty'), 'err');
   }
 });
 $('watch-browse-dir-btn').addEventListener('click', async () => {
@@ -2116,7 +2639,7 @@ async function checkBatchState() {
     const d = await r.json();
     if (!d.has_batch) return;
     _savedBatchState = d;
-    resumeText.textContent = `Found unfinished batch: ${d.done}/${d.total} completed (${d.failed} failed). Resume?`;
+    resumeText.textContent = t('batchResume.found', { done: d.done, total: d.total, failed: d.failed });
     resumeBanner.style.display = 'flex';
   } catch(e) { /* no batch or server error */ }
 }
@@ -2141,7 +2664,7 @@ batchResumeBtn.addEventListener('click', async () => {
       }),
     });
     const d = await r.json();
-    if (!r.ok) { showNotice(d.error || 'Resume failed', 'err'); return; }
+    if (!r.ok) { showNotice(d.error || t('notice.resumeFailed'), 'err'); return; }
     STATE.isRunning = true;
     STATE.runStartTime = Date.now();
     STATE.resultCursor = 0;
@@ -2150,7 +2673,7 @@ batchResumeBtn.addEventListener('click', async () => {
     updateStartButtonState();
     startSSE();
   } catch(e) {
-    showNotice('Resume failed: ' + e.message, 'err');
+    showNotice(t('notice.resumeFailedPrefix') + e.message, 'err');
   }
 });
 
@@ -2171,9 +2694,19 @@ const settingConcurrentWorkers = $('setting-concurrent-workers');
 const settingThumbnailWorkers = $('setting-thumbnail-workers');
 const settingCleanupDelay = $('setting-cleanup-delay');
 const settingIdleTimeout = $('setting-idle-timeout');
+const settingLanguage = $('setting-language');
+
+// Language is a pure client-side preference, so it applies immediately on
+// change rather than waiting for the Settings panel's Save button (which
+// only covers server-side config like host/port).
+settingLanguage.addEventListener('change', () => {
+  localStorage.setItem('imgopt.lang', settingLanguage.value);
+  applyStoredLang();
+});
 
 function openSettings() {
   settingsOverlay.classList.add('open');
+  settingLanguage.value = currentLang();
   // Load current values
   apiFetch('/api/settings').then(r => r.json()).then(data => {
     const s = data.settings || {};
@@ -2214,22 +2747,23 @@ settingsSave.addEventListener('click', async () => {
     });
     const data = await r.json();
     if (!r.ok) {
-      showNotice(data.error || 'Failed to save settings', 'err');
+      showNotice(data.error || t('settings.saveFailed'), 'err');
       return;
     }
-    let msg = 'Settings saved.';
+    let msg = t('settings.saved');
     if (data.requires_restart && data.requires_restart.length > 0) {
-      msg += ' Some changes require a restart to take effect.';
+      msg += t('settings.savedRestartNote');
     }
     showNotice(msg, 'ok');
     closeSettings();
   } catch (e) {
-    showNotice('Failed to save settings: ' + e.message, 'err');
+    showNotice(t('settings.saveFailed') + ': ' + e.message, 'err');
   }
 });
 
 // Init
 applyStoredTheme();
+applyStoredLang();
 loadConfig();
 checkHealth();
 loadRecentPaths();

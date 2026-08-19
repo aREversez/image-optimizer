@@ -47,6 +47,65 @@ class TestWatchStartStop:
         status = client.get("/api/watch/status", headers=auth_headers).json()
         assert status["running"] is False
 
+    def test_watch_rejects_resize_only_without_max_width(self, client, auth_headers, tmp_path):
+        """Same rule /api/optimize and per-file overrides already enforce
+        (see _validate_overrides): Resize Only has nothing to do without a
+        width. Watch mode used to skip this check entirely — starting a
+        watch with resize_only and a forgotten/zero max_width would run
+        indefinitely, "processing" every detected file with no resize ever
+        applied (and, before the AVIF resize_only fix, silently degrading
+        AVIF quality for zero benefit on top of that)."""
+        watch_dir = tmp_path / "watch"
+        watch_dir.mkdir()
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        r = client.post("/api/watch/start", json={
+            "directory": str(watch_dir),
+            "output_dir": str(output_dir),
+            "output_format": "png",
+            "compression_mode": "resize_only",
+            "max_width": 0,
+        }, headers=auth_headers)
+        assert r.status_code == 400
+        assert "Max Width" in r.json()["error"]
+
+        status = client.get("/api/watch/status", headers=auth_headers).json()
+        assert status["running"] is False
+
+    def test_watch_rejects_screenshot_mode_with_non_png_format(self, client, auth_headers, tmp_path):
+        watch_dir = tmp_path / "watch"
+        watch_dir.mkdir()
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        r = client.post("/api/watch/start", json={
+            "directory": str(watch_dir),
+            "output_dir": str(output_dir),
+            "output_format": "webp",
+            "compression_mode": "screenshot",
+        }, headers=auth_headers)
+        assert r.status_code == 400
+        assert "PNG-only" in r.json()["error"]
+
+        status = client.get("/api/watch/status", headers=auth_headers).json()
+        assert status["running"] is False
+
+    def test_watch_accepts_screenshot_mode_with_png(self, client, auth_headers, tmp_path):
+        watch_dir = tmp_path / "watch"
+        watch_dir.mkdir()
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        r = client.post("/api/watch/start", json={
+            "directory": str(watch_dir),
+            "output_dir": str(output_dir),
+            "output_format": "png",
+            "compression_mode": "screenshot",
+        }, headers=auth_headers)
+        assert r.status_code == 200
+        client.post("/api/watch/stop", headers=auth_headers)
+
     def test_watch_rejects_when_already_running(self, client, auth_headers, tmp_path):
         watch_dir = tmp_path / "watch"
         watch_dir.mkdir()

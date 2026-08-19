@@ -84,3 +84,37 @@ class TestPreviewPage:
             assert r.headers["content-type"] == expected[ext], f["name"]
             checked_extensions.add(ext)
         assert checked_extensions == {".png", ".jpg"}, "test_images fixture should cover both — update this test if it changes"
+
+
+class TestPreviewPageI18n:
+    """The Compare page is server-rendered and opened in its own tab, so it
+    can't read index.html's localStorage — the caller passes its current
+    language as ?lang=, and the page picks strings from PREVIEW_I18N."""
+
+    def test_lang_zh_renders_chinese_strings(self, client, auth_headers, test_images):
+        scanned = scan_and_wait(client, auth_headers, test_images)
+        ws_name = scanned["files"][0]["thumbnail"].split("/")[3]
+        result = optimize_and_wait(client, auth_headers)
+        file_id = result["results"][0]["id"]
+        r = client.get(f"/api/preview/{ws_name}/{file_id}?lang=zh")
+        assert r.status_code == 200
+        assert "<title>对比 -" in r.text
+        assert "并排对比" in r.text  # Side by Side
+        assert "叠加对比" in r.text  # Overlay
+        assert "Side by Side" not in r.text
+        assert "Overlay</button>" not in r.text
+
+    def test_unknown_lang_falls_back_to_english(self, client, auth_headers, test_images):
+        scanned = scan_and_wait(client, auth_headers, test_images)
+        ws_name = scanned["files"][0]["thumbnail"].split("/")[3]
+        result = optimize_and_wait(client, auth_headers)
+        file_id = result["results"][0]["id"]
+        r = client.get(f"/api/preview/{ws_name}/{file_id}?lang=fr")
+        assert r.status_code == 200
+        assert "<title>Compare -" in r.text
+        assert 'id="btn-overlay">Overlay</button>' in r.text
+
+    def test_no_lang_param_defaults_to_english(self, client, auth_headers, test_images):
+        r = get_preview(client, auth_headers, test_images)
+        assert r.status_code == 200
+        assert "<title>Compare -" in r.text

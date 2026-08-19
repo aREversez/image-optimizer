@@ -40,3 +40,17 @@ encoder) plus a copy of the IJG reference license.
 > PPM/PGM support are ever needed.
 
 After placing the binaries, restart the tool and they will be auto-detected.
+
+## avifenc (libavif)
+
+Required only if you want **AVIF output** — the next-gen image format with
+superior compression. The app feeds avifenc a lossless PNG intermediate
+(Pillow decodes first, preserving alpha), so avifenc only needs to handle
+PNG input.
+
+- Source & releases: https://github.com/AOMediaCodec/libavif/releases
+- Windows: `avifenc.exe`
+- macOS: `brew install libavif` → `avifenc`
+- Linux: `sudo apt install libavif-bin` / `dnf install libavif-tools` → `avifenc`
+
+After placing the binaries, restart the tool and they will be auto-detected.

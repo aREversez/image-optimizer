@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
-from PIL import Image
+import pytest
+from PIL import Image, ImageChops, ImageStat
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
@@ -90,6 +92,166 @@ class TestCompressionModes:
 
         asyncio.run(optimizer.optimize_png(src, out, compression_mode="standard", progress_callback=log))
         assert any("color quantization" in m and "skipping" not in m for m in logs)
+
+    def test_screenshot_mode_uses_tight_quality_and_forces_no_dithering(self, tmp_path, optimizer, monkeypatch):
+        """Screenshot mode's whole value proposition is a much tighter
+        pngquant quality floor (75-100, vs Standard's 50-65/65-80/80-100
+        ranges) with dithering hardcoded off regardless of the caller's
+        `dithering` setting — see optimizer.py's screenshot branch for the
+        empirical numbers. The floor was originally 95-100; lowered to
+        75-100 after measuring that pngquant's min-max range only acts as
+        a pass/fail gate (looser min costs nothing on content that already
+        clears the tight floor — measured byte-identical output across a
+        60-100 to 95-100 sweep), while images that couldn't clear 95 at
+        all were previously failing outright and getting zero quantization
+        benefit. Dithering stays off: on a real 4K UI screenshot, dithering
+        on cost ~75% *more* file size for a *worse* color-error score, not
+        better."""
+        captured = {}
+        real_exec = asyncio.create_subprocess_exec
+
+        async def spy_exec(*args, **kwargs):
+            if str(args[0]).endswith(("pngquant", "pngquant.exe", "pngquant.bat")):
+                captured["argv"] = args
+            return await real_exec(*args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spy_exec)
+
+        src = tmp_path / "src.png"
+        self._make_png(src)
+        out = tmp_path / "out.png"
+        result = asyncio.run(optimizer.optimize_png(
+            src, out, compression_mode="screenshot",
+            dithering=True,  # explicitly ask for dithering — must be ignored
+        ))
+        assert result["success"] is True
+        argv = captured["argv"]
+        assert "75-100" in argv, f"expected the 75-100 quality floor, got: {argv}"
+        assert "--nofs" in argv, f"dithering must be forced off for screenshot mode, got: {argv}"
+        # Sanity: Standard mode's ranges must never appear here.
+        assert "65-80" not in argv and "80-100" not in argv and "50-65" not in argv
+
+    def test_screenshot_mode_never_resizes_even_with_max_width_set(self, tmp_path, optimizer):
+        """Screenshot mode is explicitly designed to never touch resolution
+        — the whole point is keeping UI text pixel-sharp. max_width must be
+        silently ignored, not error out, so the mode stays a true
+        one-click preset even if a leftover max_width value is present
+        from a previous Standard-mode run."""
+        src = tmp_path / "src.png"
+        self._make_png(src, size=(400, 300))
+        out = tmp_path / "out.png"
+        result = asyncio.run(optimizer.optimize_png(
+            src, out, compression_mode="screenshot", max_width=100,
+        ))
+        assert result["success"] is True
+        assert Image.open(out).size == (400, 300), "screenshot mode must ignore max_width entirely"
+
+    def test_screenshot_mode_falls_back_to_lossless_when_pngquant_unavailable(self, tmp_path, optimizer):
+        """If pngquant can't be found (e.g. removed mid-run), screenshot
+        mode must degrade to a plain lossless pass rather than fail the
+        file outright — same fallback shape as Standard mode without
+        pngquant."""
+        optimizer.pngquant_path = None
+        src = tmp_path / "src.png"
+        self._make_png(src)
+        out = tmp_path / "out.png"
+
+        logs = []
+
+        async def log(msg):
+            logs.append(msg)
+
+        result = asyncio.run(optimizer.optimize_png(
+            src, out, compression_mode="screenshot", progress_callback=log,
+        ))
+        assert result["success"] is True
+        assert any("pngquant not found" in m for m in logs)
+        assert list(Image.open(src).getdata()) == list(Image.open(out).getdata()), (
+            "fallback must be genuinely lossless, not a lossy leftover"
+        )
+
+    def test_screenshot_mode_fails_cleanly_when_non_png_source_is_too_complex_to_quantize(
+        self, tmp_path, optimizer, monkeypatch
+    ):
+        """Bug: a real (non-screenshot) photo run through Screenshot mode
+        got silently balooned to several times its original size. Root
+        cause: Screenshot mode always normalizes non-PNG sources to PNG
+        first (see _ensure_png), and when pngquant can't hit the
+        near-lossless floor on genuinely photographic content, it exits
+        nonzero — the old code treated that exactly like the
+        pngquant-not-found case and fell through to a plain *lossless*
+        PNG pass, i.e. shipped an uncompressed-ish PNG re-encode of a
+        JPEG, which is inherently much bigger than the JPEG (JPEG's lossy
+        DCT beats PNG's lossless DEFLATE on photo content by a wide
+        margin — reproduced empirically at ~14x on a synthetic photo).
+
+        Fix: when the source isn't already PNG (i.e. Screenshot mode is
+        about to force a real format conversion) and pngquant fails, fail
+        the file instead of silently shipping a bloated conversion."""
+        real_exec = asyncio.create_subprocess_exec
+
+        class _FakePngquantFailure:
+            returncode = 99
+
+            async def communicate(self):
+                return b"", b"pngquant: image quality below min\n"
+
+        async def spy_exec(*args, **kwargs):
+            if str(args[0]).endswith(("pngquant", "pngquant.exe", "pngquant.bat")):
+                return _FakePngquantFailure()
+            return await real_exec(*args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spy_exec)
+
+        src = tmp_path / "photo.jpg"
+        Image.new("RGB", (64, 64), (120, 80, 40)).save(src, format="JPEG")
+        out = tmp_path / "photo.png"
+
+        logs = []
+
+        async def log(msg):
+            logs.append(msg)
+
+        result = asyncio.run(optimizer.optimize_png(
+            src, out, compression_mode="screenshot", progress_callback=log,
+        ))
+        assert result["success"] is False
+        assert "isn't a good fit" in result["error"]
+        assert not out.exists(), "must not ship a bloated PNG conversion on failure"
+        assert any("too color-complex" in m for m in logs)
+
+    def test_screenshot_mode_still_falls_back_to_lossless_when_png_source_fails_to_quantize(
+        self, tmp_path, optimizer, monkeypatch
+    ):
+        """Unlike the non-PNG case above, a source that's already PNG
+        involves no format conversion — falling through to the existing
+        lossless pass on pngquant failure is still the right, safe
+        behavior here (matches the documented fallback for real
+        screenshots with an embedded photo that can't be quantized)."""
+        real_exec = asyncio.create_subprocess_exec
+
+        class _FakePngquantFailure:
+            returncode = 99
+
+            async def communicate(self):
+                return b"", b"pngquant: image quality below min\n"
+
+        async def spy_exec(*args, **kwargs):
+            if str(args[0]).endswith(("pngquant", "pngquant.exe", "pngquant.bat")):
+                return _FakePngquantFailure()
+            return await real_exec(*args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", spy_exec)
+
+        src = tmp_path / "src.png"
+        self._make_png(src)
+        out = tmp_path / "out.png"
+
+        result = asyncio.run(optimizer.optimize_png(
+            src, out, compression_mode="screenshot",
+        ))
+        assert result["success"] is True
+        assert out.exists()
 
 
 class TestProtectedColorsAndDithering:
@@ -288,6 +450,168 @@ class TestJPEG:
             assert img.mode in ("RGB", "L")
 
 
+class TestGrowthGuard:
+    """Bug: same-format 'optimization' that ends up bigger than the source
+    (or that leaves the source's size unchanged) got shipped as-is,
+    reporting a negative savings percentage on a file that's genuinely no
+    better than what the user already had. Fix: _apply_growth_guard falls
+    back to the original's pixel data (unmodified) with privacy-relevant
+    metadata stripped — never re-encoded, so it can only be the same size
+    as or smaller than the raw original, and it keeps the same
+    'GPS is gone by default' guarantee the compressed path makes."""
+
+    @staticmethod
+    def _png_with_exif_chunk(path: Path, exif_payload: bytes, size=(40, 40), color=(10, 20, 30)):
+        import struct
+        import zlib
+        Image.new("RGB", size, color).save(path, format="PNG")
+        data = bytearray(path.read_bytes())
+        chunk = struct.pack(">I", len(exif_payload)) + b"eXIf" + exif_payload
+        chunk += struct.pack(">I", zlib.crc32(b"eXIf" + exif_payload) & 0xFFFFFFFF)
+        iend_pos = data.rfind(b"IEND") - 4  # back up over IEND's 4-byte length field
+        path.write_bytes(bytes(data[:iend_pos]) + chunk + bytes(data[iend_pos:]))
+
+    def test_same_format_png_falls_back_to_original_pixels_with_exif_stripped(self, tmp_path, optimizer):
+        """The fake pngquant/oxipng binaries just copy bytes through
+        unchanged (no real compression), so a source with an eXIf chunk
+        comes out the exact same size with the chunk still attached —
+        exactly the 'no improvement' case the guard exists for."""
+        src = tmp_path / "src.png"
+        self._png_with_exif_chunk(src, b"II*\x00fake-exif-payload-would-carry-gps")
+        out = tmp_path / "out.png"
+
+        result = asyncio.run(optimizer.optimize_png(src, out, compression_mode="standard"))
+
+        assert result["success"] is True
+        assert result.get("kept_original") is True
+        out_bytes = out.read_bytes()
+        assert b"eXIf" not in out_bytes
+        assert b"fake-exif-payload-would-carry-gps" not in out_bytes
+        assert list(Image.open(src).getdata()) == list(Image.open(out).getdata())
+
+    def test_same_format_jpeg_falls_back_to_original_bytes_with_exif_stripped(self, tmp_path, optimizer):
+        src = tmp_path / "src.jpg"
+        img = Image.new("RGB", (40, 40), (200, 50, 90))
+        exif = img.getexif()
+        exif[0x010E] = "test description"  # arbitrary tag so APP1 is written
+        img.save(src, format="JPEG", exif=exif.tobytes())
+        assert b"Exif" in src.read_bytes()
+        out = tmp_path / "out.jpg"
+
+        # lossless mode maps to q=95 in the fake cjpeg's real Pillow re-encode,
+        # which for a flat-color 40x40 swatch typically won't beat the
+        # source's own JPEG encoding — if it happens to for some Pillow
+        # version, the guard simply won't fire and this assertion tree
+        # still holds trivially (result stays smaller, no eXIF concern
+        # either way since cjpeg's own PPM pipeline is metadata-free).
+        result = asyncio.run(optimizer.optimize_png(
+            src, out, output_format="jpg", compression_mode="lossless",
+        ))
+        assert result["success"] is True
+        if result.get("kept_original"):
+            assert b"Exif" not in out.read_bytes()
+
+    def test_cross_format_conversion_is_never_touched_by_the_guard(self, tmp_path, optimizer):
+        """A genuine format conversion (jpg source -> png output) must
+        never trigger the fallback — the original bytes wouldn't even be
+        a valid file at the target extension."""
+        src = tmp_path / "src.jpg"
+        Image.new("RGB", (40, 40), (5, 5, 5)).save(src, format="JPEG")
+        out = tmp_path / "out.png"
+        result = asyncio.run(optimizer.optimize_png(src, out, compression_mode="standard"))
+        assert result["success"] is True
+        assert "kept_original" not in result
+        assert out.read_bytes()[:8] == PNG_MAGIC
+
+
+class TestMetadataStrippers:
+    """Direct unit coverage for the pure byte-manipulation helpers behind
+    the growth guard — these are hand-rolled container parsers (PNG chunk
+    stream, JPEG marker stream, WebP RIFF stream), so they're worth
+    testing in isolation from the async pipelines that call them."""
+
+    def test_strip_png_metadata_removes_exif_keeps_pixels(self, tmp_path):
+        from app.optimizer import Optimizer
+        path = tmp_path / "x.png"
+        TestGrowthGuard._png_with_exif_chunk(path, b"II*\x00some-exif-bytes")
+        data = path.read_bytes()
+        stripped = Optimizer._strip_png_metadata(data)
+        assert b"eXIf" not in stripped
+        assert b"some-exif-bytes" not in stripped
+        assert stripped[:8] == PNG_MAGIC
+        # still a valid, openable PNG with the same pixels
+        out = tmp_path / "y.png"
+        out.write_bytes(stripped)
+        assert list(Image.open(path).getdata()) == list(Image.open(out).getdata())
+
+    def test_strip_png_metadata_leaves_color_chunks_alone(self):
+        from app.optimizer import Optimizer
+        import io
+        buf = io.BytesIO()
+        Image.new("RGB", (10, 10), (1, 2, 3)).save(buf, format="PNG", pnginfo=None)
+        data = buf.getvalue()
+        # sanity: no metadata chunks to begin with, must be a pure no-op
+        assert Optimizer._strip_png_metadata(data) == data
+
+    def test_strip_jpeg_metadata_removes_exif_keeps_pixels(self, tmp_path):
+        from app.optimizer import Optimizer
+        path = tmp_path / "x.jpg"
+        img = Image.new("RGB", (40, 40), (9, 8, 7))
+        exif = img.getexif()
+        exif[0x010E] = "desc"
+        img.save(path, format="JPEG", exif=exif.tobytes())
+        data = path.read_bytes()
+        assert b"Exif" in data
+        stripped = Optimizer._strip_jpeg_metadata(data)
+        assert b"Exif" not in stripped
+        out = tmp_path / "y.jpg"
+        out.write_bytes(stripped)
+        assert Image.open(out).size == (40, 40)
+
+    def test_strip_jpeg_metadata_noop_on_clean_jpeg(self, tmp_path):
+        from app.optimizer import Optimizer
+        path = tmp_path / "x.jpg"
+        Image.new("RGB", (20, 20), (1, 1, 1)).save(path, format="JPEG")
+        data = path.read_bytes()
+        stripped = Optimizer._strip_jpeg_metadata(data)
+        out = tmp_path / "y.jpg"
+        out.write_bytes(stripped)
+        assert list(Image.open(path).getdata()) == list(Image.open(out).getdata())
+
+    def test_strip_jpeg_metadata_handles_malformed_input_without_raising(self):
+        from app.optimizer import Optimizer
+        assert Optimizer._strip_jpeg_metadata(b"") == b""
+        assert Optimizer._strip_jpeg_metadata(b"not a jpeg") == b"not a jpeg"
+        assert Optimizer._strip_jpeg_metadata(b"\xff\xd8\xff") == b"\xff\xd8\xff"
+
+    def test_strip_webp_metadata_removes_exif_keeps_pixels(self, tmp_path):
+        from app.optimizer import Optimizer
+        path = tmp_path / "x.webp"
+        img = Image.new("RGB", (30, 30), (4, 5, 6))
+        exif = img.getexif()
+        exif[0x010E] = "desc"
+        img.save(path, format="WEBP", exif=exif.tobytes())
+        data = path.read_bytes()
+        assert b"EXIF" in data
+        stripped = Optimizer._strip_webp_metadata(data)
+        assert b"EXIF" not in stripped
+        out = tmp_path / "y.webp"
+        out.write_bytes(stripped)
+        assert list(Image.open(path).convert("RGB").getdata()) == list(Image.open(out).convert("RGB").getdata())
+
+    def test_strip_webp_metadata_noop_on_clean_webp(self, tmp_path):
+        from app.optimizer import Optimizer
+        path = tmp_path / "x.webp"
+        Image.new("RGB", (20, 20), (2, 2, 2)).save(path, format="WEBP", lossless=True)
+        data = path.read_bytes()
+        assert Optimizer._strip_webp_metadata(data) == data
+
+    def test_strip_webp_metadata_handles_malformed_input_without_raising(self):
+        from app.optimizer import Optimizer
+        assert Optimizer._strip_webp_metadata(b"") == b""
+        assert Optimizer._strip_webp_metadata(b"not a webp") == b"not a webp"
+
+
 class TestAvailableModes:
     """`ready` predates WebP / lossless / resize_only and only described the
     Standard-mode PNG path — so it returns False on a build that can still
@@ -308,7 +632,7 @@ class TestAvailableModes:
         assert opt.cjpeg_path is not None
         assert opt.avifenc_path is not None
         modes = opt.available_modes()
-        assert {("png", "standard"), ("png", "lossless"), ("png", "resize_only"),
+        assert {("png", "standard"), ("png", "lossless"), ("png", "resize_only"), ("png", "screenshot"),
                 ("webp", "standard"), ("webp", "lossless"), ("webp", "resize_only"),
                 ("jpg", "standard"), ("jpg", "lossless"), ("jpg", "resize_only"),
                 ("avif", "standard"), ("avif", "lossless"), ("avif", "resize_only")} == modes
@@ -323,9 +647,10 @@ class TestAvailableModes:
         assert opt.avifenc_path is None
 
         modes = opt.available_modes()
-        # PNG standard — the one mode that actually needs pngquant for its
-        # lossy color quantization step — is dropped.
+        # PNG standard/screenshot — the two modes that actually need
+        # pngquant for their lossy color quantization step — are dropped.
         assert ("png", "standard") not in modes
+        assert ("png", "screenshot") not in modes
         # JPEG needs cjpeg for every mode (it's a genuine JPEG re-encode),
         # so without it the whole (jpg, *) family disappears.
         assert not any(fmt == "jpg" for fmt, _ in modes)
@@ -385,6 +710,39 @@ class TestAVIF:
         )
         assert result["success"] is True
         assert out.exists()
+
+    def test_resize_only_avif_uses_lossless_not_quality(self, optimizer, tmp_path, monkeypatch):
+        """Regression test: resize_only used to encode AVIF at -q 90 (lossy)
+        instead of --lossless, silently costing quality that "Resize Only"
+        promises not to touch — unlike JPEG (no true lossless codec exists),
+        AVIF has a real --lossless mode, so there's no excuse for it, and
+        PNG/WebP's resize_only are both genuinely lossless already.
+        Confirmed with the real libavif CLI (avifenc v1.3.0): a
+        resize_only encode with max_width=0 (no resize at all) used to
+        come back pixel-different from the source; with --lossless it's
+        pixel-identical. The test fixture's fake avifenc round-trips
+        losslessly regardless of the flags it's given, so what's actually
+        under test here is the command line built for it."""
+        import asyncio as _asyncio
+        captured = {}
+        real_exec = _asyncio.create_subprocess_exec
+
+        async def spy_exec(*args, **kwargs):
+            captured["argv"] = args
+            return await real_exec(*args, **kwargs)
+
+        monkeypatch.setattr(_asyncio, "create_subprocess_exec", spy_exec)
+
+        src = tmp_path / "input.png"
+        out = tmp_path / "output.avif"
+        Image.new("RGB", (100, 100), (10, 20, 30)).save(src)
+        result = asyncio.run(
+            optimizer.optimize_png(src, out, output_format="avif", compression_mode="resize_only")
+        )
+        assert result["success"] is True
+        argv = captured["argv"]
+        assert "--lossless" in argv, f"resize_only should encode losslessly, got: {argv}"
+        assert "-q" not in argv, f"resize_only should not use a lossy quality flag, got: {argv}"
 
     def test_avif_requires_avifenc(self, tmp_path):
         from app.optimizer import Optimizer
@@ -468,4 +826,83 @@ class TestAVIF:
         )
         assert "--quality" not in argv, "avifenc has no --quality flag — use -q/--qcolor"
         assert "-q" in argv
+
+
+class TestScreenshotModeRealBinaries:
+    """Empirical validation against real pngquant/oxipng (not the fake
+    test doubles) — skipped when they're not on PATH, since they're
+    genuine platform binaries CI can't run. Run this locally on a machine
+    with pngquant/oxipng installed to reproduce the numbers backing the
+    screenshot mode design (see optimizer.py's screenshot branch and
+    CHANGELOG): a real 3840x2160 UI screenshot (flat UI regions + a lot
+    of anti-aliased text + a gradient panel), synthesized here, should
+    compress by roughly 70-80% with near-zero color deviation."""
+
+    @staticmethod
+    def _real_binaries():
+        import shutil as _shutil
+        pq = _shutil.which("pngquant")
+        ox = _shutil.which("oxipng")
+        return pq, ox
+
+    def _make_synthetic_screenshot(self, path):
+        """A rough approximation of a real UI screenshot: flat sidebar/
+        toolbar regions, many small anti-aliased text glyphs (the part
+        that pushes real screenshots' color count into the thousands,
+        defeating a naive "screenshots have <=256 colors" assumption),
+        and a smooth gradient panel (the part most likely to show visible
+        banding under aggressive quantization)."""
+        from PIL import ImageDraw, ImageFont
+        W, H = 3840, 2160
+        img = Image.new("RGB", (W, H), (245, 246, 248))
+        d = ImageDraw.Draw(img)
+        d.rectangle([0, 0, 280, H], fill=(38, 42, 54))
+        d.rectangle([280, 0, W, 70], fill=(255, 255, 255))
+        try:
+            font = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 15
+            )
+        except OSError:
+            font = ImageFont.load_default()
+        for i in range(60):
+            d.text((320, 110 + i * 30), f"{i+1:>4}  some_code_line = {i}", font=font, fill=(60, 64, 74))
+        x0, y0, x1, y1 = 2600, 1300, 3820, 1900
+        for gy in range(y0, y1):
+            t = (gy - y0) / (y1 - y0)
+            d.line([x0, gy, x1, gy], fill=(int(240 - t*80), int(245 - t*60), int(250 - t*20)))
+        img.save(path, format="PNG", compress_level=1)
+        return img
+
+    def test_screenshot_mode_hits_target_compression_with_low_color_error(self, tmp_path):
+        pq, ox = self._real_binaries()
+        if not pq or not ox:
+            pytest.skip("real pngquant/oxipng not on PATH — this validates against the actual binaries, not the CI test doubles")
+
+        from app.optimizer import Optimizer
+        opt = Optimizer(bin_dir=tmp_path)
+        opt.pngquant_path = Path(pq)
+        opt.oxipng_path = Path(ox)
+
+        src = tmp_path / "screenshot.png"
+        self._make_synthetic_screenshot(src)
+        raw_size = src.stat().st_size
+        out = tmp_path / "out.png"
+
+        result = asyncio.run(opt.optimize_png(src, out, compression_mode="screenshot"))
+        assert result["success"] is True
+        reduction = 1 - (out.stat().st_size / raw_size)
+        assert reduction >= 0.65, (
+            f"only {reduction:.1%} reduction on the synthetic screenshot — "
+            "expected roughly 70-80%, see CHANGELOG for the reference numbers"
+        )
+
+        orig = Image.open(src).convert("RGB")
+        compressed = Image.open(out).convert("RGB")
+        diff = ImageChops.difference(orig, compressed)
+        mean_err = sum(ImageStat.Stat(diff).mean) / 3
+        assert mean_err < 0.1, (
+            f"mean per-channel color error {mean_err:.4f} is far higher than the "
+            "~0.007 measured in development — screenshot mode may no longer be "
+            "near-lossless on this kind of content"
+        )
 

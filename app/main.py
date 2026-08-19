@@ -332,6 +332,70 @@ def _list_unfinished_batch_states() -> list[dict]:
     return out
 
 
+def _skip_fingerprints_dir() -> Path:
+    d = _config_dir() / "skip_fingerprints"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
+def _skip_fingerprints_file(output_dir: str) -> Path:
+    # Reuses the same output_dir → stable id scheme as batch state (see
+    # _batch_id_for_output_dir) — same reasoning applies: output_dir is
+    # what identifies "this run's destination", stable across restarts,
+    # distinct between unrelated runs.
+    return _skip_fingerprints_dir() / f"{_batch_id_for_output_dir(output_dir)}.json"
+
+
+def _settings_fingerprint(
+    quality: str, compression_mode: str, max_width: int,
+    protected_colors: Optional[list], dithering: bool, keep_exif: bool, output_format: str,
+) -> str:
+    """Fingerprints the effective per-file compression settings that
+    produced (or would produce) a given output. Used by skip_existing to
+    tell "the source hasn't changed AND these are the same settings that
+    made this file last time" apart from "the source happens to be
+    unchanged but the user asked for something different this run" — the
+    two look identical if you only check the source's mtime, which is all
+    the reuse check used to do.
+
+    Order-independent on protected_colors (case/whitespace-normalized) so
+    ["#FF0000", "#00ff00"] and ["#00FF00", "#ff0000"] fingerprint the same,
+    matching how the color-map step itself treats them."""
+    colors = sorted((c or "").strip().lower() for c in (protected_colors or []))
+    payload = json.dumps({
+        "quality": quality,
+        "compression_mode": compression_mode,
+        "max_width": max_width,
+        "protected_colors": colors,
+        "dithering": bool(dithering),
+        "keep_exif": bool(keep_exif),
+        "output_format": output_format,
+    }, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _load_skip_fingerprints(output_dir: str) -> dict:
+    """rel_path -> fingerprint of the settings that produced the current
+    file at that path, for one output_dir. Missing/corrupt file -> {} (an
+    empty map means "nothing recorded", which skip_existing treats as
+    unverifiable and recompresses rather than trusting a stale file blindly
+    — see the reuse check in _process_files)."""
+    try:
+        return json.loads(_skip_fingerprints_file(output_dir).read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_skip_fingerprints(output_dir: str, data: dict):
+    try:
+        _skip_fingerprints_file(output_dir).write_text(json.dumps(data), encoding="utf-8")
+    except OSError:
+        pass  # best-effort — a write failure here just means the next run recompresses instead of reusing
+
+
 # Defaults for everything a config.json can override. CLI flags (where they
 # exist) take priority over the config file, which takes priority over
 # these. Keep this in sync with README's config.json documentation.
@@ -536,6 +600,54 @@ def _fmt_size(b: int) -> str:
     if b < 1024 * 1024:
         return f"{b / 1024:.1f} KB"
     return f"{b / (1024 * 1024):.2f} MB"
+
+
+# Strings for the standalone Compare page (see /api/preview below). This
+# page is server-rendered and opened in its own tab/window, so it can't
+# share index.html's client-side I18N dict or read its localStorage — the
+# caller passes its current language as a ?lang= query param instead (see
+# the previewUrl construction in index.html). Keep in step with
+# index.html's I18N when adding a language; only "en"/"zh" exist today.
+PREVIEW_I18N = {
+    "en": {
+        "not_found": "Not found",
+        "title_prefix": "Compare - ",
+        "saved": "saved {pct}%",
+        "side_by_side": "Side by Side",
+        "overlay": "Overlay",
+        "fit": "Fit",
+        "fit_title": "Scale images to fit the window",
+        "zoom100": "100%",
+        "zoom100_title": "Show actual pixels — the real test for whether text stays sharp",
+        "original_label": "Original ({size})",
+        "compressed_label": "Compressed ({size})",
+        "original": "Original",
+        "compressed": "Compressed",
+        "toggle_suffix": " \u2014 click image to toggle (or press space)",
+        "footer_overlay": "Click the image (or press space) to flip between original and compressed",
+        "footer_side": "Original (left) vs Compressed (right)",
+        "zoom_hint": " (scroll to pan around at actual size)",
+    },
+    "zh": {
+        "not_found": "未找到",
+        "title_prefix": "对比 - ",
+        "saved": "节省 {pct}%",
+        "side_by_side": "并排对比",
+        "overlay": "叠加对比",
+        "fit": "适应窗口",
+        "fit_title": "缩放图片以适应窗口",
+        "zoom100": "100%",
+        "zoom100_title": "显示实际像素——检验文字是否保持清晰的真正标准",
+        "original_label": "原图（{size}）",
+        "compressed_label": "压缩后（{size}）",
+        "original": "原图",
+        "compressed": "压缩后",
+        "toggle_suffix": "\u2014点击图片切换（或按空格键）",
+        "footer_overlay": "点击图片（或按空格键）切换原图与压缩后效果",
+        "footer_side": "原图（左）对比压缩后（右）",
+        "zoom_hint": "（可滚动查看实际尺寸下的细节）",
+    },
+}
 
 
 def _is_valid_reusable_output(path: Path, expected_format: str) -> bool:
@@ -923,8 +1035,13 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
     if state.is_running:
         return JSONResponse({"error": "Optimization in progress, please wait"}, status_code=400)
 
-    if data.compression_mode not in ("standard", "lossless", "resize_only"):
+    if data.compression_mode not in ("standard", "lossless", "resize_only", "screenshot"):
         return JSONResponse({"error": "Invalid compression_mode"}, status_code=400)
+    if data.compression_mode == "screenshot" and data.output_format != "png":
+        return JSONResponse(
+            {"error": "Screenshot mode is PNG-only (it's a tuned pngquant pass, not a general codec setting)"},
+            status_code=400,
+        )
     if data.quality not in ("high", "medium", "low"):
         # Previously an unknown quality silently fell back to "medium" deep
         # inside the optimizer — reject it here like the other enum fields
@@ -1037,7 +1154,7 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
     # must fail the request loudly, not half-start a run. See
     # _validate_overrides for the field-value/unknown-key/resize_only rules.
     selected_ids = {f["id"] for f in files_to_process}
-    ov_err = _validate_overrides(data.overrides, selected_ids, data.compression_mode, data.max_width)
+    ov_err = _validate_overrides(data.overrides, selected_ids, data.compression_mode, data.max_width, data.output_format)
     if ov_err:
         return JSONResponse({"error": ov_err}, status_code=400)
 
@@ -1147,15 +1264,18 @@ OVERRIDEABLE_FIELDS = (
 )
 
 
-def _validate_overrides(overrides: dict, selected_ids: set, top_mode: str, top_width: int) -> Optional[str]:
+def _validate_overrides(
+    overrides: dict, selected_ids: set, top_mode: str, top_width: int, top_format: str
+) -> Optional[str]:
     """Validate every per-file override entry. Returns an error string on the
     first problem, or None if all entries are well-formed.
 
     Field-value checks (enum/colors/unknown-keys) run for EVERY entry, even
     ids not in the selection — a typo in an override for a deselected file is
-    still a typo worth reporting. The resize_only+max_width cross-check only
-    runs for selected ids: an override on an unselected file has no effect,
-    so complaining about it would be a false positive."""
+    still a typo worth reporting. The resize_only+max_width and
+    screenshot+PNG-only cross-checks only run for selected ids: an override
+    on an unselected file has no effect, so complaining about it would be a
+    false positive."""
     for fid, ov in overrides.items():
         if not isinstance(ov, dict):
             return f"Override for file {fid!r} must be an object"
@@ -1165,7 +1285,7 @@ def _validate_overrides(overrides: dict, selected_ids: set, top_mode: str, top_w
                     f"Supported: {list(OVERRIDEABLE_FIELDS)}")
         if "quality" in ov and ov["quality"] not in ("high", "medium", "low"):
             return f"Invalid quality in override for file {fid!r}: {ov['quality']!r}"
-        if "compression_mode" in ov and ov["compression_mode"] not in ("standard", "lossless", "resize_only"):
+        if "compression_mode" in ov and ov["compression_mode"] not in ("standard", "lossless", "resize_only", "screenshot"):
             return f"Invalid compression_mode in override for file {fid!r}: {ov['compression_mode']!r}"
         if "output_format" in ov and ov["output_format"] not in ("png", "webp", "jpg", "avif"):
             return f"Invalid output_format in override for file {fid!r}: {ov['output_format']!r}"
@@ -1179,13 +1299,17 @@ def _validate_overrides(overrides: dict, selected_ids: set, top_mode: str, top_w
             bc = [c for c in ov["protected_colors"] if not HEX_COLOR_RE.match(str(c).strip())]
             if bc:
                 return f"Invalid color(s) in override for file {fid!r}: {', '.join(bc)}"
-        # resize_only needs a max_width — check the effective combination, but
-        # only for files actually being processed.
+        # resize_only needs a max_width, and screenshot is PNG-only — check
+        # the effective combination, but only for files actually being
+        # processed.
         if fid in selected_ids:
             eff_mode = ov.get("compression_mode", top_mode)
             eff_width = ov.get("max_width", top_width)
+            eff_format = ov.get("output_format", top_format)
             if eff_mode == "resize_only" and eff_width <= 0:
                 return f"Resize Only mode requires Max Width (override for file {fid!r})"
+            if eff_mode == "screenshot" and eff_format != "png":
+                return f"Screenshot mode is PNG-only (override for file {fid!r})"
     return None
 
 
@@ -1225,6 +1349,25 @@ async def _process_files(
     if batch_state:
         for _f in batch_state.get("files", []):
             _bs_lookup[_f["path"]] = _f
+
+    # rel_path -> fingerprint of the settings that produced the file
+    # currently at that path in output_dir. Loaded once here (not
+    # per-file — this file can grow to one entry per image ever produced
+    # into this folder, so re-reading/re-writing it from disk on every
+    # single file would be O(n) work repeated n times) and only written
+    # back to disk if something actually changes. Tracked for every run
+    # with a persistent output_dir, not just skip_existing runs — a very
+    # common pattern is "run normally once, then re-run with
+    # skip_existing checked", and that first normal run needs to have
+    # left a fingerprint behind for the second run to have anything to
+    # verify against. See skip_existing's reuse check below and
+    # _settings_fingerprint for why this exists: mtime alone can't tell
+    # "unchanged source, same settings, safe to reuse" apart from
+    # "unchanged source, but the user asked for different settings this
+    # run" — before this, skip_existing couldn't tell those apart and
+    # silently reused stale output for the latter.
+    _skip_fp = _load_skip_fingerprints(output_dir) if output_dir else {}
+    _skip_fp_dirty = False
 
     ws = state.workspace
     opt_output_dir = ws / "output"
@@ -1319,20 +1462,33 @@ async def _process_files(
         # leftover from a previous run that was interrupted mid-write — a
         # non-empty file alone isn't proof it's complete.
         # Staleness: reuse is only valid if the *source* hasn't changed since
-        # the existing output was produced. Same filename doesn't mean same
-        # content — e.g. a screenshot re-taken under the same name. There's no
-        # manifest recording "this output came from source hash X" (and we
-        # deliberately don't want to write sidecar files into the user's real
-        # output folder), so this uses the same mtime-newer-than-target check
-        # every incremental build tool uses (make, rsync -u, ...): if the
-        # source's mtime is more recent than the existing output's, treat it
-        # as changed and recompress instead of reusing. For the upload flow
-        # specifically, input_path is a fresh workspace-local copy made at
-        # upload time, so its mtime is always "now" — re-uploading an
-        # unchanged file will (safely, if unnecessarily) recompress rather
-        # than reuse; that's the conservative direction to fail in.
-        # Note: a skipped file is NOT recompressed, so per-file overrides are
-        # intentionally ignored on the skip path (the existing output stands).
+        # the existing output was produced, AND this run's effective
+        # settings match whatever produced it. Same filename doesn't mean
+        # same content — e.g. a screenshot re-taken under the same name —
+        # and an unchanged source doesn't mean the user wants the same
+        # output either: they may have just changed quality/mode/max_width/
+        # format/etc. and re-run with skip_existing still on, expecting
+        # their new settings to apply. mtime alone can't tell those two
+        # cases apart (confirmed empirically: changing max_width between
+        # runs with an untouched source silently kept the old, un-resized
+        # output). There's no manifest recording "this output came from
+        # source hash X" written into the user's real output folder (still
+        # deliberately avoided — see _settings_fingerprint), so the mtime
+        # check (make/rsync -u style: source newer than target => changed)
+        # is combined with a settings fingerprint stored separately under
+        # this app's own config dir. No recorded fingerprint (e.g. the
+        # first skip_existing run against files produced before this
+        # existed) means "unverifiable" — recompress rather than trust it,
+        # same conservative direction the upload-flow mtime case already
+        # fails in.
+        # Note: a skip decision means the file is NOT recompressed at all,
+        # so a per-file override only has an effect on a skipped file
+        # indirectly — by changing its fingerprint and thereby causing a
+        # miss on settings_unchanged below, which forces a recompress
+        # (where the override then genuinely applies). An override whose
+        # values happen to match what's already in place doesn't change
+        # anything either way, by design (nothing to apply that wasn't
+        # already true).
         if skip_existing and output_dir:
             rel = out_path.relative_to(opt_output_dir)
             dest = Path(output_dir) / rel
@@ -1340,8 +1496,14 @@ async def _process_files(
                 input_path.exists() and dest.exists()
                 and input_path.stat().st_mtime <= dest.stat().st_mtime
             )
+            eff_fingerprint = _settings_fingerprint(
+                eff_quality, eff_compression_mode, eff_max_width,
+                eff_protected_colors, eff_dithering, eff_keep_exif, eff_output_format,
+            )
+            settings_unchanged = _skip_fp.get(str(rel)) == eff_fingerprint
             if (
                 source_unchanged
+                and settings_unchanged
                 and dest.stat().st_size > 0
                 and _is_valid_reusable_output(dest, eff_output_format)
             ):
@@ -1428,6 +1590,19 @@ async def _process_files(
                     # disk to reveal (nothing to show when output_dir is
                     # empty and results live only in the temp workspace).
                     result["final_output_path"] = str(dest)
+                    # Record what settings actually produced this file, so
+                    # a later skip_existing run can tell "safe to reuse"
+                    # apart from "source unchanged but settings differ" —
+                    # see the fingerprint check above. Tracked on every
+                    # run with a persistent output_dir (not just
+                    # skip_existing runs) so a plain run followed by a
+                    # skip_existing run has something to verify against.
+                    nonlocal _skip_fp_dirty
+                    _skip_fp[str(rel)] = _settings_fingerprint(
+                        eff_quality, eff_compression_mode, eff_max_width,
+                        eff_protected_colors, eff_dithering, eff_keep_exif, eff_output_format,
+                    )
+                    _skip_fp_dirty = True
                 except Exception as e:
                     state.logs.append(f"  Output copy failed: {e}")
         else:
@@ -1513,6 +1688,13 @@ async def _process_files(
             remaining = [f for f in batch_state.get("files", []) if f["status"] in ("pending", "failed")]
             if not remaining and batch_state.get("output_dir"):
                 _clear_batch_state(batch_state["output_dir"])
+        # Persist any new/updated skip_existing fingerprints from this run
+        # in one write, rather than one disk write per file (see the load
+        # site's comment for why). A cancelled/crashed run still saves
+        # whatever completed before the interruption — those files are
+        # genuinely done and their fingerprints are genuinely accurate.
+        if _skip_fp_dirty:
+            _save_skip_fingerprints(output_dir, _skip_fp)
 
 
 @app.get("/api/progress")
@@ -1711,8 +1893,13 @@ async def preview_optimize(data: PreviewRequest, state: AppState = Depends(get_s
         return JSONResponse({"error": "Optimizer not initialized"}, status_code=503)
     # Same enum validation as /api/optimize, so a preview reflects what the
     # real run would actually accept (a typo'd mode fails here, not silently).
-    if data.compression_mode not in ("standard", "lossless", "resize_only"):
+    if data.compression_mode not in ("standard", "lossless", "resize_only", "screenshot"):
         return JSONResponse({"error": "Invalid compression_mode"}, status_code=400)
+    if data.compression_mode == "screenshot" and data.output_format != "png":
+        return JSONResponse(
+            {"error": "Screenshot mode is PNG-only (it's a tuned pngquant pass, not a general codec setting)"},
+            status_code=400,
+        )
     if data.quality not in ("high", "medium", "low"):
         return JSONResponse(
             {"error": f"Invalid quality: {data.quality!r}. Supported: 'high', 'medium', 'low'."},
@@ -1818,15 +2005,24 @@ async def get_result(ws_name: str, result_path: str, state: AppState = Depends(g
 
 
 @app.get("/api/preview/{ws_name}/{file_id}")
-async def preview(ws_name: str, file_id: str, state: AppState = Depends(get_session)):
+async def preview(ws_name: str, file_id: str, request: Request, state: AppState = Depends(get_session)):
     # Same ownership check as every other workspace-scoped endpoint. Doing
     # it FIRST also closes a reflected-XSS hole: ws_name is an arbitrary
     # URL path segment that gets embedded in the HTML below — without this
     # gate (plus the html.escape on the URLs), a crafted ws_name like
     # `"><script>...` would execute in this app's origin and could then
     # harvest APP_TOKEN from the index page, defeating the CSRF defense.
+    # This page is opened in a new tab (see index.html's `${previewUrl}`,
+    # which appends the caller's current UI language as ?lang=), so it
+    # can't read the main page's localStorage directly — the query param
+    # is how the language choice crosses that boundary. Anything other
+    # than a known key falls back to English; this dict is standalone
+    # from index.html's I18N (different runtime, server- vs client-
+    # rendered) and needs updating in step with it for new languages.
+    lang = request.query_params.get("lang", "en")
+    T = PREVIEW_I18N.get(lang, PREVIEW_I18N["en"])
     if not (state.workspace and state.workspace.name == ws_name):
-        return HTMLResponse("<h2>Not found</h2>", status_code=404)
+        return HTMLResponse(f"<h2>{T['not_found']}</h2>", status_code=404)
     html = """<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <style>
@@ -1863,7 +2059,7 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
             break
 
     if not result:
-        return HTMLResponse("<h2>Not found</h2>", status_code=404)
+        return HTMLResponse(f"<h2>{T['not_found']}</h2>", status_code=404)
 
     import html as _html
 
@@ -1879,44 +2075,60 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 
     safe_name = _html.escape(str(result['name']))
     safe_basename = _html.escape(Path(result['name']).name)
+    title_prefix = _html.escape(T["title_prefix"])
     html = html.replace(
         '<head><meta charset="utf-8">',
-        f'<head><meta charset="utf-8"><title>Compare - {safe_basename}</title>',
+        f'<head><meta charset="utf-8"><title>{title_prefix}{safe_basename}</title>',
         1,
     )
+    orig_size = _fmt_size(result['original_size'])
+    comp_size = _fmt_size(result['compressed_size'])
+    saved_text = _html.escape(T["saved"].format(pct=result.get('savings_percent', 0)))
+    # Static, hardcoded-in-Python strings only (never user/result data) —
+    # safe to embed directly as a JS object literal for the toggle script
+    # below, same trust boundary as the rest of this f-string page.
+    js_i18n = json.dumps({
+        "original": T["original"],
+        "compressed": T["compressed"],
+        "toggle_suffix": T["toggle_suffix"],
+        "footer_overlay": T["footer_overlay"],
+        "footer_side": T["footer_side"],
+        "zoom_hint": T["zoom_hint"],
+    })
     html += f"""
 <div class="bar">
   <span class="title">{safe_name}</span>
-  <span class="stats">{_fmt_size(result['original_size'])} -> {_fmt_size(result['compressed_size'])} | saved {result.get('savings_percent', 0)}%</span>
+  <span class="stats">{orig_size} -> {comp_size} | {saved_text}</span>
   <div class="view-toggle">
-    <button class="view-btn" id="btn-side">Side by Side</button>
-    <button class="view-btn active" id="btn-overlay">Overlay</button>
+    <button class="view-btn" id="btn-side">{_html.escape(T['side_by_side'])}</button>
+    <button class="view-btn active" id="btn-overlay">{_html.escape(T['overlay'])}</button>
   </div>
   <div class="zoom-toggle">
-    <button class="view-btn active" id="btn-fit" title="Scale images to fit the window">Fit</button>
-    <button class="view-btn" id="btn-zoom100" title="Show actual pixels — the real test for whether text stays sharp">100%</button>
+    <button class="view-btn active" id="btn-fit" title="{_html.escape(T['fit_title'])}">{_html.escape(T['fit'])}</button>
+    <button class="view-btn" id="btn-zoom100" title="{_html.escape(T['zoom100_title'])}">{_html.escape(T['zoom100'])}</button>
   </div>
 </div>
 <div class="container" id="side-view" style="display:none">
   <div class="panel">
-    <div class="label">Original ({_fmt_size(result['original_size'])})</div>
+    <div class="label">{_html.escape(T['original_label'].format(size=orig_size))}</div>
     <div class="image-wrap" id="orig-wrap"><img src="{orig_url}" id="orig-img" alt="original"/></div>
   </div>
   <div class="panel">
-    <div class="label">Compressed ({_fmt_size(result['compressed_size'])})</div>
+    <div class="label">{_html.escape(T['compressed_label'].format(size=comp_size))}</div>
     <div class="image-wrap" id="comp-wrap"><img src="{comp_url}" id="comp-img" alt="compressed"/></div>
   </div>
 </div>
 <div class="overlay-view" id="overlay-view">
-  <div class="overlay-label" id="overlay-label">Compressed &mdash; click image to toggle (or press space)</div>
+  <div class="overlay-label" id="overlay-label">{_html.escape(T['compressed'] + T['toggle_suffix'])}</div>
   <div class="overlay-wrap" id="overlay-wrap">
     <img src="{orig_url}" class="overlay-img" id="overlay-orig" alt="original" style="display:none"/>
     <img src="{comp_url}" class="overlay-img" id="overlay-comp" alt="compressed"/>
   </div>
 </div>
-<div class="footer" id="footer-hint">Overlay — click the image (or press space) to flip between original and compressed</div>
+<div class="footer" id="footer-hint">{_html.escape(T['footer_overlay'])}</div>
 <script>
 (function(){{
+  var I18N = {js_i18n};
   var sideBtn = document.getElementById('btn-side');
   var overlayBtn = document.getElementById('btn-overlay');
   var fitBtn = document.getElementById('btn-fit');
@@ -1959,10 +2171,10 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 
   function updateFooter(){{
     var isOverlay = overlayView.style.display !== 'none';
-    var zoomHint = zoomedIn ? ' (scroll to pan around at actual size)' : '';
+    var zoomHint = zoomedIn ? I18N.zoom_hint : '';
     footer.textContent = isOverlay
-      ? 'Click the image (or press space) to flip between original and compressed' + zoomHint
-      : 'Original (left) vs Compressed (right)' + zoomHint;
+      ? I18N.footer_overlay + zoomHint
+      : I18N.footer_side + zoomHint;
   }}
 
   function toggleImage(){{
@@ -1970,7 +2182,7 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
     showingOriginal = !showingOriginal;
     orig.style.display = showingOriginal ? 'block' : 'none';
     comp.style.display = showingOriginal ? 'none' : 'block';
-    label.textContent = (showingOriginal ? 'Original' : 'Compressed') + ' \\u2014 click image to toggle (or press space)';
+    label.textContent = (showingOriginal ? I18N.original : I18N.compressed) + I18N.toggle_suffix;
   }}
   wrap.addEventListener('click', toggleImage);
   document.addEventListener('keydown', function(e){{
@@ -2626,10 +2838,29 @@ async def watch_start(
                 ),
             }, status_code=400)
 
-    if data.compression_mode not in ("standard", "lossless", "resize_only"):
+    if data.compression_mode not in ("standard", "lossless", "resize_only", "screenshot"):
         return JSONResponse({"error": "Invalid compression_mode"}, status_code=400)
+    if data.compression_mode == "screenshot" and data.output_format != "png":
+        return JSONResponse(
+            {"error": "Screenshot mode is PNG-only (it's a tuned pngquant pass, not a general codec setting)"},
+            status_code=400,
+        )
     if data.quality not in ("high", "medium", "low"):
         return JSONResponse({"error": f"Invalid quality: {data.quality!r}"}, status_code=400)
+    if data.compression_mode == "resize_only" and data.max_width <= 0:
+        # Same rule as /api/optimize and per-file overrides (see
+        # _validate_overrides) — Resize Only has nothing to do without a
+        # width, and every other entry point already rejects this
+        # combination. Watch mode lacked this check, so starting a watch
+        # with mode=resize_only and a forgotten/zero max_width would run
+        # indefinitely: every detected file gets "processed" with no
+        # resize applied at all — for AVIF this used to mean a pointless
+        # lossy re-encode for zero size benefit (fixed alongside this),
+        # and for every format it's just wasted CPU with no resize.
+        return JSONResponse(
+            {"error": "Resize Only mode requires Max Width (max_width must be > 0)"},
+            status_code=400,
+        )
 
     warning = None
     if (data.output_format, data.compression_mode) not in optimizer.available_modes():

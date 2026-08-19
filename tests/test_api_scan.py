@@ -1,6 +1,8 @@
 """Regression tests for /api/scan and /api/scan-progress."""
 from __future__ import annotations
 
+import time
+
 from PIL import Image
 
 from .conftest import wait_for
@@ -59,14 +61,30 @@ class TestScanReturnsQuickly:
 
         client.post("/api/scan", json={"directory": str(big_dir), "recursive": False}, headers=auth_headers)
         seen_partial = False
-        for _ in range(300):
+        # Time-budgeted rather than iteration-budgeted: a fixed poll count
+        # (this used to be `for _ in range(300)`) assumes each client.get()
+        # round trip + the background scan task's own progress take roughly
+        # constant wall-clock time. On a slower/more loaded CI runner that
+        # assumption doesn't hold — the scan can legitimately still be
+        # in-flight after 300 fast polls, which looks identical to "the
+        # scan never finished" from the test's point of view even though
+        # nothing is actually wrong. 20 files at 0.03s of injected sleep
+        # each is 0.6s of guaranteed minimum scan time; 30s of budget is
+        # generous headroom above that for CI variance without masking a
+        # genuine hang (a real deadlock/regression still fails loudly,
+        # just after 30s instead of instantly).
+        deadline = time.time() + 30.0
+        d = None
+        while time.time() < deadline:
             d = client.get("/api/scan-progress", headers=auth_headers).json()
             if d["total"] > 0 and 0 < d["current"] < d["total"]:
                 seen_partial = True
             if not d["running"]:
                 break
         assert seen_partial, "never observed an intermediate progress state — scan may have regressed to blocking"
-        assert d["total"] == 20 and len(d["files"]) == 20
+        assert d["total"] == 20 and len(d["files"]) == 20, (
+            f"scan didn't finish within the time budget: {d}"
+        )
 
 
 class TestScanDeterministicOrder:

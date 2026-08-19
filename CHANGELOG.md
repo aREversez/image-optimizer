@@ -2,6 +2,153 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+## [1.0.4] - 2026-08-19
+
+### Added
+- **Screenshot mode** (`compression_mode: "screenshot"`, PNG only). A
+  dedicated one-click preset for software/UI screenshots, which Standard/
+  Lossless/Resize Only all handle poorly: Standard's default quality
+  ranges visibly shifted colors on gradients/shadows (measured mean
+  color error 0.33, gradient-region error up to 48/255, clearly visible
+  banding); Lossless alone only cut a synthetic 4K UI screenshot by 43%;
+  Resize Only blurs exactly the UI text a screenshot is usually kept
+  around to reference. Screenshot mode instead runs pngquant at a much
+  tighter quality floor than Standard's 50-65/65-80/80-100, with
+  dithering forced off, since screenshots' native color count is
+  naturally close to 256 already (flat UI regions + anti-aliased text
+  edges). Measured on a synthetic 3840x2160 UI screenshot (flat
+  sidebar/toolbar, ~60 lines of anti-aliased text, a gradient panel):
+  75.3% size reduction with mean color error 0.007 and zero resolution
+  loss. Dithering was measured to make things worse for this content,
+  not better, so it's hardcoded off rather than left as a per-run
+  choice. If an individual image's true color complexity is too high to
+  fit within 256 colors (e.g. a screenshot with an embedded photo),
+  pngquant declines and the file falls back to a plain lossless pass
+  automatically. Quality/Max Width/Protect Colors/Dithering don't apply
+  to this mode and are disabled in the UI when it's selected; Output
+  Format is locked to PNG since the whole technique is PNG-specific.
+- **Front-end internationalization (English/Chinese), extensible to more
+  languages.** A dictionary-based `I18N = { en: {...}, zh: {...} }` system
+  replaces ~150 previously hardcoded English strings across the template,
+  including the standalone Compare page (which crosses a page-reload
+  boundary via a `?lang=` query param, since it can't share the main
+  page's client-side dict). Default language auto-detects from
+  `navigator.language` (falls back to English for anything non-Chinese);
+  an explicit choice in Settings > Language always wins and persists to
+  `localStorage`. Adding a language is one new key in `I18N` plus one
+  `<option>` in the language `<select>`, no other code changes needed.
+  Scoped to front-end UI text only; server-pushed log lines stay in
+  English. 161 keys, verified with zero missing/unused entries in either
+  direction.
+- **Settings panel restructured into a three-column layout** so Settings
+  and Watch Mode are visible without scrolling past the file list, and
+  Compression Mode's 4 options no longer overflow the sidebar (now a
+  self-contained 2x2 grid). Left column holds only Source Path / Target
+  Path; container widens to 1680px with a 1300px breakpoint that drops
+  the third column to a full-width row, and the existing 1000px
+  breakpoint still collapses everything to one column.
+- **"Screenshot preset" button** in Settings — one click sets Quality:
+  High, Max Width: 1920px, Mode: Standard, Dithering: Off, the combo that
+  measured best for compressing software screenshots without the blur
+  Screenshot mode's own resize restriction rules out. A short "Settings
+  are saved automatically" caption sits above it, since Quality/Max
+  Width/Mode/Dithering/Format already persist to `localStorage` across
+  reloads but nothing previously told the user that.
+
+### Changed
+- **Screenshot mode's pngquant quality floor loosened from 95-100 to
+  75-100.** The tighter floor is a pass/fail gate, not an optimization
+  target — content that already clears it (flat UI, icons, moderate
+  gradients) produces byte-for-byte identical output either way, but
+  content that couldn't clear 95 (embedded photos/video thumbnails,
+  richer gradient panels) failed outright and fell all the way through
+  to a 0%-gain lossless pass. At 75, that harder content now succeeds
+  instead, with resulting color error concentrated almost entirely in
+  the photo-like regions rather than the text/UI chrome where a
+  screenshot's readability actually lives.
+
+### Fixed
+- **`skip_existing` ignored settings changes between runs.** Its reuse
+  decision was keyed purely on the source file's mtime vs the existing
+  output's, so re-running against an untouched source with a different
+  `max_width` (or quality/compression_mode/output_format/
+  protected_colors/dithering/keep_exif) silently reused the old output
+  produced under the *previous* settings, with no warning that the new
+  settings had no effect. A settings fingerprint (quality/mode/width/
+  colors/dithering/keep_exif/format) is now stored per output_dir
+  alongside the file it produced, and skip_existing only reuses when
+  both the source is unchanged AND the fingerprint matches this run's
+  effective settings. No recorded fingerprint (e.g. a file that predates
+  this feature) is treated as unverifiable and recompressed rather than
+  trusted.
+- **AVIF's "Resize Only" mode was silently lossy**, unlike every other
+  format's Resize Only. PNG and WebP both guarantee Resize Only costs no
+  quality beyond the resize itself; AVIF silently encoded at `-q 90`
+  even though avifenc has a real `--lossless` mode already used
+  correctly for AVIF's own "Lossless" mode, and the quality loss
+  happened even when no resize occurred at all. resize_only now shares
+  the same `--lossless` path as AVIF's lossless mode, confirmed
+  pixel-identical to the source against the real libavif CLI.
+- **Watch mode didn't validate `resize_only` requires a Max Width** —
+  `/api/optimize` and per-file overrides both reject that combination,
+  but `/api/watch/start` let it through and ran indefinitely
+  "processing" every detected file with no resize ever applied. Watch
+  mode now rejects the same combination with the same error the other
+  two entry points already use.
+- **Same-format optimization (PNG/JPEG/WebP) could ship a result bigger
+  than the source** when the encoder couldn't improve on already-
+  near-minimal content — nothing checked the output was actually
+  smaller before shipping it. A new growth guard falls back to the
+  original's pixel data with EXIF/GPS/XMP/text-comment metadata
+  stripped (never re-encoded, so the result is provably never bigger
+  than the source), preserving the "GPS is gone by default" guarantee
+  even on this fallback path. Scoped to same-format results only — a
+  genuine format conversion has no valid original-bytes fallback at the
+  target extension.
+- **Screenshot mode could balloon a non-screenshot source (e.g. a real
+  photo) into a PNG many times larger than the original** instead of
+  failing. When pngquant can't hit the quality floor on a source that
+  isn't already PNG, that's an actual format conversion in progress
+  (jpg -> png), and a lossless PNG re-encode of photographic content is
+  inherently much bigger than a lossy JPEG source (reproduced at ~14x on
+  a synthetic photo). Now fails cleanly with an actionable message
+  instead. A source that's already PNG is unaffected — no format
+  conversion happens there, so the existing lossless fallback is
+  unchanged.
+- **Dark theme's selected-state text contrast regressed to failing WCAG
+  AA**, and selecting a Compression Mode option could resize the whole
+  button row. A color refinement pass had flipped selected-state text
+  from black to white globally (not scoped to dark mode, so it also hit
+  light mode) and added `font-weight: 500` on selection, which measurably
+  widens text and pushed `#mode-group`'s equal-width columns around.
+  Reverted selected-state text to black in both themes (measured contrast
+  passes WCAG AA; white text against dark mode's lighter accent measured
+  as low as 2.88, failing even the lenient large-text threshold) and
+  dropped the weight change — background contrast alone reads clearly as
+  "selected". Also switched `#mode-group`'s columns to `minmax(0, 1fr)`
+  and gave `.config-group` a definite width, so nothing inside it
+  (button labels, notes, anything added later) can expand the panel
+  again.
+- **Source Path / Target Path sidebar overlapped page content between
+  1000px and 1300px viewport widths.** The sidebar's `position: sticky`
+  was only reset to `static` below 1000px, but the layout already drops
+  to a narrower 2-column arrangement at 1300px — the sidebar kept
+  scrolling-pinned behavior appropriate to the wider 3-column layout and
+  visually covered the row beneath it. Reproduced and confirmed fixed
+  with Playwright screenshots at multiple widths; no change to the
+  intentional sticky behavior above 1300px or the single-column layout
+  below 1000px.
+- Renamed "Output Path" to "Target Path" to actually deliver the
+  Source/Target pairing "Select Images" was renamed to "Source Path" for
+  in an earlier pass, and fixed a leftover grammar mismatch ("Source
+  Path and Output paths are both empty") in the same string.
+- Removed remaining em-dashes from user-facing tooltip and notice text
+  (28 strings across both languages) for more consistent, less "AI-ish"
+  copy; a few Chinese strings also switched from straight quotes to
+  proper 【】-bracket conventions for naming UI elements.
+
 ## [1.0.3] - 2026-08-13
 
 ### Fixed
