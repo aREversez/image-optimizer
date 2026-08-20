@@ -209,6 +209,31 @@ class TestWatchStartStop:
         client.post("/api/watch/stop", headers=auth_headers)
 
 
+        status = client.get("/api/watch/status", headers=auth_headers).json()
+        assert status["running"] is False
+
+    def test_watch_rejects_invalid_output_format(self, client, auth_headers, tmp_path):
+        """The output_format enum check existed at /api/optimize and
+        /api/preview-optimize but was missing entirely from watch mode's
+        validation until it was consolidated into the shared
+        _validate_optimize_settings — this is what that gap looked like."""
+        watch_dir = tmp_path / "watch"
+        watch_dir.mkdir()
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+
+        r = client.post("/api/watch/start", json={
+            "directory": str(watch_dir),
+            "output_dir": str(output_dir),
+            "output_format": "bmp",
+        }, headers=auth_headers)
+        assert r.status_code == 400
+        assert "output_format" in r.json()["error"]
+
+        status = client.get("/api/watch/status", headers=auth_headers).json()
+        assert status["running"] is False
+
+
 class TestWatchSelfLoopPrevention:
     """Reproduces, at the FolderWatcher level, the infinite-reprocessing
     loop that in-place watching (output_dir inside the watched tree) used

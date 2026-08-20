@@ -1077,39 +1077,11 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
     if state.is_running:
         return JSONResponse({"error": "Optimization in progress, please wait"}, status_code=400)
 
-    if data.compression_mode not in ("standard", "lossless", "resize_only", "screenshot"):
-        return JSONResponse({"error": "Invalid compression_mode"}, status_code=400)
-    if data.compression_mode == "screenshot" and data.output_format != "png":
-        return JSONResponse(
-            {"error": "Screenshot mode is PNG-only (it's a tuned pngquant pass, not a general codec setting)"},
-            status_code=400,
-        )
-    if data.quality not in ("high", "medium", "low"):
-        # Previously an unknown quality silently fell back to "medium" deep
-        # inside the optimizer — reject it here like the other enum fields
-        # so a typo'd client request fails loudly instead.
-        return JSONResponse(
-            {"error": f"Invalid quality: {data.quality!r}. Supported: 'high', 'medium', 'low'."},
-            status_code=400,
-        )
-    if data.output_format not in ("png", "webp", "jpg", "avif"):
-        # The pipeline only ever produces real PNG, WebP, JPEG, or AVIF bytes —
-        # accepting anything else here would silently produce a file whose
-        # extension lies about its actual content.
-        return JSONResponse(
-            {"error": f"Unsupported output_format: {data.output_format!r}. Supported: 'png', 'webp', 'jpg', 'avif'."},
-            status_code=400,
-        )
-    if data.compression_mode == "resize_only" and data.max_width <= 0:
-        return JSONResponse(
-            {"error": "Resize Only mode requires Max Width to be set"}, status_code=400
-        )
-    bad_colors = [c for c in data.protected_colors if not HEX_COLOR_RE.match(c.strip())]
-    if bad_colors:
-        return JSONResponse(
-            {"error": f"Invalid color(s) in Protect Colors: {', '.join(bad_colors)}. Use hex format like #2ecc71."},
-            status_code=400,
-        )
+    err = _validate_optimize_settings(
+        data.quality, data.output_format, data.compression_mode, data.max_width, data.protected_colors,
+    )
+    if err:
+        return JSONResponse({"error": err}, status_code=400)
 
     if state.watch_running:
         return JSONResponse({"error": "Watch mode is running, stop it first"}, status_code=400)
@@ -1304,6 +1276,38 @@ OVERRIDEABLE_FIELDS = (
     "quality", "compression_mode", "max_width", "dithering",
     "protected_colors", "keep_exif", "output_format",
 )
+
+
+def _validate_optimize_settings(
+    quality: str, output_format: str, compression_mode: str, max_width: int,
+    protected_colors: list,
+) -> Optional[str]:
+    """The top-level (non-per-file-override) compression settings shared by
+    every entry point that can start a run: /api/optimize, /api/preview-optimize,
+    and watch mode start. Returns an error string on the first problem, or
+    None if everything is valid.
+
+    This used to be ~15 lines duplicated near-verbatim at each of those 3
+    call sites (each with its own copy of the same 5 checks) — one already
+    drifted to a slightly different wording for the same resize_only/
+    max_width rule. Consolidated here so a 4th entry point (CLI mode) gets
+    the same validation for free instead of a 4th slightly-different copy,
+    and so the next new check only needs to be added once.
+    """
+    if compression_mode not in ("standard", "lossless", "resize_only", "screenshot"):
+        return "Invalid compression_mode"
+    if compression_mode == "screenshot" and output_format != "png":
+        return "Screenshot mode is PNG-only (it's a tuned pngquant pass, not a general codec setting)"
+    if quality not in ("high", "medium", "low"):
+        return f"Invalid quality: {quality!r}. Supported: 'high', 'medium', 'low'."
+    if output_format not in ("png", "webp", "jpg", "avif"):
+        return f"Unsupported output_format: {output_format!r}. Supported: 'png', 'webp', 'jpg', 'avif'."
+    if compression_mode == "resize_only" and max_width <= 0:
+        return "Resize Only mode requires Max Width (max_width must be > 0)"
+    bad_colors = [c for c in protected_colors if not HEX_COLOR_RE.match(c.strip())]
+    if bad_colors:
+        return f"Invalid color(s) in Protect Colors: {', '.join(bad_colors)}. Use hex format like #2ecc71."
+    return None
 
 
 def _validate_overrides(
@@ -1933,35 +1937,13 @@ async def preview_optimize(data: PreviewRequest, state: AppState = Depends(get_s
     preview progress doesn't leak into the batch's live log."""
     if optimizer is None:
         return JSONResponse({"error": "Optimizer not initialized"}, status_code=503)
-    # Same enum validation as /api/optimize, so a preview reflects what the
-    # real run would actually accept (a typo'd mode fails here, not silently).
-    if data.compression_mode not in ("standard", "lossless", "resize_only", "screenshot"):
-        return JSONResponse({"error": "Invalid compression_mode"}, status_code=400)
-    if data.compression_mode == "screenshot" and data.output_format != "png":
-        return JSONResponse(
-            {"error": "Screenshot mode is PNG-only (it's a tuned pngquant pass, not a general codec setting)"},
-            status_code=400,
-        )
-    if data.quality not in ("high", "medium", "low"):
-        return JSONResponse(
-            {"error": f"Invalid quality: {data.quality!r}. Supported: 'high', 'medium', 'low'."},
-            status_code=400,
-        )
-    if data.output_format not in ("png", "webp", "jpg", "avif"):
-        return JSONResponse(
-            {"error": f"Unsupported output_format: {data.output_format!r}. Supported: 'png', 'webp', 'jpg', 'avif'."},
-            status_code=400,
-        )
-    if data.compression_mode == "resize_only" and data.max_width <= 0:
-        return JSONResponse(
-            {"error": "Resize Only mode requires Max Width to be set"}, status_code=400
-        )
-    bad_colors = [c for c in data.protected_colors if not HEX_COLOR_RE.match(c.strip())]
-    if bad_colors:
-        return JSONResponse(
-            {"error": f"Invalid color(s) in Protect Colors: {', '.join(bad_colors)}. Use hex format like #2ecc71."},
-            status_code=400,
-        )
+    # Same validation as /api/optimize (now literally the same function), so
+    # a preview reflects what the real run would actually accept.
+    err = _validate_optimize_settings(
+        data.quality, data.output_format, data.compression_mode, data.max_width, data.protected_colors,
+    )
+    if err:
+        return JSONResponse({"error": err}, status_code=400)
 
     file_info = next((f for f in state.files if f.get("id") == data.file_id), None)
     if file_info is None:
@@ -2910,29 +2892,11 @@ async def watch_start(
                 ),
             }, status_code=400)
 
-    if data.compression_mode not in ("standard", "lossless", "resize_only", "screenshot"):
-        return JSONResponse({"error": "Invalid compression_mode"}, status_code=400)
-    if data.compression_mode == "screenshot" and data.output_format != "png":
-        return JSONResponse(
-            {"error": "Screenshot mode is PNG-only (it's a tuned pngquant pass, not a general codec setting)"},
-            status_code=400,
-        )
-    if data.quality not in ("high", "medium", "low"):
-        return JSONResponse({"error": f"Invalid quality: {data.quality!r}"}, status_code=400)
-    if data.compression_mode == "resize_only" and data.max_width <= 0:
-        # Same rule as /api/optimize and per-file overrides (see
-        # _validate_overrides) — Resize Only has nothing to do without a
-        # width, and every other entry point already rejects this
-        # combination. Watch mode lacked this check, so starting a watch
-        # with mode=resize_only and a forgotten/zero max_width would run
-        # indefinitely: every detected file gets "processed" with no
-        # resize applied at all — for AVIF this used to mean a pointless
-        # lossy re-encode for zero size benefit (fixed alongside this),
-        # and for every format it's just wasted CPU with no resize.
-        return JSONResponse(
-            {"error": "Resize Only mode requires Max Width (max_width must be > 0)"},
-            status_code=400,
-        )
+    err = _validate_optimize_settings(
+        data.quality, data.output_format, data.compression_mode, data.max_width, data.protected_colors,
+    )
+    if err:
+        return JSONResponse({"error": err}, status_code=400)
 
     warning = None
     if (data.output_format, data.compression_mode) not in optimizer.available_modes():
