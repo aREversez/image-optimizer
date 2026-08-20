@@ -571,6 +571,46 @@ def _gen_thumbnail(src: Path, dst: Path, max_size: int = 200):
         print(f"[Warning] Thumbnail failed for {src.name}: {e}")
 
 
+# Display label for Pillow's `mode` string on the Compare page. Deliberately
+# a friendly bits-per-pixel summary of the *decoded* representation, not the
+# exact on-disk encoding (e.g. a low-bit-depth palette PNG still decodes to
+# mode "P" here) — precise enough for "did this change color depth" at a
+# glance without parsing each container format's own bit-depth field.
+_MODE_LABELS = {
+    "1": "1-bit",
+    "L": "8-bit grayscale",
+    "LA": "16-bit grayscale+alpha",
+    "P": "8-bit indexed",
+    "PA": "16-bit indexed+alpha",
+    "RGB": "24-bit RGB",
+    "RGBA": "32-bit RGBA",
+    "CMYK": "32-bit CMYK",
+    "YCbCr": "24-bit YCbCr",
+    "I": "32-bit integer",
+    "I;16": "16-bit grayscale",
+    "F": "32-bit float",
+}
+
+
+def _get_image_info(path: Path) -> Optional[dict]:
+    """Width/height/bit-depth for the Compare page. Returns None (not a
+    dict with placeholder values) on any failure to open/decode — e.g. an
+    AVIF file if the installed Pillow build lacks AVIF support — so the
+    caller can render an explicit "unavailable" state instead of a blank or
+    misleading number. Same try/except-and-report shape as _gen_thumbnail
+    above, applied here for the same reason: a read failure must be visible,
+    not silently swallowed into a default.
+    """
+    try:
+        with Image.open(path) as img:
+            w, h = img.size
+            depth = _MODE_LABELS.get(img.mode, img.mode)
+            return {"width": w, "height": h, "depth": depth}
+    except Exception as e:
+        print(f"[Warning] Reading image info failed for {path.name}: {e}")
+        return None
+
+
 # Starlette's FileResponse falls back to Python's `mimetypes` module when
 # no media_type is given, which on Windows reads from the registry rather
 # than a built-in table — .webp (and sometimes others) frequently isn't
@@ -627,6 +667,7 @@ PREVIEW_I18N = {
         "footer_overlay": "Click the image (or press space) to flip between original and compressed",
         "footer_side": "Original (left) vs Compressed (right)",
         "zoom_hint": " (scroll to pan around at actual size)",
+        "info_unavailable": "info unavailable",
     },
     "zh": {
         "not_found": "未找到",
@@ -646,6 +687,7 @@ PREVIEW_I18N = {
         "footer_overlay": "点击图片（或按空格键）切换原图与压缩后效果",
         "footer_side": "原图（左）对比压缩后（右）",
         "zoom_hint": "（可滚动查看实际尺寸下的细节）",
+        "info_unavailable": "信息不可用",
     },
 }
 
@@ -2038,6 +2080,7 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 .panel{flex:1;display:flex;flex-direction:column;overflow:hidden}
 .panel:first-child{border-right:1px solid #ddd}
 .label{padding:8px 16px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#888;background:#fafaf5}
+.label .info{display:block;text-transform:none;letter-spacing:normal;color:#aaa;margin-top:2px;font-size:11px}
 .image-wrap{flex:1;display:flex;align-items:center;justify-content:center;overflow:auto;padding:16px;background:#f0f0eb}
 .image-wrap img{max-width:100%;max-height:100%;object-fit:contain}
 .image-wrap.zoom-100{align-items:flex-start;justify-content:flex-start}
@@ -2073,6 +2116,28 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 
     comp_url = _html.escape(f"/api/result/{ws_name}/{comp_rel}", quote=True) if comp_rel else ""
 
+    # Same resolve-and-prefix-check as /api/result, applied here too even
+    # though comp_rel isn't directly attacker-controlled at this call site
+    # (file_id was already validated against state.results above) — cheap
+    # to keep the guarantee consistent rather than assume it holds because
+    # of how this call site happens to be reached today.
+    orig_path = Path(result["original_path"]) if result.get("original_path") else None
+    orig_info = _get_image_info(orig_path) if orig_path and orig_path.exists() else None
+    comp_info = None
+    if comp_rel and state.workspace:
+        comp_path = (state.workspace / "output" / comp_rel).resolve()
+        comp_base = str((state.workspace / "output").resolve())
+        if str(comp_path) == comp_base or str(comp_path).startswith(comp_base + os.sep):
+            comp_info = _get_image_info(comp_path) if comp_path.exists() else None
+
+    def _fmt_info(info: Optional[dict]) -> str:
+        if not info:
+            return T["info_unavailable"]
+        return f"{info['width']}\u00d7{info['height']} \u00b7 {info['depth']}"
+
+    orig_info_text = _html.escape(_fmt_info(orig_info))
+    comp_info_text = _html.escape(_fmt_info(comp_info))
+
     safe_name = _html.escape(str(result['name']))
     safe_basename = _html.escape(Path(result['name']).name)
     title_prefix = _html.escape(T["title_prefix"])
@@ -2084,9 +2149,13 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
     orig_size = _fmt_size(result['original_size'])
     comp_size = _fmt_size(result['compressed_size'])
     saved_text = _html.escape(T["saved"].format(pct=result.get('savings_percent', 0)))
-    # Static, hardcoded-in-Python strings only (never user/result data) —
-    # safe to embed directly as a JS object literal for the toggle script
-    # below, same trust boundary as the rest of this f-string page.
+    # Everything else here is a static, hardcoded-in-Python string (never
+    # user/result data) safe to embed directly as a JS object literal. The
+    # two info fields are the exception — orig_info_text/comp_info_text are
+    # derived from the actual files (width/height ints plus a label from the
+    # fixed _MODE_LABELS lookup) rather than hardcoded, but json.dumps
+    # escapes them like everything else here, so the trust boundary for
+    # this f-string page is unchanged.
     js_i18n = json.dumps({
         "original": T["original"],
         "compressed": T["compressed"],
@@ -2094,6 +2163,8 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
         "footer_overlay": T["footer_overlay"],
         "footer_side": T["footer_side"],
         "zoom_hint": T["zoom_hint"],
+        "orig_info": orig_info_text,
+        "comp_info": comp_info_text,
     })
     html += f"""
 <div class="bar">
@@ -2110,16 +2181,16 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 </div>
 <div class="container" id="side-view" style="display:none">
   <div class="panel">
-    <div class="label">{_html.escape(T['original_label'].format(size=orig_size))}</div>
+    <div class="label">{_html.escape(T['original_label'].format(size=orig_size))}<span class="info">{orig_info_text}</span></div>
     <div class="image-wrap" id="orig-wrap"><img src="{orig_url}" id="orig-img" alt="original"/></div>
   </div>
   <div class="panel">
-    <div class="label">{_html.escape(T['compressed_label'].format(size=comp_size))}</div>
+    <div class="label">{_html.escape(T['compressed_label'].format(size=comp_size))}<span class="info">{comp_info_text}</span></div>
     <div class="image-wrap" id="comp-wrap"><img src="{comp_url}" id="comp-img" alt="compressed"/></div>
   </div>
 </div>
 <div class="overlay-view" id="overlay-view">
-  <div class="overlay-label" id="overlay-label">{_html.escape(T['compressed'] + T['toggle_suffix'])}</div>
+  <div class="overlay-label" id="overlay-label">{_html.escape(T['compressed'] + T['toggle_suffix'])} \u00b7 {comp_info_text}</div>
   <div class="overlay-wrap" id="overlay-wrap">
     <img src="{orig_url}" class="overlay-img" id="overlay-orig" alt="original" style="display:none"/>
     <img src="{comp_url}" class="overlay-img" id="overlay-comp" alt="compressed"/>
@@ -2182,7 +2253,8 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
     showingOriginal = !showingOriginal;
     orig.style.display = showingOriginal ? 'block' : 'none';
     comp.style.display = showingOriginal ? 'none' : 'block';
-    label.textContent = (showingOriginal ? I18N.original : I18N.compressed) + I18N.toggle_suffix;
+    label.textContent = (showingOriginal ? I18N.original : I18N.compressed) + I18N.toggle_suffix
+      + ' \u00b7 ' + (showingOriginal ? I18N.orig_info : I18N.comp_info);
   }}
   wrap.addEventListener('click', toggleImage);
   document.addEventListener('keydown', function(e){{

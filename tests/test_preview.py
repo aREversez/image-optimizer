@@ -118,3 +118,107 @@ class TestPreviewPageI18n:
         r = get_preview(client, auth_headers, test_images)
         assert r.status_code == 200
         assert "<title>Compare -" in r.text
+
+
+class TestGetImageInfo:
+    """Unit tests for _get_image_info — in particular the failure path
+    (vibe-coding-rules #1: a read failure must return an explicit None the
+    caller can render as "unavailable", never a default/placeholder that
+    looks like real data)."""
+
+    def test_returns_width_height_depth_for_rgb_png(self, app_module, tmp_path):
+        from PIL import Image
+        p = tmp_path / "img.png"
+        Image.new("RGB", (64, 48), (0, 0, 0)).save(p)
+        info = app_module._get_image_info(p)
+        assert info == {"width": 64, "height": 48, "depth": "24-bit RGB"}
+
+    def test_returns_depth_for_rgba_png(self, app_module, tmp_path):
+        from PIL import Image
+        p = tmp_path / "img.png"
+        Image.new("RGBA", (10, 10), (0, 0, 0, 0)).save(p)
+        info = app_module._get_image_info(p)
+        assert info["depth"] == "32-bit RGBA"
+
+    def test_returns_depth_for_palette_png(self, app_module, tmp_path):
+        from PIL import Image
+        p = tmp_path / "img.png"
+        Image.new("P", (10, 10)).save(p)
+        info = app_module._get_image_info(p)
+        assert info["depth"] == "8-bit indexed"
+
+    def test_nonexistent_file_returns_none_not_a_placeholder_dict(self, app_module, tmp_path):
+        info = app_module._get_image_info(tmp_path / "does-not-exist.png")
+        assert info is None
+
+    def test_corrupt_file_returns_none_not_a_placeholder_dict(self, app_module, tmp_path):
+        p = tmp_path / "corrupt.png"
+        p.write_bytes(b"not actually a png")
+        info = app_module._get_image_info(p)
+        assert info is None
+
+
+class TestPreviewPageImageInfo:
+    """The Compare page shows width/height/bit-depth for both images (see
+    _get_image_info) — these tests confirm it actually renders, for both
+    the side-by-side labels and the overlay label's initial and toggled
+    state."""
+
+    def test_side_by_side_labels_show_dimensions_and_depth(self, client, auth_headers, test_images):
+        scanned = scan_and_wait(client, auth_headers, test_images)
+        ws_name = scanned["files"][0]["thumbnail"].split("/")[3]
+        png_file = next(f for f in scanned["files"] if f["name"].endswith(".png"))
+        result = optimize_and_wait(client, auth_headers, file_ids=[png_file["id"]])
+        file_id = result["results"][0]["id"]
+        r = client.get(f"/api/preview/{ws_name}/{file_id}")
+        assert r.status_code == 200
+        # test_images' PNGs are 64x64 RGB; fake pngquant/oxipng copy bytes
+        # through unchanged, so the compressed output is byte-identical.
+        assert "64\u00d764" in r.text
+        assert "24-bit RGB" in r.text
+
+    def test_overlay_label_shows_compressed_image_info_by_default(self, client, auth_headers, test_images):
+        scanned = scan_and_wait(client, auth_headers, test_images)
+        ws_name = scanned["files"][0]["thumbnail"].split("/")[3]
+        png_file = next(f for f in scanned["files"] if f["name"].endswith(".png"))
+        result = optimize_and_wait(client, auth_headers, file_ids=[png_file["id"]])
+        file_id = result["results"][0]["id"]
+        r = client.get(f"/api/preview/{ws_name}/{file_id}")
+        overlay_label = re.search(r'id="overlay-label">([^<]*)</div>', r.text)
+        assert overlay_label, "overlay-label div not found"
+        assert "64\u00d764" in overlay_label.group(1)
+        assert "24-bit RGB" in overlay_label.group(1)
+
+    def test_jpeg_source_dimensions_and_depth_present(self, client, auth_headers, test_images):
+        """photo.jpg in the fixture is 80x80 RGB — a non-PNG source, to
+        confirm this isn't PNG-only (unlike Screenshot mode)."""
+        scanned = scan_and_wait(client, auth_headers, test_images)
+        ws_name = scanned["files"][0]["thumbnail"].split("/")[3]
+        jpg_file = next(f for f in scanned["files"] if f["name"].endswith(".jpg"))
+        result = optimize_and_wait(client, auth_headers, file_ids=[jpg_file["id"]])
+        file_id = result["results"][0]["id"]
+        r = client.get(f"/api/preview/{ws_name}/{file_id}")
+        assert r.status_code == 200
+        assert "80\u00d780" in r.text
+        assert "24-bit RGB" in r.text
+
+    def test_missing_original_file_shows_unavailable_not_blank(self, client, auth_headers, test_images):
+        """If the source file is gone by the time Compare is opened (moved/
+        deleted after the batch ran), the page must say so explicitly
+        rather than silently showing nothing or a wrong number."""
+        scanned = scan_and_wait(client, auth_headers, test_images)
+        ws_name = scanned["files"][0]["thumbnail"].split("/")[3]
+        # Explicit file_ids, not a full-directory optimize_and_wait(): the
+        # worker pool processes files concurrently, so results[0] isn't
+        # guaranteed to be the PNG whose original this test deletes below —
+        # it could just as easily land on photo.jpg, whose original is
+        # untouched, making "info unavailable" not appear and the test flake
+        # depending on completion order. Pin down which file this is.
+        png_file = next(f for f in scanned["files"] if f["name"].endswith(".png"))
+        result = optimize_and_wait(client, auth_headers, file_ids=[png_file["id"]])
+        file_id = result["results"][0]["id"]
+        for img in test_images.rglob("*.png"):
+            img.unlink()
+        r = client.get(f"/api/preview/{ws_name}/{file_id}")
+        assert r.status_code == 200
+        assert "info unavailable" in r.text
