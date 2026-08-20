@@ -641,6 +641,13 @@ header h1 span { color: var(--accent); }
     <div class="card-title" data-i18n="config.title">Settings</div>
     <div id="settings-tip" style="font-size:12px;color:var(--text2);margin-bottom:12px" data-i18n="config.settingsTip">Settings are saved automatically.</div>
     <button class="btn btn-secondary btn-sm" id="screenshot-preset-btn" style="padding:4px 12px;font-size:12px;margin-bottom:12px" data-i18n-title="config.screenshotPresetTitle" title="Sets Quality: High, Max Width: 1920px, Mode: Standard, Dithering: Off. A starting point for compressing software screenshots." data-i18n="config.screenshotPreset">Screenshot preset</button>
+    <div style="display:flex;gap:6px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+      <select id="custom-preset-select" style="font-size:12px;padding:4px 8px;max-width:180px">
+        <option value="" data-i18n="config.presetsPlaceholder">Custom presets...</option>
+      </select>
+      <button class="btn btn-secondary btn-sm" id="save-preset-btn" style="padding:4px 10px;font-size:12px" data-i18n-title="config.savePresetTitle" title="Save the current Quality/Max Width/Format/Mode/Dithering/Protect Colors/Keep EXIF settings as a named preset." data-i18n="config.savePreset">Save preset</button>
+      <button class="btn btn-secondary btn-sm" id="delete-preset-btn" style="padding:4px 10px;font-size:12px;display:none" data-i18n="config.deletePreset">Delete</button>
+    </div>
     <div id="watch-lock-notice" style="display:none;font-size:12px;color:var(--yellow);background:rgba(230,180,60,0.1);border:1px solid rgba(230,180,60,0.3);border-radius:6px;padding:8px 10px;margin-bottom:12px" data-i18n="config.watchLockNotice">
       Locked while Watch Mode is running. It captured these settings when you clicked "Start Watching" and won't pick up changes. Stop Watch Mode to change them, then start again.
     </div>
@@ -911,6 +918,14 @@ const I18N = {
     'config.settingsTip': 'Settings are saved automatically.',
     'config.screenshotPreset': 'Screenshot preset',
     'config.screenshotPresetTitle': 'Sets Quality: High, Max Width: 1920px, Mode: Standard, Dithering: Off. A starting point for compressing software screenshots.',
+    'config.presetsPlaceholder': 'Custom presets...',
+    'config.savePreset': 'Save preset',
+    'config.savePresetTitle': 'Save the current Quality/Max Width/Format/Mode/Dithering/Protect Colors/Keep EXIF settings as a named preset.',
+    'config.deletePreset': 'Delete',
+    'config.presetNamePrompt': 'Preset name:',
+    'config.presetNameEmpty': 'Preset name cannot be empty.',
+    'config.presetOverwriteConfirm': 'A preset named "{name}" already exists. Overwrite it?',
+    'config.presetDeleteConfirm': 'Delete preset "{name}"?',
     'config.quality': 'Quality',
     'config.qualityTitle': 'Controls how much color detail Standard mode is allowed to sacrifice for size. For UI screenshots with text, High usually costs little extra size since screenshots rarely use many colors to begin with.',
     'config.qualityHigh': 'High',
@@ -1076,6 +1091,14 @@ const I18N = {
     'config.settingsTip': '设置将自动保存。',
     'config.screenshotPreset': '软件截图预设',
     'config.screenshotPresetTitle': '一键设置 Quality: High、Max Width: 1920px、Mode: Standard、Dithering: Off，适合压缩软件截图的起点。',
+    'config.presetsPlaceholder': '自定义预设...',
+    'config.savePreset': '保存预设',
+    'config.savePresetTitle': '将当前的 Quality/Max Width/Format/Mode/Dithering/Protect Colors/Keep EXIF 设置保存为一个命名预设。',
+    'config.deletePreset': '删除',
+    'config.presetNamePrompt': '预设名称：',
+    'config.presetNameEmpty': '预设名称不能为空。',
+    'config.presetOverwriteConfirm': '已存在名为“{name}”的预设，是否覆盖？',
+    'config.presetDeleteConfirm': '删除预设“{name}”？',
     'config.quality': '质量',
     'config.qualityTitle': '控制 Standard 模式允许牺牲多少色彩细节来换取体积。对于带文字的 UI 截图，选择 High 通常不会增加太多体积，因为截图本身颜色数就不多。',
     'config.qualityHigh': '高',
@@ -1203,6 +1226,12 @@ function applyStoredLang() {
   if (typeof renderResultGrid === 'function' && STATE.results.length) renderResultGrid();
   if (typeof updateModeDependentControls === 'function') updateModeDependentControls();
   if (typeof updateStartButtonState === 'function') updateStartButtonState();
+  // The preset dropdown's placeholder <option> is built via innerHTML, not
+  // a static [data-i18n] element, so it's outside applyI18n()'s sweep above
+  // and needs its own refresh here.
+  if (typeof renderPresetDropdown === 'function' && $('custom-preset-select')) {
+    renderPresetDropdown($('custom-preset-select').value);
+  }
 }
 
 // Wraps fetch() to attach the per-session app token (see APP_TOKEN in the
@@ -1401,6 +1430,103 @@ function applyScreenshotPreset() {
   }
 }
 $('screenshot-preset-btn').addEventListener('click', applyScreenshotPreset);
+
+// Custom presets: user-named snapshots of the "compression recipe" fields
+// (quality/maxWidth/format/mode/dithering/protectColors/keepExif) —
+// deliberately NOT recursive/skipExisting, which are properties of how a
+// given batch run is scoped, not of the image-processing recipe itself, so
+// applying a preset shouldn't unexpectedly flip those on/off underneath the
+// current run. Stored as one object under 'imgopt.presets', same
+// try/except-and-fall-back-to-empty shape as loadConfig/saveConfig above —
+// corrupt/unavailable storage degrades to "no presets" rather than breaking
+// the page.
+const PRESET_FIELDS = ['quality', 'maxWidth', 'format', 'mode', 'dithering', 'protectColors', 'keepExif'];
+
+function getSavedPresets() {
+  try {
+    const raw = JSON.parse(localStorage.getItem('imgopt.presets') || 'null');
+    return (raw && typeof raw === 'object') ? raw : {};
+  } catch (e) { return {}; }
+}
+function setSavedPresets(presets) {
+  try { localStorage.setItem('imgopt.presets', JSON.stringify(presets)); }
+  catch (e) { /* storage unavailable/full — non-critical, same as saveConfig */ }
+}
+function captureCurrentSettingsForPreset() {
+  return {
+    quality: (document.querySelector('input[name="quality"]:checked') || {}).value,
+    maxWidth: $('max-width').value,
+    format: (document.querySelector('input[name="format"]:checked') || {}).value,
+    mode: (document.querySelector('input[name="mode"]:checked') || {}).value,
+    dithering: ditheringInput.checked,
+    protectColors: protectColorsInput.value,
+    keepExif: $('keep-exif').checked,
+  };
+}
+function applyPresetValues(preset) {
+  const setRadio = (name, val) => {
+    if (val == null) return;
+    const el = document.querySelector(`input[name="${name}"][value="${val}"]`);
+    if (el && !el.disabled) { el.checked = true; el.dispatchEvent(new Event('change', { bubbles: true })); }
+  };
+  setRadio('quality', preset.quality);
+  setRadio('format', preset.format);
+  setRadio('mode', preset.mode);
+  if (preset.maxWidth != null && !$('max-width').disabled
+      && $('max-width').querySelector(`option[value="${preset.maxWidth}"]`)) {
+    $('max-width').value = preset.maxWidth;
+    $('max-width').dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  if (typeof preset.dithering === 'boolean' && !ditheringInput.disabled) {
+    ditheringInput.checked = preset.dithering;
+    ditheringInput.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  if (typeof preset.protectColors === 'string' && !protectColorsInput.disabled) {
+    protectColorsInput.value = preset.protectColors;
+    protectColorsInput.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  if (typeof preset.keepExif === 'boolean' && !$('keep-exif').disabled) {
+    $('keep-exif').checked = preset.keepExif;
+    $('keep-exif').dispatchEvent(new Event('change', { bubbles: true }));
+  }
+}
+function renderPresetDropdown(selectName) {
+  const presets = getSavedPresets();
+  const select = $('custom-preset-select');
+  const names = Object.keys(presets).sort((a, b) => a.localeCompare(b));
+  select.innerHTML = `<option value="">${t('config.presetsPlaceholder')}</option>`
+    + names.map(n => `<option value="${n.replace(/"/g, '&quot;')}">${n}</option>`).join('');
+  select.value = (selectName && names.includes(selectName)) ? selectName : '';
+  $('delete-preset-btn').style.display = select.value ? '' : 'none';
+}
+$('custom-preset-select').addEventListener('change', () => {
+  const name = $('custom-preset-select').value;
+  $('delete-preset-btn').style.display = name ? '' : 'none';
+  if (!name) return;
+  const presets = getSavedPresets();
+  if (presets[name]) applyPresetValues(presets[name]);
+});
+$('save-preset-btn').addEventListener('click', () => {
+  let name = window.prompt(t('config.presetNamePrompt'), $('custom-preset-select').value || '');
+  if (name == null) return; // cancelled
+  name = name.trim().slice(0, 60);
+  if (!name) { window.alert(t('config.presetNameEmpty')); return; }
+  const presets = getSavedPresets();
+  if (presets[name] && !window.confirm(t('config.presetOverwriteConfirm', { name }))) return;
+  presets[name] = captureCurrentSettingsForPreset();
+  setSavedPresets(presets);
+  renderPresetDropdown(name);
+});
+$('delete-preset-btn').addEventListener('click', () => {
+  const name = $('custom-preset-select').value;
+  if (!name) return;
+  if (!window.confirm(t('config.presetDeleteConfirm', { name }))) return;
+  const presets = getSavedPresets();
+  delete presets[name];
+  setSavedPresets(presets);
+  renderPresetDropdown();
+});
+renderPresetDropdown();
 
 // Save on any config change. updateModeDependentControls (bound separately
 // for format/mode) also recomputes disabled states; saveConfig is additive.
@@ -2544,7 +2670,7 @@ function applyWatchLock(locked) {
     ...document.querySelectorAll('input[name="format"]'),
     ...document.querySelectorAll('input[name="mode"]'),
     $('max-width'), $('protect-colors'), $('dithering'), $('keep-exif'),
-    $('screenshot-preset-btn'),
+    $('screenshot-preset-btn'), $('custom-preset-select'), $('save-preset-btn'), $('delete-preset-btn'),
   ];
   if (locked) {
     inputs.forEach(el => { el.disabled = true; });
