@@ -195,6 +195,17 @@ header h1 span { color: var(--accent); }
   min-width: 140px;
 }
 .config-group select:focus, .config-group input:focus { border-color: var(--accent); }
+/* Same visual language as .config-group select (border/background/color
+   all theme-aware) but scaled down for the compact preset-controls row it
+   lives in, which isn't itself a .config-group. Without this it fell back
+   to the browser's unstyled native <select> appearance — stark white in
+   dark mode, and visually inconsistent with every other control either way. */
+.custom-preset-select {
+  padding: 4px 8px; background: var(--bg); border: 1px solid var(--border);
+  border-radius: var(--radius); color: var(--text); font-size: 12px; outline: none;
+  max-width: 180px;
+}
+.custom-preset-select:focus { border-color: var(--accent); }
 .config-group input[type="text"] {
   padding: 8px 12px; background: var(--bg); border: 1px solid var(--border);
   border-radius: var(--radius); color: var(--text); font-size: 14px; outline: none;
@@ -498,6 +509,25 @@ header h1 span { color: var(--accent); }
   </div>
 </div>
 
+<!-- Themed prompt/confirm/alert modal — replaces window.prompt/confirm/alert,
+     which render as an unstyled native browser dialog ("127.0.0.1:8090
+     says") that doesn't match the app's look. Reuses the exact same
+     .settings-overlay/.settings-panel classes as the Settings modal above
+     for visual consistency, rather than a one-off style. -->
+<div class="settings-overlay" id="app-dialog-overlay">
+  <div class="settings-panel" style="width:340px">
+    <h2><span id="app-dialog-title"></span></h2>
+    <div class="settings-field" id="app-dialog-input-field" style="display:none">
+      <input type="text" id="app-dialog-input">
+    </div>
+    <div id="app-dialog-message" style="font-size:13px;color:var(--text);margin-bottom:4px;display:none"></div>
+    <div class="settings-actions">
+      <button class="btn" id="app-dialog-cancel" style="background:var(--surface2)" data-i18n="dialog.cancel">Cancel</button>
+      <button class="btn" id="app-dialog-ok" style="background:var(--accent);color:#fff" data-i18n="dialog.ok">OK</button>
+    </div>
+  </div>
+</div>
+
 <div id="notice-container"></div>
 
 <!-- Batch resume banner -->
@@ -642,7 +672,7 @@ header h1 span { color: var(--accent); }
     <div id="settings-tip" style="font-size:12px;color:var(--text2);margin-bottom:12px" data-i18n="config.settingsTip">Settings are saved automatically.</div>
     <button class="btn btn-secondary btn-sm" id="screenshot-preset-btn" style="padding:4px 12px;font-size:12px;margin-bottom:12px" data-i18n-title="config.screenshotPresetTitle" title="Sets Quality: High, Max Width: 1920px, Mode: Standard, Dithering: Off. A starting point for compressing software screenshots." data-i18n="config.screenshotPreset">Screenshot preset</button>
     <div style="display:flex;gap:6px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
-      <select id="custom-preset-select" style="font-size:12px;padding:4px 8px;max-width:180px">
+      <select id="custom-preset-select" class="custom-preset-select">
         <option value="" data-i18n="config.presetsPlaceholder">Custom presets...</option>
       </select>
       <button class="btn btn-secondary btn-sm" id="save-preset-btn" style="padding:4px 10px;font-size:12px" data-i18n-title="config.savePresetTitle" title="Save the current Quality/Max Width/Format/Mode/Dithering/Protect Colors/Keep EXIF settings as a named preset." data-i18n="config.savePreset">Save preset</button>
@@ -832,6 +862,8 @@ const I18N = {
     'settings.cleanupDelay': 'Workspace Cleanup Delay (seconds)',
     'settings.idleTimeout': 'Session Idle Timeout (hours)',
     'settings.cancel': 'Cancel',
+    'dialog.ok': 'OK',
+    'dialog.cancel': 'Cancel',
     'settings.save': 'Save',
     'settings.saved': 'Settings saved.',
     'settings.savedRestartNote': ' Some changes require a restart to take effect.',
@@ -1005,6 +1037,8 @@ const I18N = {
     'settings.cleanupDelay': '工作区清理延迟（秒）',
     'settings.idleTimeout': '会话空闲超时（小时）',
     'settings.cancel': '取消',
+    'dialog.ok': '确定',
+    'dialog.cancel': '取消',
     'settings.save': '保存',
     'settings.saved': '设置已保存。',
     'settings.savedRestartNote': '部分改动需要重启后才能生效。',
@@ -1506,21 +1540,71 @@ $('custom-preset-select').addEventListener('change', () => {
   const presets = getSavedPresets();
   if (presets[name]) applyPresetValues(presets[name]);
 });
-$('save-preset-btn').addEventListener('click', () => {
-  let name = window.prompt(t('config.presetNamePrompt'), $('custom-preset-select').value || '');
+// Themed replacement for window.prompt/confirm/alert (see the
+// #app-dialog-overlay markup above) — same Promise-based call shape so the
+// call sites below just gain an `await`, nothing else changes structurally.
+function showAppDialog({ title, message, showInput, inputValue, okOnly }) {
+  return new Promise(resolve => {
+    const overlay = $('app-dialog-overlay');
+    const inputField = $('app-dialog-input-field');
+    const messageEl = $('app-dialog-message');
+    const inputEl = $('app-dialog-input');
+    const okBtn = $('app-dialog-ok');
+    const cancelBtn = $('app-dialog-cancel');
+
+    $('app-dialog-title').textContent = title || '';
+    if (message) { messageEl.textContent = message; messageEl.style.display = ''; }
+    else { messageEl.style.display = 'none'; }
+    if (showInput) { inputField.style.display = ''; inputEl.value = inputValue || ''; }
+    else { inputField.style.display = 'none'; }
+    cancelBtn.style.display = okOnly ? 'none' : '';
+
+    overlay.classList.add('open');
+    if (showInput) { inputEl.focus(); inputEl.select(); }
+
+    function cleanup(result) {
+      overlay.classList.remove('open');
+      okBtn.removeEventListener('click', onOk);
+      cancelBtn.removeEventListener('click', onCancel);
+      inputEl.removeEventListener('keydown', onKeydown);
+      resolve(result);
+    }
+    function onOk() { cleanup(showInput ? inputEl.value : true); }
+    function onCancel() { cleanup(showInput ? null : false); }
+    function onKeydown(e) {
+      if (e.key === 'Enter') onOk();
+      else if (e.key === 'Escape') onCancel();
+    }
+    okBtn.addEventListener('click', onOk);
+    cancelBtn.addEventListener('click', onCancel);
+    if (showInput) inputEl.addEventListener('keydown', onKeydown);
+  });
+}
+function appPrompt(title, defaultValue) {
+  return showAppDialog({ title, showInput: true, inputValue: defaultValue });
+}
+function appConfirm(title, message) {
+  return showAppDialog({ title, message, showInput: false });
+}
+function appAlert(title, message) {
+  return showAppDialog({ title, message, showInput: false, okOnly: true });
+}
+
+$('save-preset-btn').addEventListener('click', async () => {
+  let name = await appPrompt(t('config.presetNamePrompt'), $('custom-preset-select').value || '');
   if (name == null) return; // cancelled
   name = name.trim().slice(0, 60);
-  if (!name) { window.alert(t('config.presetNameEmpty')); return; }
+  if (!name) { await appAlert(t('config.presetNameEmpty')); return; }
   const presets = getSavedPresets();
-  if (presets[name] && !window.confirm(t('config.presetOverwriteConfirm', { name }))) return;
+  if (presets[name] && !(await appConfirm(t('config.presetOverwriteConfirm', { name })))) return;
   presets[name] = captureCurrentSettingsForPreset();
   setSavedPresets(presets);
   renderPresetDropdown(name);
 });
-$('delete-preset-btn').addEventListener('click', () => {
+$('delete-preset-btn').addEventListener('click', async () => {
   const name = $('custom-preset-select').value;
   if (!name) return;
-  if (!window.confirm(t('config.presetDeleteConfirm', { name }))) return;
+  if (!(await appConfirm(t('config.presetDeleteConfirm', { name })))) return;
   const presets = getSavedPresets();
   delete presets[name];
   setSavedPresets(presets);
