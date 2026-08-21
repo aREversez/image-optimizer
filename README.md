@@ -41,6 +41,7 @@ compression of UI/software screenshots.
 - **In-app settings** — gear icon opens a settings panel (host, port, workers, timeouts, language) persisted to `config.json`
 - **Session state restoration** — page refresh restores files/results and re-attaches to a still-running batch
 - **Auto-detect binaries** — finds `pngquant`/`oxipng`/`cjpeg`/`avifenc` in `bin/` folder or system PATH
+- **CLI mode** — `--source`/`--output` runs a batch headlessly (no browser, no server) and exits with a process exit code, for scripts and CI; shares the exact same compression pipeline and settings validation as the web UI
 - **Cross-platform** — Windows, macOS, Linux (pre-built exe for Windows; macOS/Linux users need `pngquant`/`oxipng`/`cjpeg`/`avifenc` on PATH)
 
 ## Quick Start
@@ -74,6 +75,47 @@ The first run will auto-detect `pngquant` and `oxipng` in the `bin/` folder and 
 
 Alternatively, set up **Watch Mode** (sidebar card) to auto-compress new images dropped into a folder, and use *Resume* on page load if a previous batch was interrupted.
 
+## CLI Mode
+
+For scripting, batch jobs, or anything that shouldn't need a browser: pass
+`--source` and the app runs headlessly (no web server, no browser) and
+exits with a process exit code (`0` if everything succeeded, `1` if
+anything failed — safe to check in a script or CI step).
+
+```
+python -m app --source "D:\screenshots" --output "D:\screenshots-compressed"
+```
+
+```
+python -m app --source ./raw --output ./compressed --quality high --max-width 1920 --mode standard --no-dithering
+```
+
+CLI mode runs every image through the exact same compression pipeline and
+settings validation as the web UI and Watch Mode — no separate "CLI
+version" of the logic to drift out of sync, so the same `--quality`/
+`--mode`/etc. combination produces the same result either way.
+
+- `--source` — directory to compress (required to trigger CLI mode)
+- `--output` — output directory (required with `--source`)
+- `--quality {high,medium,low}` — Standard/Screenshot mode color-quality floor (default `medium`)
+- `--format {png,jpg,webp,avif}` — output format (default `png`)
+- `--mode {standard,lossless,resize_only,screenshot}` — compression mode (default `standard`; `screenshot` is PNG-only)
+- `--max-width <int>` — resize so the longest side is at most this many pixels (default `0` = no resize; required `> 0` with `--mode resize_only`)
+- `--dithering` / `--no-dithering` — dithering for Standard-mode PNG quantization (default enabled)
+- `--protect-colors "#2ecc71,#ff0000"` — hex colors to prioritize keeping exact in Standard mode's palette
+- `--keep-exif` — keep a curated subset of EXIF (camera make/model, date, exposure); GPS and orientation are always stripped regardless (default: strip all EXIF)
+- `--recursive` / `--no-recursive` — scan subfolders too (default `--recursive`; shared with `--dir`, see Configuration below)
+- `--workers` — concurrent compression workers (shared with the web server's `--workers`, see Configuration below)
+
+Output mirrors the source folder's directory structure. Name collisions
+after a format conversion (e.g. `photo.png` and `photo.jpg` both becoming
+`photo.png`) get a numbered suffix (`photo_2.png`) rather than silently
+overwriting one another.
+
+Not yet supported in CLI mode: `--skip-existing`'s settings-aware caching
+(every CLI run recompresses everything under `--source`) and per-file
+overrides (every file in the batch gets the same settings).
+
 ## Configuration
 
 Command-line flags:
@@ -90,10 +132,10 @@ python -m app --host 127.0.0.1 --port 8090 --workers 4 --dir "D:\screenshots"
 - `--thumbnail-workers` — how many images to thumbnail concurrently during a
   scan (default `4`). Independent from `--workers`, so a scan's I/O-bound
   thumbnailing can be tuned separately from CPU-bound compression.
-- `--dir` — auto-scan this folder on startup
-- `--recursive` / `--no-recursive` — when used with `--dir`, whether to
-  scan subfolders too (default `--recursive`, the historical behavior).
-  Pass `--no-recursive` to scan only the top level.
+- `--dir` — auto-scan this folder on startup (opens the web UI with results pre-loaded)
+- `--recursive` / `--no-recursive` — when used with `--dir` or `--source`,
+  whether to scan subfolders too (default `--recursive`, the historical
+  behavior). Pass `--no-recursive` to scan only the top level.
 
 For settings you don't want to type every time, either use the **in-app
 settings panel** (gear icon in the header — changes persist to

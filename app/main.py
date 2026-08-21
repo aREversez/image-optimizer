@@ -1359,6 +1359,44 @@ def _validate_overrides(
     return None
 
 
+def _resolve_collision_free_output_paths(
+    items: list[tuple[str, str, str]], output_dir: Path,
+) -> dict[str, Optional[Path]]:
+    """Pre-assign an output path per item so name collisions are resolved
+    deterministically: "photo.png" and "photo.jpg" both map to "photo.png"
+    after the suffix swap and would silently overwrite each other if
+    processed concurrently (last one to finish wins, both reported as
+    successes). First occurrence keeps the plain name; later collisions get
+    a numbered stem ("photo_2.png"). Keys are case-folded because Windows/
+    macOS filesystems collide case-insensitively.
+
+    `items` is a list of (id, relative_name, effective_output_format)
+    tuples — deliberately a plain tuple, not the web batch handler's
+    file_info/overrides dict shape, so this same function is usable by any
+    caller (web batch, CLI) without adapting to that shape first.
+
+    A None value in the returned dict marks a name whose resolved path
+    escapes output_dir (should be impossible after the caller's own
+    sanitization — this is defense in depth, not the primary check) and
+    must be turned into a per-item failure by the caller.
+    """
+    base_resolved = str(output_dir.resolve())
+    out_paths: dict[str, Optional[Path]] = {}
+    used_names: set[str] = set()
+    for item_id, name, eff_fmt in items:
+        base = (output_dir / name).with_suffix(f".{eff_fmt}")
+        candidate = base
+        n = 2
+        while str(candidate).lower() in used_names:
+            candidate = base.with_name(f"{base.stem}_{n}{base.suffix}")
+            n += 1
+        used_names.add(str(candidate).lower())
+        resolved = str(candidate.resolve())
+        inside = resolved == base_resolved or resolved.startswith(base_resolved + os.sep)
+        out_paths[item_id] = candidate if inside else None
+    return out_paths
+
+
 async def _process_files(
     state: AppState,
     files: list,
@@ -1439,34 +1477,16 @@ async def _process_files(
         await _async_rmtree(opt_output_dir)
     opt_output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Pre-assign every file's output path so name collisions are resolved
-    # deterministically: "photo.png" and "photo.jpg" both map to
-    # "photo.png" after the suffix swap and would silently overwrite each
-    # other mid-batch (last worker to finish wins, both reported as
-    # successes). First occurrence keeps the plain name; later collisions
-    # get a numbered stem ("photo_2.png"). Keys are case-folded because
-    # Windows/macOS filesystems collide case-insensitively. A None entry
-    # marks a name whose resolved path escapes the output dir (should be
-    # impossible after upload-side sanitization — defense in depth) and is
-    # turned into a per-file failure inside process_one.
-    base_resolved = str(opt_output_dir.resolve())
-    out_paths: dict[str, Optional[Path]] = {}
-    used_names: set[str] = set()
-    for file_info in files:
-        # A per-file output_format override changes this file's suffix (and
-        # thus its output path / collision slot). Different suffixes don't
-        # collide ("photo.png" vs "photo.webp"), which is correct.
-        eff_fmt = overrides.get(file_info["id"], {}).get("output_format", output_format)
-        base = (opt_output_dir / file_info["name"]).with_suffix(f".{eff_fmt}")
-        candidate = base
-        n = 2
-        while str(candidate).lower() in used_names:
-            candidate = base.with_name(f"{base.stem}_{n}{base.suffix}")
-            n += 1
-        used_names.add(str(candidate).lower())
-        resolved = str(candidate.resolve())
-        inside = resolved == base_resolved or resolved.startswith(base_resolved + os.sep)
-        out_paths[file_info["id"]] = candidate if inside else None
+    # A per-file output_format override changes that file's suffix (and thus
+    # its collision slot) — see _resolve_collision_free_output_paths for the
+    # actual algorithm this now shares with CLI mode.
+    out_paths = _resolve_collision_free_output_paths(
+        [
+            (f["id"], f["name"], overrides.get(f["id"], {}).get("output_format", output_format))
+            for f in files
+        ],
+        opt_output_dir,
+    )
 
     async def log(msg):
         state.logs.append(f"  {msg}")
@@ -3010,9 +3030,119 @@ async def watch_events(request: Request, state: AppState = Depends(get_session))
     )
 
 
+async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> int:
+    """Headless batch run: no web server, no browser. Scans --source, runs
+    every image through the exact same optimizer.optimize_png pipeline the
+    web UI and Watch Mode use (so a CLI run behaves identically to a batch
+    run started from the browser with the same settings — no separate
+    "CLI version" of the compression logic to drift out of sync), and exits
+    with a process exit code (0 if everything succeeded, 1 if anything
+    failed) so this composes into scripts/CI.
+
+    Deliberately does not implement --skip-existing: that feature depends
+    on the per-output-dir settings-fingerprint file the web/watch paths
+    already maintain (see skip_existing in _process_files), and wiring a
+    CLI run into that same fingerprint store is future work, not something
+    silently half-supported here. Every CLI run recompresses everything
+    in --source.
+    """
+    source = Path(args.source).resolve()
+    if not source.exists() or not source.is_dir():
+        print(f"[Error] --source is not a directory: {source}", file=sys.stderr)
+        return 1
+    if not args.output:
+        print("[Error] --output is required when using --source", file=sys.stderr)
+        return 1
+    output_dir = Path(args.output).resolve()
+
+    protected_colors = (
+        [c.strip() for c in args.protect_colors.split(",") if c.strip()]
+        if args.protect_colors else []
+    )
+    err = _validate_optimize_settings(
+        args.quality, args.format, args.mode, args.max_width, protected_colors,
+    )
+    if err:
+        print(f"[Error] {err}", file=sys.stderr)
+        return 1
+
+    images = _scan_images(source, recursive=args.recursive)
+    if not images:
+        print(f"[CLI] No supported images found in {source}")
+        return 0
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    items = [(str(i), str(p.relative_to(source)), args.format) for i, p in enumerate(images)]
+    out_paths = _resolve_collision_free_output_paths(items, output_dir)
+
+    global optimizer
+    optimizer = optimizer_instance or Optimizer(max_concurrency=CONCURRENT_WORKERS)
+    if not optimizer.pngquant_path and not optimizer.oxipng_path and args.format == "png":
+        print(
+            "[Warning] Neither pngquant nor oxipng found in bin/ — PNG results will be much "
+            "weaker than normal (falls back toward Pillow-only handling). Compression will "
+            "still run and nothing will be corrupted, but expect far smaller size savings."
+        )
+
+    total = len(images)
+    counters = {"done": 0, "ok": 0, "failed": 0, "orig": 0, "comp": 0}
+    lock = asyncio.Lock()
+    # No manual semaphore here — Optimizer already bounds concurrent work
+    # internally via its own max_concurrency, so every image is dispatched
+    # via asyncio.gather() and the Optimizer instance does the throttling.
+
+    async def process(idx: int, img_path: Path):
+        item_id = str(idx)
+        rel = str(img_path.relative_to(source))
+        out_path = out_paths[item_id]
+        if out_path is None:
+            async with lock:
+                counters["done"] += 1
+                counters["failed"] += 1
+                d = counters["done"]
+            print(f"[{d}/{total}] FAIL {rel}: resolved output path escapes --output directory")
+            return
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        result = await optimizer.optimize_png(
+            img_path, out_path,
+            quality=args.quality, max_width=args.max_width, compression_mode=args.mode,
+            protected_colors=protected_colors, dithering=args.dithering,
+            output_format=args.format, keep_exif=args.keep_exif,
+        )
+        async with lock:
+            counters["done"] += 1
+            d = counters["done"]
+            if result["success"]:
+                counters["ok"] += 1
+                counters["orig"] += result["original_size"]
+                counters["comp"] += result["compressed_size"]
+                pct = (
+                    round((1 - result["compressed_size"] / result["original_size"]) * 100, 1)
+                    if result["original_size"] > 0 else 0
+                )
+                print(
+                    f"[{d}/{total}] OK   {rel} -> {out_path.name}  "
+                    f"{_fmt_size(result['original_size'])} -> {_fmt_size(result['compressed_size'])} "
+                    f"({pct}% saved)"
+                )
+            else:
+                counters["failed"] += 1
+                print(f"[{d}/{total}] FAIL {rel}: {result.get('error') or 'unknown error'}")
+
+    await asyncio.gather(*(process(i, p) for i, p in enumerate(images)))
+
+    print()
+    print(f"Done: {counters['ok']} succeeded, {counters['failed']} failed, {total} total")
+    if counters["orig"] > 0:
+        saved_pct = round((1 - counters["comp"] / counters["orig"]) * 100, 1)
+        print(f"Total: {_fmt_size(counters['orig'])} -> {_fmt_size(counters['comp'])} ({saved_pct}% saved)")
+    return 1 if counters["failed"] > 0 else 0
+
+
 def main():
     import argparse
 
+    global CONCURRENT_WORKERS, THUMBNAIL_WORKERS, WORKSPACE_CLEANUP_DELAY, SESSION_IDLE_TIMEOUT
     config = _load_app_config()
 
     parser = argparse.ArgumentParser(description="Image Optimizer Web UI")
@@ -3055,22 +3185,67 @@ def main():
              f"Independent from --workers so a scan's I/O-bound thumbnailing can be tuned "
              f"separately from CPU-bound compression.",
     )
-    parser.add_argument("--dir", help="Directory to auto-scan on startup")
+    parser.add_argument("--dir", help="Directory to auto-scan on startup (opens the web UI with results pre-loaded)")
     # Defaults to True to match the historical CLI behavior — the UI checkbox
     # defaults to False, but `--dir` has always scanned recursively since the
     # feature shipped. --no-recursive lets an operator override that (e.g. a
     # folder with thousands of files nested under deep subfolder trees where
     # only the top-level files are wanted) without breaking existing
-    # invocations that never passed this flag at all.
+    # invocations that never passed this flag at all. Also used by --source
+    # (CLI mode) below — same meaning, one flag either way.
     parser.add_argument(
         "--recursive", action=argparse.BooleanOptionalAction, default=True,
-        help="When used with --dir, scan subfolders too (default True, the "
-             "historical behavior; pass --no-recursive to scan only the top "
-             "level).",
+        help="When used with --dir or --source, scan subfolders too (default True, the "
+             "historical behavior; pass --no-recursive to scan only the top level).",
+    )
+
+    # --- CLI mode: presence of --source means "run headlessly and exit",
+    # skipping the web server entirely. Everything below is only read when
+    # --source is given; see _run_cli.
+    cli_group = parser.add_argument_group("CLI mode (no web server; runs a batch and exits)")
+    cli_group.add_argument(
+        "--source", help="Run headlessly instead of starting the web server: compress every "
+                          "supported image under this directory and exit. Requires --output.",
+    )
+    cli_group.add_argument("--output", help="Output directory for --source (required with --source).")
+    cli_group.add_argument(
+        "--quality", choices=["high", "medium", "low"], default="medium",
+        help="Standard/Screenshot mode color-quality floor (default medium).",
+    )
+    cli_group.add_argument(
+        "--format", choices=["png", "jpg", "webp", "avif"], default="png",
+        help="Output format (default png).",
+    )
+    cli_group.add_argument(
+        "--mode", choices=["standard", "lossless", "resize_only", "screenshot"], default="standard",
+        help="Compression mode (default standard). screenshot is PNG-only.",
+    )
+    cli_group.add_argument(
+        "--max-width", type=int, default=0,
+        help="Resize so the longest side is at most this many pixels (default 0 = no resize). "
+             "Required (> 0) when --mode resize_only.",
+    )
+    cli_group.add_argument(
+        "--dithering", action=argparse.BooleanOptionalAction, default=True,
+        help="Dithering for Standard-mode PNG quantization (default enabled; --no-dithering to "
+             "disable, e.g. for UI screenshots with flat colors and text).",
+    )
+    cli_group.add_argument(
+        "--protect-colors", default="",
+        help="Comma-separated hex colors (e.g. '#2ecc71,#ff0000') to prioritize keeping exact "
+             "in Standard mode's palette.",
+    )
+    cli_group.add_argument(
+        "--keep-exif", action="store_true",
+        help="Keep a curated subset of EXIF (camera make/model, date, exposure). GPS and "
+             "Orientation are always stripped regardless. Default: strip all EXIF.",
     )
     args = parser.parse_args()
 
-    global CONCURRENT_WORKERS, THUMBNAIL_WORKERS, WORKSPACE_CLEANUP_DELAY, SESSION_IDLE_TIMEOUT
+    if args.source:
+        CONCURRENT_WORKERS = max(1, args.workers)
+        sys.exit(asyncio.run(_run_cli(args)))
+
     CONCURRENT_WORKERS = max(1, args.workers)
     THUMBNAIL_WORKERS = max(1, args.thumbnail_workers)
     WORKSPACE_CLEANUP_DELAY = config["workspace_cleanup_delay"]
