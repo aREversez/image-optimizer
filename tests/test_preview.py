@@ -1,6 +1,7 @@
 """Regression tests for GET /api/preview (the Compare page)."""
 from __future__ import annotations
 
+import json
 import re
 
 from .conftest import wait_for
@@ -222,3 +223,71 @@ class TestPreviewPageImageInfo:
         r = client.get(f"/api/preview/{ws_name}/{file_id}")
         assert r.status_code == 200
         assert "info unavailable" in r.text
+
+
+class TestSliderView:
+    """The drag-to-compare Slider view: a third mode alongside Side by Side
+    and Overlay. slider-top (original) sits over slider-base (compressed)
+    and is clipped via CSS to expose the base layer on one side — these
+    tests cover what the server actually renders; the clip-path math and
+    drag/keyboard behavior themselves are JS/CSS that this Python suite
+    can't execute, and were verified separately with a real browser."""
+
+    def test_slider_button_present_and_inactive_by_default(self, client, auth_headers, test_images):
+        r = get_preview(client, auth_headers, test_images)
+        assert 'id="btn-slider">Slider</button>' in r.text
+        assert re.search(r'class="view-btn active"[^>]*id="btn-slider"', r.text) is None
+
+    def test_slider_view_hidden_by_default(self, client, auth_headers, test_images):
+        r = get_preview(client, auth_headers, test_images)
+        assert re.search(r'id="slider-view"[^>]*style="display:none"', r.text)
+
+    def test_slider_view_has_both_images_and_accessible_handle(self, client, auth_headers, test_images):
+        r = get_preview(client, auth_headers, test_images)
+        assert 'id="slider-base"' in r.text
+        assert 'id="slider-top"' in r.text
+        handle = re.search(r'<div class="slider-handle" id="slider-handle"([^>]*)>', r.text)
+        assert handle, "slider-handle element not found"
+        attrs = handle.group(1)
+        assert 'role="slider"' in attrs
+        assert 'tabindex="0"' in attrs
+        assert 'aria-valuemin="0"' in attrs
+        assert 'aria-valuemax="100"' in attrs
+        assert 'aria-valuenow="50"' in attrs
+
+    def test_slider_labels_show_dimensions_and_depth_for_both_sides(self, client, auth_headers, test_images):
+        scanned = scan_and_wait(client, auth_headers, test_images)
+        ws_name = scanned["files"][0]["thumbnail"].split("/")[3]
+        png_file = next(f for f in scanned["files"] if f["name"].endswith(".png"))
+        result = optimize_and_wait(client, auth_headers, file_ids=[png_file["id"]])
+        file_id = result["results"][0]["id"]
+        r = client.get(f"/api/preview/{ws_name}/{file_id}")
+        assert r.status_code == 200
+        label_block = re.search(r'<div class="slider-label">(.*?)<div class="slider-wrap"', r.text, re.S)
+        assert label_block, "slider-label block not found"
+        # test_images' PNGs are 64x64 RGB; fake pngquant/oxipng copy bytes
+        # through unchanged, so both sides report the same dimensions/depth.
+        assert label_block.group(1).count("64\u00d764") == 2
+        assert label_block.group(1).count("24-bit RGB") == 2
+
+    def test_slider_zh_i18n_button_and_footer(self, client, auth_headers, test_images):
+        scanned = scan_and_wait(client, auth_headers, test_images)
+        ws_name = scanned["files"][0]["thumbnail"].split("/")[3]
+        result = optimize_and_wait(client, auth_headers)
+        file_id = result["results"][0]["id"]
+        r = client.get(f"/api/preview/{ws_name}/{file_id}?lang=zh")
+        assert r.status_code == 200
+        assert "滑动对比" in r.text  # Slider
+        assert "Slider</button>" not in r.text
+        i18n_match = re.search(r"var I18N = (\{.*?\});", r.text, re.S)
+        assert i18n_match, "I18N JS object not found"
+        i18n = json.loads(i18n_match.group(1))
+        assert "把手" in i18n["footer_slider"]
+
+    def test_slider_en_footer_hint_present(self, client, auth_headers, test_images):
+        r = get_preview(client, auth_headers, test_images)
+        i18n_match = re.search(r"var I18N = (\{.*?\});", r.text, re.S)
+        assert i18n_match, "I18N JS object not found"
+        i18n = json.loads(i18n_match.group(1))
+        assert "handle" in i18n["footer_slider"]
+        assert "arrow keys" in i18n["footer_slider"]

@@ -666,8 +666,11 @@ PREVIEW_I18N = {
         "toggle_suffix": " \u2014 click image to toggle (or press space)",
         "footer_overlay": "Click the image (or press space) to flip between original and compressed",
         "footer_side": "Original (left) vs Compressed (right)",
+        "footer_slider": "Drag the handle (or use arrow keys) to compare, original on the left and compressed on the right",
         "zoom_hint": " (scroll to pan around at actual size)",
         "info_unavailable": "info unavailable",
+        "slider": "Slider",
+        "slider_aria": "Comparison slider",
     },
     "zh": {
         "not_found": "未找到",
@@ -686,8 +689,11 @@ PREVIEW_I18N = {
         "toggle_suffix": "\u2014点击图片切换（或按空格键）",
         "footer_overlay": "点击图片（或按空格键）切换原图与压缩后效果",
         "footer_side": "原图（左）对比压缩后（右）",
+        "footer_slider": "拖动把手（或使用方向键）对比，左侧原图，右侧压缩后",
         "zoom_hint": "（可滚动查看实际尺寸下的细节）",
         "info_unavailable": "信息不可用",
+        "slider": "滑动对比",
+        "slider_aria": "对比滑块",
     },
 }
 
@@ -2095,6 +2101,20 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 .overlay-wrap.zoom-100{align-items:flex-start;justify-content:flex-start}
 .overlay-img.zoom-100{width:auto;height:auto;max-width:none;max-height:none}
 .zoom-toggle{display:flex;gap:4px}
+.slider-view{flex:1;display:flex;flex-direction:column}
+.slider-label{padding:8px 16px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#888;background:#fafaf5;user-select:none;display:flex;justify-content:space-between;gap:16px}
+.slider-label .side{min-width:0}
+.slider-label .side.right{text-align:right}
+.slider-label .info{display:block;text-transform:none;letter-spacing:normal;color:#aaa;margin-top:2px;font-size:11px}
+.slider-wrap{flex:1;position:relative;overflow:hidden;background:#f0f0eb;touch-action:none;--pos:50%}
+.slider-wrap.zoom-100{overflow:auto}
+.slider-img{position:absolute;top:16px;left:16px;width:calc(100% - 32px);height:calc(100% - 32px);object-fit:contain;pointer-events:none;user-select:none}
+.slider-wrap.zoom-100 .slider-img{top:0;left:0;width:auto;height:auto;object-fit:none}
+.slider-top{clip-path:inset(0 calc(100% - var(--pos)) 0 0)}
+.slider-handle{position:absolute;top:0;bottom:0;left:var(--pos);width:32px;margin-left:-16px;cursor:ew-resize;display:flex;align-items:center;justify-content:center;touch-action:none}
+.slider-handle::before{content:"";position:absolute;top:0;bottom:0;left:50%;width:2px;background:#fff;box-shadow:0 0 0 1px rgba(0,0,0,.25);transform:translateX(-50%)}
+.slider-handle-grip{position:relative;width:28px;height:28px;border-radius:50%;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;color:#666;font-size:13px}
+.slider-handle:focus-visible .slider-handle-grip{outline:2px solid #333;outline-offset:2px}
 </style>
 </head><body>"""
     result = None
@@ -2164,6 +2184,7 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
         "toggle_suffix": T["toggle_suffix"],
         "footer_overlay": T["footer_overlay"],
         "footer_side": T["footer_side"],
+        "footer_slider": T["footer_slider"],
         "zoom_hint": T["zoom_hint"],
         "orig_info": orig_info_text,
         "comp_info": comp_info_text,
@@ -2175,6 +2196,7 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
   <div class="view-toggle">
     <button class="view-btn" id="btn-side">{_html.escape(T['side_by_side'])}</button>
     <button class="view-btn active" id="btn-overlay">{_html.escape(T['overlay'])}</button>
+    <button class="view-btn" id="btn-slider">{_html.escape(T['slider'])}</button>
   </div>
   <div class="zoom-toggle">
     <button class="view-btn active" id="btn-fit" title="{_html.escape(T['fit_title'])}">{_html.escape(T['fit'])}</button>
@@ -2198,16 +2220,31 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
     <img src="{comp_url}" class="overlay-img" id="overlay-comp" alt="compressed"/>
   </div>
 </div>
+<div class="slider-view" id="slider-view" style="display:none">
+  <div class="slider-label">
+    <span class="side">{_html.escape(T['original_label'].format(size=orig_size))}<span class="info">{orig_info_text}</span></span>
+    <span class="side right">{_html.escape(T['compressed_label'].format(size=comp_size))}<span class="info">{comp_info_text}</span></span>
+  </div>
+  <div class="slider-wrap" id="slider-wrap">
+    <img src="{comp_url}" class="slider-img" id="slider-base" alt="compressed" draggable="false"/>
+    <img src="{orig_url}" class="slider-img slider-top" id="slider-top" alt="original" draggable="false"/>
+    <div class="slider-handle" id="slider-handle" role="slider" tabindex="0" aria-orientation="horizontal" aria-label="{_html.escape(T['slider_aria'], quote=True)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50">
+      <div class="slider-handle-grip">\u2194</div>
+    </div>
+  </div>
+</div>
 <div class="footer" id="footer-hint">{_html.escape(T['footer_overlay'])}</div>
 <script>
 (function(){{
   var I18N = {js_i18n};
   var sideBtn = document.getElementById('btn-side');
   var overlayBtn = document.getElementById('btn-overlay');
+  var sliderBtn = document.getElementById('btn-slider');
   var fitBtn = document.getElementById('btn-fit');
   var zoomBtn = document.getElementById('btn-zoom100');
   var sideView = document.getElementById('side-view');
   var overlayView = document.getElementById('overlay-view');
+  var sliderView = document.getElementById('slider-view');
   var origWrap = document.getElementById('orig-wrap');
   var compWrap = document.getElementById('comp-wrap');
   var origImg = document.getElementById('orig-img');
@@ -2216,24 +2253,30 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
   var comp = document.getElementById('overlay-comp');
   var label = document.getElementById('overlay-label');
   var wrap = document.getElementById('overlay-wrap');
+  var sliderWrap = document.getElementById('slider-wrap');
+  var sliderHandle = document.getElementById('slider-handle');
   var footer = document.getElementById('footer-hint');
   var showingOriginal = false;
   var zoomedIn = false;
+  var currentMode = 'overlay';
 
-  function setMode(mode){{
-    var isOverlay = mode === 'overlay';
-    sideView.style.display = isOverlay ? 'none' : 'flex';
-    overlayView.style.display = isOverlay ? 'flex' : 'none';
-    sideBtn.classList.toggle('active', !isOverlay);
-    overlayBtn.classList.toggle('active', isOverlay);
+  function setMode(m){{
+    currentMode = m;
+    sideView.style.display = m === 'side' ? 'flex' : 'none';
+    overlayView.style.display = m === 'overlay' ? 'flex' : 'none';
+    sliderView.style.display = m === 'slider' ? 'flex' : 'none';
+    sideBtn.classList.toggle('active', m === 'side');
+    overlayBtn.classList.toggle('active', m === 'overlay');
+    sliderBtn.classList.toggle('active', m === 'slider');
     updateFooter();
   }}
   sideBtn.addEventListener('click', function(){{ setMode('side'); }});
   overlayBtn.addEventListener('click', function(){{ setMode('overlay'); }});
+  sliderBtn.addEventListener('click', function(){{ setMode('slider'); }});
 
   function setZoom(mode){{
     zoomedIn = mode === '100';
-    [origWrap, compWrap, wrap].forEach(function(w){{ w.classList.toggle('zoom-100', zoomedIn); }});
+    [origWrap, compWrap, wrap, sliderWrap].forEach(function(w){{ w.classList.toggle('zoom-100', zoomedIn); }});
     [origImg, compImg, orig, comp].forEach(function(img){{ img.classList.toggle('zoom-100', zoomedIn); }});
     fitBtn.classList.toggle('active', !zoomedIn);
     zoomBtn.classList.toggle('active', zoomedIn);
@@ -2243,11 +2286,11 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
   zoomBtn.addEventListener('click', function(){{ setZoom('100'); }});
 
   function updateFooter(){{
-    var isOverlay = overlayView.style.display !== 'none';
     var zoomHint = zoomedIn ? I18N.zoom_hint : '';
-    footer.textContent = isOverlay
-      ? I18N.footer_overlay + zoomHint
-      : I18N.footer_side + zoomHint;
+    var text = I18N.footer_overlay;
+    if (currentMode === 'side') text = I18N.footer_side;
+    else if (currentMode === 'slider') text = I18N.footer_slider;
+    footer.textContent = text + zoomHint;
   }}
 
   function toggleImage(){{
@@ -2260,10 +2303,61 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
   }}
   wrap.addEventListener('click', toggleImage);
   document.addEventListener('keydown', function(e){{
-    if (overlayView.style.display !== 'none' && e.code === 'Space') {{
+    if (currentMode === 'overlay' && e.code === 'Space') {{
       e.preventDefault();
       toggleImage();
     }}
+  }});
+
+  // Slider (drag-to-compare) view: slider-top (original) is clipped to its
+  // left `--pos` percent via CSS clip-path, revealing slider-base
+  // (compressed) underneath on the right. Both layers share the exact same
+  // box (see .slider-img in the stylesheet), so the clip lines up with the
+  // same on-screen position regardless of each image's own aspect ratio.
+  // Pointer Events unify mouse/touch/pen so one listener set drives every
+  // input type; dragging is bound to the whole wrap (not just the handle)
+  // for an easy-to-grab target, matching how these compare sliders usually
+  // work elsewhere. Known limitation: if Max Width resize changed the
+  // compressed image's pixel dimensions, 100%-zoom alignment can be
+  // slightly off at the edges since each layer then sizes to its own
+  // natural dimensions (the other two views make the same simplification
+  // in that mode) - Fit mode is unaffected since both layers always share
+  // one calculated box there.
+  var sliderPos = 50;
+  function clampPct(n){{ return Math.min(100, Math.max(0, n)); }}
+  function setSliderPos(pct){{
+    sliderPos = clampPct(pct);
+    sliderWrap.style.setProperty('--pos', sliderPos + '%');
+    sliderHandle.setAttribute('aria-valuenow', String(Math.round(sliderPos)));
+  }}
+  function pctFromClientX(clientX){{
+    var rect = sliderWrap.getBoundingClientRect();
+    if (rect.width === 0) return sliderPos;
+    return (clientX - rect.left) / rect.width * 100;
+  }}
+  var dragging = false;
+  sliderWrap.addEventListener('pointerdown', function(e){{
+    dragging = true;
+    sliderWrap.setPointerCapture(e.pointerId);
+    setSliderPos(pctFromClientX(e.clientX));
+    e.preventDefault();
+  }});
+  sliderWrap.addEventListener('pointermove', function(e){{
+    if (!dragging) return;
+    setSliderPos(pctFromClientX(e.clientX));
+  }});
+  function endSliderDrag(e){{
+    dragging = false;
+    try {{ sliderWrap.releasePointerCapture(e.pointerId); }} catch (err) {{}}
+  }}
+  sliderWrap.addEventListener('pointerup', endSliderDrag);
+  sliderWrap.addEventListener('pointercancel', endSliderDrag);
+  sliderHandle.addEventListener('keydown', function(e){{
+    var step = e.shiftKey ? 10 : 2;
+    if (e.key === 'ArrowLeft') {{ setSliderPos(sliderPos - step); e.preventDefault(); }}
+    else if (e.key === 'ArrowRight') {{ setSliderPos(sliderPos + step); e.preventDefault(); }}
+    else if (e.key === 'Home') {{ setSliderPos(0); e.preventDefault(); }}
+    else if (e.key === 'End') {{ setSliderPos(100); e.preventDefault(); }}
   }});
 }})();
 </script>
