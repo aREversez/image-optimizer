@@ -2108,7 +2108,7 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 .slider-label .info{display:block;text-transform:none;letter-spacing:normal;color:#aaa;margin-top:2px;font-size:11px}
 .slider-wrap{flex:1;position:relative;overflow:hidden;background:#f0f0eb;touch-action:none;--pos:50%}
 .slider-wrap.zoom-100{overflow:auto}
-.slider-img{position:absolute;top:16px;left:16px;width:calc(100% - 32px);height:calc(100% - 32px);object-fit:contain;pointer-events:none;user-select:none}
+.slider-img{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain;pointer-events:none;user-select:none}
 .slider-wrap.zoom-100 .slider-img{top:0;left:0;width:auto;height:auto;object-fit:none}
 .slider-top{clip-path:inset(0 calc(100% - var(--pos)) 0 0)}
 .slider-handle{position:absolute;top:0;bottom:0;left:var(--pos);width:32px;margin-left:-16px;cursor:ew-resize;display:flex;align-items:center;justify-content:center;touch-action:none}
@@ -2311,9 +2311,14 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 
   // Slider (drag-to-compare) view: slider-top (original) is clipped to its
   // left `--pos` percent via CSS clip-path, revealing slider-base
-  // (compressed) underneath on the right. Both layers share the exact same
-  // box (see .slider-img in the stylesheet), so the clip lines up with the
-  // same on-screen position regardless of each image's own aspect ratio.
+  // (compressed) underneath on the right. .slider-img spans the wrap at
+  // top:0;left:0;width:100%;height:100% with no inset - the handle's
+  // `left: var(--pos)` is a percent of the wrap's own width, and clip-path
+  // percentages are relative to the clipped element's own box, so both
+  // only land on the same on-screen position when that box IS the wrap
+  // (0 inset). Giving .slider-img any padding/inset here reintroduces a
+  // mismatch between where the handle line sits and where the image
+  // actually splits (off by a few px away from the exact center).
   // Pointer Events unify mouse/touch/pen so one listener set drives every
   // input type; dragging is bound to the whole wrap (not just the handle)
   // for an easy-to-grab target, matching how these compare sliders usually

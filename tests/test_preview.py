@@ -291,3 +291,16 @@ class TestSliderView:
         i18n = json.loads(i18n_match.group(1))
         assert "handle" in i18n["footer_slider"]
         assert "arrow keys" in i18n["footer_slider"]
+
+    def test_slider_img_has_no_inset_from_wrap(self, client, auth_headers, test_images):
+        """Regression guard: the handle's `left: var(--pos)` is a percent of
+        slider-wrap's own width, and clip-path percentages on slider-top
+        are relative to slider-top's own box. Those two only land on the
+        same on-screen position when .slider-img's box exactly equals the
+        wrap's box (0 inset) - any padding/inset added back here makes the
+        handle line and the actual image split drift apart by a few px
+        except coincidentally at 50%, which is exactly what shipped once
+        and was caught by manual testing, not this suite. See the JS
+        comment above the drag handlers in the preview() route."""
+        r = get_preview(client, auth_headers, test_images)
+        assert ".slider-img{position:absolute;top:0;left:0;width:100%;height:100%" in r.text
