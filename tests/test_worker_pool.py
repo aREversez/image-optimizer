@@ -349,3 +349,94 @@ class TestCancelSkipsDoNotOrphanWorkers:
         t0 = time.time()
         asyncio.run(run())
         assert time.time() - t0 < 2.0
+
+
+class TestYieldsControlBetweenItems:
+    """A worker must hand control back to the event loop after every item,
+    even when process_item itself never awaits anything — exactly the
+    shape of process_one's skip_existing reuse branch in _process_files
+    (plain stat/exists/copy2 calls, no await at all). Without an explicit
+    yield, one worker can drain an entire zero-await queue in a single
+    uninterrupted synchronous burst, during which nothing else on the
+    event loop runs — so a concurrently connecting SSE/poll client has
+    zero chance of ever observing an intermediate on_item_done count. This
+    is the root cause behind "the progress bar looks frozen on an all-skip
+    run" — see CHANGELOG."""
+
+    def test_yields_after_every_item_even_when_process_item_never_awaits(self):
+        async def scenario():
+            n = 30
+            shared = {"current": 0, "stop": False}
+            observed = []
+
+            async def p(_item):
+                pass  # zero internal await — mirrors the skip_existing branch
+
+            def on_done(_item):
+                shared["current"] += 1
+
+            async def observer():
+                # asyncio.sleep(0) is the finest-grained yield asyncio
+                # offers. If even this can't catch intermediate values, no
+                # real network client (SSE, polling) ever could either.
+                last = -1
+                while not shared["stop"]:
+                    if shared["current"] != last:
+                        last = shared["current"]
+                        observed.append(shared["current"])
+                    await asyncio.sleep(0)
+
+            obs_task = asyncio.create_task(observer())
+            await call_helper(list(range(n)), p, on_item_done=on_done, n_workers=4)
+            shared["stop"] = True
+            await obs_task
+            return observed, n
+
+        observed, n = asyncio.run(scenario())
+        # A smooth run doesn't have to hit every single integer (a worker
+        # can advance the counter more than once between two observer
+        # wakeups), but it must show real incremental movement, not one
+        # jump straight from 0 to n with nothing in between.
+        assert len(observed) > 2, (
+            f"an asyncio.sleep(0)-granularity observer only caught "
+            f"{observed} for {n} zero-await items — the pool is draining "
+            f"the queue in one synchronous burst instead of yielding "
+            f"after each item"
+        )
+        assert observed[0] == 0
+        assert observed[-1] == n
+
+    def test_single_worker_zero_await_items_still_yields(self):
+        """Same guarantee with n_workers=1, where there's no other worker
+        competing for the loop — isolates the per-item yield itself from
+        any cross-worker scheduling effect."""
+        async def scenario():
+            n = 15
+            shared = {"current": 0, "stop": False}
+            observed = []
+
+            async def p(_item):
+                pass
+
+            def on_done(_item):
+                shared["current"] += 1
+
+            async def observer():
+                last = -1
+                while not shared["stop"]:
+                    if shared["current"] != last:
+                        last = shared["current"]
+                        observed.append(shared["current"])
+                    await asyncio.sleep(0)
+
+            obs_task = asyncio.create_task(observer())
+            await call_helper(list(range(n)), p, on_item_done=on_done, n_workers=1)
+            shared["stop"] = True
+            await obs_task
+            return observed
+
+        observed = asyncio.run(scenario())
+        assert len(observed) > 2, (
+            f"single-worker zero-await run only produced {observed} "
+            f"distinct progress values out of 15 items"
+        )

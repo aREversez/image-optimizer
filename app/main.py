@@ -833,6 +833,15 @@ async def _run_worker_pool(
                 if on_item_done is not None:
                     on_item_done(item)
                 queue.task_done()
+            # Yield to the event loop after every item, not just ones whose
+            # process_item happens to await something. process_one's
+            # skip_existing reuse branch is pure sync I/O (stat/exists/
+            # copy2, no await at all) — without this, one worker can drain
+            # an entire skip-heavy queue in a single uninterrupted
+            # synchronous burst, starving any concurrently connecting SSE/
+            # poll client of a chance to ever observe state.current move.
+            # See test_yields_after_every_item_even_when_process_item_never_awaits.
+            await asyncio.sleep(0)
 
     workers = [asyncio.create_task(worker()) for _ in range(max(1, n_workers))]
     await asyncio.gather(*workers)
