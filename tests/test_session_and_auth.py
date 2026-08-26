@@ -7,7 +7,9 @@ to catch a regression back to shared global state.
 """
 from __future__ import annotations
 
+import asyncio
 import re
+import time
 
 from .conftest import wait_for
 
@@ -100,3 +102,97 @@ class TestSessionIsolation:
             rb = b.post("/api/optimize", json={}, headers=hb)
             assert ra.status_code == 200
             assert rb.status_code == 400  # b has no files
+
+
+class TestStaleSessionSweepCancelsWatch:
+    """A session going stale while Watch Mode is running is the normal
+    "fire and forget" use case, not an edge case. The sweep must cancel
+    the orphaned watch task, not just drop the SESSIONS entry -- otherwise
+    the task survives forever (its closure holds a live reference to the
+    AppState, including the ever-growing watch_logs list), with no way
+    for the user to reach or stop it again.
+
+    These bypass the TestClient/HTTP layer on purpose: watch_task is an
+    asyncio.Task tied to whichever event loop created it, and TestClient
+    requests all run on its own internal loop (via its portal) -- a task
+    created through a client.post(...) call can't be awaited from a
+    separately asyncio.run()'d loop. So these construct the session and
+    watch task directly against app.main's module-level SESSIONS dict, on
+    a single self-contained event loop, mirroring what watch_start
+    actually does."""
+
+    def test_stale_sweep_cancels_orphaned_watch_task(self, app_module, tmp_path):
+        import app.main as m
+
+        async def scenario():
+            watched_dir = tmp_path / "watched"
+            watched_dir.mkdir()
+
+            sid = "test-stale-watch-session"
+            state = m.AppState()
+            m.SESSIONS[sid] = state
+            task = None
+            try:
+                state.watch_watcher = m.FolderWatcher(directory=watched_dir, on_change=lambda *a: None)
+                task = asyncio.create_task(state.watch_watcher.run())
+                state.watch_task = task
+                state.watch_running = True
+                await asyncio.sleep(0)  # let the task actually start running
+                assert not task.done(), "watch task should still be running before the sweep"
+
+                # Simulate staleness without waiting SESSION_IDLE_TIMEOUT for real.
+                state.last_seen = time.time() - m.SESSION_IDLE_TIMEOUT - 1
+
+                await m._sweep_stale_sessions_once()
+
+                assert sid not in m.SESSIONS
+                assert state.watch_running is False
+                assert state.watch_task is None
+                assert task.done(), "the original watch task must actually be cancelled, not just dereferenced"
+                assert task.cancelled()
+            finally:
+                m.SESSIONS.pop(sid, None)
+                if task is not None and not task.done():
+                    task.cancel()
+
+        asyncio.run(scenario())
+
+    def test_sweep_leaves_active_sessions_and_their_watch_tasks_alone(self, app_module, tmp_path):
+        """Control case: a session that's still active (last_seen recent)
+        must survive the sweep with its watch task untouched -- the fix
+        must not become "cancel watch mode on every sweep pass"."""
+        import app.main as m
+
+        async def scenario():
+            watched_dir = tmp_path / "watched2"
+            watched_dir.mkdir()
+
+            sid = "test-active-watch-session"
+            state = m.AppState()
+            m.SESSIONS[sid] = state
+            task = None
+            try:
+                state.watch_watcher = m.FolderWatcher(directory=watched_dir, on_change=lambda *a: None)
+                task = asyncio.create_task(state.watch_watcher.run())
+                state.watch_task = task
+                state.watch_running = True
+                state.last_seen = time.time()  # fresh -- not stale
+                await asyncio.sleep(0)
+
+                await m._sweep_stale_sessions_once()
+
+                assert sid in m.SESSIONS
+                assert state.watch_running is True
+                assert not task.done()
+            finally:
+                m.SESSIONS.pop(sid, None)
+                if state.watch_watcher:
+                    state.watch_watcher.stop()
+                if task is not None and not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+        asyncio.run(scenario())

@@ -199,20 +199,40 @@ def get_session(request: Request) -> AppState:
     return st
 
 
+async def _sweep_stale_sessions_once() -> None:
+    """One sweep pass: drop sessions idle past SESSION_IDLE_TIMEOUT. Split
+    out from _sweep_stale_sessions so tests can trigger a single pass
+    directly instead of waiting on the real interval."""
+    now = time.time()
+    stale = [sid for sid, st in SESSIONS.items() if now - st.last_seen > SESSION_IDLE_TIMEOUT]
+    for sid in stale:
+        st = SESSIONS.pop(sid, None)
+        if st is None:
+            continue
+        # A session can go stale while Watch Mode is still running — that's
+        # the normal "fire and forget" use case, not an edge case — so it
+        # must be cancelled here, not just dropped from SESSIONS. Without
+        # this, watch_task (created in watch_start) keeps polling forever:
+        # its closure holds a live reference to `st`, keeping the whole
+        # AppState — including the ever-growing watch_logs list — alive
+        # and running with no way for the user to reach it again (a
+        # reconnect gets a brand-new AppState, unaware the old task still
+        # exists). No-op if watch wasn't running.
+        # See test_stale_sweep_cancels_orphaned_watch_task.
+        await _stop_watch(st)
+        if st.workspace:
+            # Each stale workspace gets deleted off the event loop — a
+            # sweep that grabs several oversized sessions in one pass
+            # could otherwise freeze the server for the combined delete
+            # duration, right when a still-active session's progress poll
+            # is exactly the request we'd want not to stall.
+            await _async_rmtree(st.workspace)
+
+
 async def _sweep_stale_sessions():
     while True:
         await asyncio.sleep(SESSION_SWEEP_INTERVAL)
-        now = time.time()
-        stale = [sid for sid, st in SESSIONS.items() if now - st.last_seen > SESSION_IDLE_TIMEOUT]
-        for sid in stale:
-            st = SESSIONS.pop(sid, None)
-            if st and st.workspace:
-                # Each stale workspace gets deleted off the event loop — a
-                # sweep that grabs several oversized sessions in one pass
-                # could otherwise freeze the server for the combined delete
-                # duration, right when a still-active session's progress poll
-                # is exactly the request we'd want not to stall.
-                await _async_rmtree(st.workspace)
+        await _sweep_stale_sessions_once()
 
 
 optimizer: Optional[Optimizer] = None
@@ -3049,16 +3069,12 @@ async def watch_start(
     })
 
 
-@app.post("/api/watch/stop")
-async def watch_stop(
-    state: AppState = Depends(get_session),
-    _auth: None = Depends(require_token),
-):
-    """Stop watch mode. Cooperative: the watcher finishes its current
-    poll sleep, then exits. Already-queued file events are lost (watch
-    is meant to be persistent, not transactional)."""
-    if not state.watch_running:
-        return JSONResponse({"error": "Watch mode is not running"}, status_code=400)
+async def _stop_watch(state: "AppState") -> None:
+    """Cancel Watch Mode for one session and clear its fields. Shared by
+    the explicit /api/watch/stop endpoint and the stale-session sweep
+    (_sweep_stale_sessions_once) so there is exactly one place that knows
+    how to tear a watch task down. Safe to call when watch isn't running —
+    every step below is a no-op in that case."""
     if state.watch_watcher:
         state.watch_watcher.stop()
     if state.watch_task:
@@ -3070,6 +3086,19 @@ async def watch_stop(
     state.watch_running = False
     state.watch_watcher = None
     state.watch_task = None
+
+
+@app.post("/api/watch/stop")
+async def watch_stop(
+    state: AppState = Depends(get_session),
+    _auth: None = Depends(require_token),
+):
+    """Stop watch mode. Cooperative: the watcher finishes its current
+    poll sleep, then exits. Already-queued file events are lost (watch
+    is meant to be persistent, not transactional)."""
+    if not state.watch_running:
+        return JSONResponse({"error": "Watch mode is not running"}, status_code=400)
+    await _stop_watch(state)
     return JSONResponse({"ok": True})
 
 
