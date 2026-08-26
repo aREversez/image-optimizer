@@ -7,6 +7,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import threading
 import zlib
 from pathlib import Path
 from typing import Callable, Optional
@@ -39,6 +40,15 @@ class Optimizer:
         self.oxipng_path: Optional[Path] = None
         self.cjpeg_path: Optional[Path] = None
         self.avifenc_path: Optional[Path] = None
+        # Guards _detect_binaries: it's called once here (main thread) and
+        # again on every /api/health request via asyncio.to_thread (see
+        # app/main.py), each on its own thread-pool thread. A real
+        # threading.Lock (not asyncio.Lock, which doesn't coordinate across
+        # OS threads) keeps two overlapping detections from interleaving
+        # their writes to the four *_path attributes below, which a reader
+        # building a /api/health response from those same attributes could
+        # otherwise observe half-updated.
+        self._detect_lock = threading.Lock()
         self._detect_binaries()
         self._semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
@@ -121,13 +131,17 @@ class Optimizer:
         return None
 
     def _detect_binaries(self):
-        self.pngquant_path = self._find_binary("pngquant")
-        self.oxipng_path = self._find_binary("oxipng")
-        # mozjpeg releases/prebuilt zip files name the encoder either
-        # `cjpeg` or `cjpeg-static` (the static variant shipped by several
-        # Windows/AiZ builds) — try both spellings so either is picked up.
-        self.cjpeg_path = self._find_binary_any(["cjpeg", "cjpeg-static"])
-        self.avifenc_path = self._find_binary("avifenc")
+        # See the comment on self._detect_lock in __init__: two concurrent
+        # /api/health requests must not run this body at the same time.
+        with self._detect_lock:
+            self.pngquant_path = self._find_binary("pngquant")
+            self.oxipng_path = self._find_binary("oxipng")
+            # mozjpeg releases/prebuilt zip files name the encoder either
+            # `cjpeg` or `cjpeg-static` (the static variant shipped by
+            # several Windows/AiZ builds) — try both spellings so either is
+            # picked up.
+            self.cjpeg_path = self._find_binary_any(["cjpeg", "cjpeg-static"])
+            self.avifenc_path = self._find_binary("avifenc")
 
     def _find_binary_any(self, names: list[str]) -> Optional[Path]:
         for name in names:

@@ -906,3 +906,63 @@ class TestScreenshotModeRealBinaries:
             "near-lossless on this kind of content"
         )
 
+
+class TestConcurrentBinaryDetection:
+    """_detect_binaries() runs once at construction and again on every
+    /api/health request via asyncio.to_thread (see app/main.py) — by
+    design, so a binary installed after the app started gets picked up
+    without a restart. Two overlapping /api/health calls therefore run
+    this on two different thread-pool threads at once; without a lock
+    around it, their writes to the four *_path attributes can interleave,
+    and a reader building a response from those same attributes could
+    observe a torn mix of the two calls' results."""
+
+    def test_concurrent_detect_binaries_does_not_interleave(self, optimizer):
+        import threading
+        import time as _time
+
+        calls = []
+        calls_lock = threading.Lock()
+        barrier = threading.Barrier(2)
+
+        def fake_find_binary(name):
+            start = _time.perf_counter()
+            # Widen the window: at 20ms per call and 5 calls per
+            # invocation (pngquant, oxipng, cjpeg, cjpeg-static,
+            # avifenc), an unlocked version reliably interleaves here.
+            _time.sleep(0.02)
+            end = _time.perf_counter()
+            with calls_lock:
+                calls.append((threading.current_thread().name, start, end))
+            return None
+
+        optimizer._find_binary = fake_find_binary
+
+        def run_detect(label):
+            threading.current_thread().name = label
+            barrier.wait()  # both threads enter _detect_binaries() together
+            optimizer._detect_binaries()
+
+        t1 = threading.Thread(target=run_detect, args=("A",))
+        t2 = threading.Thread(target=run_detect, args=("B",))
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+        assert not t1.is_alive() and not t2.is_alive()
+
+        a_spans = [(s, e) for label, s, e in calls if label == "A"]
+        b_spans = [(s, e) for label, s, e in calls if label == "B"]
+        assert a_spans and b_spans
+        a_start, a_end = min(s for s, _ in a_spans), max(e for _, e in a_spans)
+        b_start, b_end = min(s for s, _ in b_spans), max(e for _, e in b_spans)
+
+        # With the lock, one invocation's entire span must finish before
+        # the other's starts — no interleaving between A's five
+        # _find_binary calls and B's.
+        assert a_end <= b_start or b_end <= a_start, (
+            f"A span=({a_start:.4f}, {a_end:.4f}) B span=({b_start:.4f}, "
+            f"{b_end:.4f}) overlap — concurrent _detect_binaries() calls "
+            f"are not serialized"
+        )
+
