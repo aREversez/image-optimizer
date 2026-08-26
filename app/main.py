@@ -2284,6 +2284,7 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
   var wrap = document.getElementById('overlay-wrap');
   var sliderWrap = document.getElementById('slider-wrap');
   var sliderHandle = document.getElementById('slider-handle');
+  var sliderTop = document.getElementById('slider-top');
   var footer = document.getElementById('footer-hint');
   var showingOriginal = false;
   var zoomedIn = false;
@@ -2310,6 +2311,12 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
     fitBtn.classList.toggle('active', !zoomedIn);
     zoomBtn.classList.toggle('active', zoomedIn);
     updateFooter();
+    // Fit and 100% modes render the image differently within slider-wrap
+    // (see sliderRange below), so the handle's usable range changes too -
+    // re-clamp immediately rather than waiting for the next drag/keypress,
+    // or a stale --pos from the other mode can sit past the new edge
+    // until the user touches the slider again.
+    setSliderPos(sliderPos);
   }}
   fitBtn.addEventListener('click', function(){{ setZoom('fit'); }});
   zoomBtn.addEventListener('click', function(){{ setZoom('100'); }});
@@ -2359,10 +2366,43 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
   // one calculated box there.
   var sliderPos = 50;
   function clampPct(n){{ return Math.min(100, Math.max(0, n)); }}
+  function sliderRange(){{
+    // .slider-img always fills slider-wrap's own box (100%/100% in Fit
+    // mode, or the natural-size box in 100% mode - see the comment above
+    // on why --pos and clip-path stay percentages of the wrap itself).
+    // But object-fit only controls how pixels are drawn *inside* that
+    // box: a source image whose aspect ratio doesn't match the wrap's
+    // still leaves letterboxed empty margin the handle could otherwise
+    // reach into. Compute where the image is actually visible and clamp
+    // to that instead of the full 0-100 wrap range.
+    var rect = sliderWrap.getBoundingClientRect();
+    var nw = sliderTop.naturalWidth, nh = sliderTop.naturalHeight;
+    if (!rect.width || !rect.height || !nw || !nh) return {{min: 0, max: 100}};
+    var renderedWidth, offsetX;
+    if (sliderWrap.classList.contains('zoom-100')) {{
+      // object-fit:none, top:0;left:0 - drawn at natural size, anchored
+      // to the top-left corner (not centered); the wrap scrolls instead
+      // of centering when the image is larger than it.
+      renderedWidth = Math.min(nw, rect.width);
+      offsetX = 0;
+    }} else {{
+      // object-fit:contain - scaled to fit and centered on both axes.
+      var scale = Math.min(rect.width / nw, rect.height / nh);
+      renderedWidth = nw * scale;
+      offsetX = (rect.width - renderedWidth) / 2;
+    }}
+    return {{
+      min: clampPct(offsetX / rect.width * 100),
+      max: clampPct((offsetX + renderedWidth) / rect.width * 100)
+    }};
+  }}
   function setSliderPos(pct){{
-    sliderPos = clampPct(pct);
+    var range = sliderRange();
+    sliderPos = Math.min(range.max, Math.max(range.min, pct));
     sliderWrap.style.setProperty('--pos', sliderPos + '%');
     sliderHandle.setAttribute('aria-valuenow', String(Math.round(sliderPos)));
+    sliderHandle.setAttribute('aria-valuemin', String(Math.round(range.min)));
+    sliderHandle.setAttribute('aria-valuemax', String(Math.round(range.max)));
   }}
   function pctFromClientX(clientX){{
     var rect = sliderWrap.getBoundingClientRect();
@@ -2373,6 +2413,11 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
   sliderWrap.addEventListener('pointerdown', function(e){{
     dragging = true;
     sliderWrap.setPointerCapture(e.pointerId);
+    // e.preventDefault() below (needed to stop native text-selection/
+    // drag while sliding) also suppresses the browser's default
+    // click-to-focus behavior, so arrow-key support after a drag/click
+    // requires focusing the handle explicitly here.
+    sliderHandle.focus();
     setSliderPos(pctFromClientX(e.clientX));
     e.preventDefault();
   }});
@@ -2387,11 +2432,12 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
   sliderWrap.addEventListener('pointerup', endSliderDrag);
   sliderWrap.addEventListener('pointercancel', endSliderDrag);
   sliderHandle.addEventListener('keydown', function(e){{
+    var range = sliderRange();
     var step = e.shiftKey ? 10 : 2;
     if (e.key === 'ArrowLeft') {{ setSliderPos(sliderPos - step); e.preventDefault(); }}
     else if (e.key === 'ArrowRight') {{ setSliderPos(sliderPos + step); e.preventDefault(); }}
-    else if (e.key === 'Home') {{ setSliderPos(0); e.preventDefault(); }}
-    else if (e.key === 'End') {{ setSliderPos(100); e.preventDefault(); }}
+    else if (e.key === 'Home') {{ setSliderPos(range.min); e.preventDefault(); }}
+    else if (e.key === 'End') {{ setSliderPos(range.max); e.preventDefault(); }}
   }});
 }})();
 </script>
