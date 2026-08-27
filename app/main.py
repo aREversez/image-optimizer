@@ -2300,6 +2300,10 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
     overlayBtn.classList.toggle('active', m === 'overlay');
     sliderBtn.classList.toggle('active', m === 'slider');
     updateFooter();
+    // Focus the handle as soon as the Slider view becomes visible, so
+    // arrow keys work right away instead of requiring an extra click on
+    // the handle first just to give it focus.
+    if (m === 'slider') sliderHandle.focus();
   }}
   sideBtn.addEventListener('click', function(){{ setMode('side'); }});
   overlayBtn.addEventListener('click', function(){{ setMode('overlay'); }});
