@@ -2144,6 +2144,7 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 .slider-handle::before{content:"";position:absolute;top:0;bottom:0;left:50%;width:2px;background:#fff;box-shadow:0 0 0 1px rgba(0,0,0,.25);transform:translateX(-50%)}
 .slider-handle-grip{position:relative;width:28px;height:28px;border-radius:50%;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;color:#666;font-size:13px}
 .slider-handle:focus-visible .slider-handle-grip{outline:2px solid #333;outline-offset:2px}
+.slider-handle.pointer-focus:focus-visible .slider-handle-grip{outline:none}
 </style>
 </head><body>"""
     result = None
@@ -2416,10 +2417,22 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
     // e.preventDefault() below (needed to stop native text-selection/
     // drag while sliding) also suppresses the browser's default
     // click-to-focus behavior, so arrow-key support after a drag/click
-    // requires focusing the handle explicitly here.
-    sliderHandle.focus();
+    // requires focusing the handle explicitly here -- but browsers'
+    // :focus-visible heuristics tend to treat an explicit, script-called
+    // focus() as "show the ring" even though this one came from a mouse/
+    // touch interaction, not the keyboard. `pointer-focus` records that
+    // this particular focus session started from a pointer so the CSS
+    // above can suppress the ring for it; it's cleared on blur so a real
+    // Tab-triggered focus still shows the ring normally. The `focusVisible:
+    // false` option is a newer, more direct way to say the same thing and
+    // is simply ignored by browsers that don't support it yet.
+    sliderHandle.classList.add('pointer-focus');
+    sliderHandle.focus({{focusVisible: false}});
     setSliderPos(pctFromClientX(e.clientX));
     e.preventDefault();
+  }});
+  sliderHandle.addEventListener('blur', function(){{
+    sliderHandle.classList.remove('pointer-focus');
   }});
   sliderWrap.addEventListener('pointermove', function(e){{
     if (!dragging) return;
