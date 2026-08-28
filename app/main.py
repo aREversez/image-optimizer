@@ -2307,7 +2307,16 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
   }}
   sideBtn.addEventListener('click', function(){{ setMode('side'); }});
   overlayBtn.addEventListener('click', function(){{ setMode('overlay'); }});
-  sliderBtn.addEventListener('click', function(){{ setMode('slider'); }});
+  sliderBtn.addEventListener('click', function(e){{
+    // A click from a real mouse/touch has e.detail >= 1 (click count); a
+    // "click" synthesized by pressing Space/Enter on a focused button has
+    // e.detail === 0. setMode('slider') focuses the handle below, and
+    // only the mouse/touch case should suppress its focus ring -- a
+    // keyboard user tabbing to this button and activating it should still
+    // see the ring when focus lands on the handle.
+    if (e.detail !== 0) sliderHandle.classList.add('pointer-focus');
+    setMode('slider');
+  }});
 
   function setZoom(mode){{
     zoomedIn = mode === '100';
