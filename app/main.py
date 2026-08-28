@@ -2126,7 +2126,7 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 .overlay-view{flex:1;display:flex;flex-direction:column}
 .overlay-label{padding:8px 16px;font-size:12px;text-align:center;color:#888;background:#fafaf5;user-select:none}
 .overlay-wrap{flex:1;position:relative;overflow:auto;background:#f0f0eb;cursor:pointer}
-.overlay-img{position:absolute;top:16px;right:16px;bottom:16px;left:16px;width:auto;height:auto;object-fit:contain}
+.overlay-img{position:absolute;top:16px;left:16px;width:calc(100% - 32px);height:calc(100% - 32px);object-fit:contain}
 .overlay-img.zoom-100{position:static;width:auto;height:auto;max-width:none;max-height:none;margin:16px}
 .zoom-toggle{display:flex;gap:4px}
 .slider-view{flex:1;display:flex;flex-direction:column}
