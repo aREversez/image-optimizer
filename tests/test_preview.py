@@ -230,8 +230,11 @@ class TestSliderView:
     and Overlay. slider-top (original) sits over slider-base (compressed)
     and is clipped via CSS to expose the base layer on one side — these
     tests cover what the server actually renders; the clip-path math and
-    drag/keyboard behavior themselves are JS/CSS that this Python suite
-    can't execute, and were verified separately with a real browser."""
+    drag behavior itself are JS/CSS that this Python suite can't execute,
+    and were verified separately with a real browser. Mouse-only by
+    design: an earlier keyboard-accessible version was reverted after
+    repeated focus-ring rendering issues that couldn't be reproduced or
+    fixed reliably without a real browser to test against."""
 
     def test_slider_button_present_and_inactive_by_default(self, client, auth_headers, test_images):
         r = get_preview(client, auth_headers, test_images)
@@ -242,18 +245,17 @@ class TestSliderView:
         r = get_preview(client, auth_headers, test_images)
         assert re.search(r'id="slider-view"[^>]*style="display:none"', r.text)
 
-    def test_slider_view_has_both_images_and_accessible_handle(self, client, auth_headers, test_images):
+    def test_slider_view_has_both_images_and_plain_handle(self, client, auth_headers, test_images):
+        """Mouse-only by design: the handle isn't focusable and carries no
+        ARIA slider semantics, which would otherwise claim keyboard
+        operability that doesn't exist. See CHANGELOG."""
         r = get_preview(client, auth_headers, test_images)
         assert 'id="slider-base"' in r.text
         assert 'id="slider-top"' in r.text
         handle = re.search(r'<div class="slider-handle" id="slider-handle"([^>]*)>', r.text)
         assert handle, "slider-handle element not found"
-        attrs = handle.group(1)
-        assert 'role="slider"' in attrs
-        assert 'tabindex="0"' in attrs
-        assert 'aria-valuemin="0"' in attrs
-        assert 'aria-valuemax="100"' in attrs
-        assert 'aria-valuenow="50"' in attrs
+        attrs = handle.group(1).strip()
+        assert attrs == "", f"handle should carry no extra attributes (mouse-only), found: {attrs!r}"
 
     def test_slider_labels_show_dimensions_and_depth_for_both_sides(self, client, auth_headers, test_images):
         scanned = scan_and_wait(client, auth_headers, test_images)
@@ -290,7 +292,9 @@ class TestSliderView:
         assert i18n_match, "I18N JS object not found"
         i18n = json.loads(i18n_match.group(1))
         assert "handle" in i18n["footer_slider"]
-        assert "arrow keys" in i18n["footer_slider"]
+        # Mouse-only by design (see CHANGELOG) -- the hint must not promise
+        # a keyboard interaction that doesn't exist.
+        assert "arrow" not in i18n["footer_slider"].lower()
 
     def test_slider_img_has_no_inset_from_wrap(self, client, auth_headers, test_images):
         """Regression guard: the handle's `left: var(--pos)` is a percent of

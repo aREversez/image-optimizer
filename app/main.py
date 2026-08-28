@@ -686,11 +686,10 @@ PREVIEW_I18N = {
         "toggle_suffix": " \u2014 click image to toggle (or press space)",
         "footer_overlay": "Click the image (or press space) to flip between original and compressed",
         "footer_side": "Original (left) vs Compressed (right)",
-        "footer_slider": "Drag the handle (or use arrow keys) to compare, original on the left and compressed on the right",
+        "footer_slider": "Drag the handle to compare, original on the left and compressed on the right",
         "zoom_hint": " (scroll to pan around at actual size)",
         "info_unavailable": "info unavailable",
         "slider": "Slider",
-        "slider_aria": "Comparison slider",
     },
     "zh": {
         "not_found": "未找到",
@@ -709,11 +708,10 @@ PREVIEW_I18N = {
         "toggle_suffix": "\u2014点击图片切换（或按空格键）",
         "footer_overlay": "点击图片（或按空格键）切换原图与压缩后效果",
         "footer_side": "原图（左）对比压缩后（右）",
-        "footer_slider": "拖动把手（或使用方向键）对比，左侧原图，右侧压缩后",
+        "footer_slider": "拖动把手对比，左侧原图，右侧压缩后",
         "zoom_hint": "（可滚动查看实际尺寸下的细节）",
         "info_unavailable": "信息不可用",
         "slider": "滑动对比",
-        "slider_aria": "对比滑块",
     },
 }
 
@@ -2142,7 +2140,6 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 .slider-handle{position:absolute;top:0;bottom:0;left:var(--pos);width:32px;margin-left:-16px;cursor:ew-resize;display:flex;align-items:center;justify-content:center;touch-action:none}
 .slider-handle::before{content:"";position:absolute;top:0;bottom:0;left:50%;width:2px;background:#fff;box-shadow:0 0 0 1px rgba(0,0,0,.25);transform:translateX(-50%)}
 .slider-handle-grip{position:relative;width:28px;height:28px;border-radius:50%;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;color:#666;font-size:13px}
-.slider-handle.show-ring .slider-handle-grip{outline:2px solid #333;outline-offset:2px}
 </style>
 </head><body>"""
     result = None
@@ -2256,7 +2253,7 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
   <div class="slider-wrap" id="slider-wrap">
     <img src="{comp_url}" class="slider-img" id="slider-base" alt="compressed" draggable="false"/>
     <img src="{orig_url}" class="slider-img slider-top" id="slider-top" alt="original" draggable="false"/>
-    <div class="slider-handle" id="slider-handle" role="slider" tabindex="0" aria-orientation="horizontal" aria-label="{_html.escape(T['slider_aria'], quote=True)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50">
+    <div class="slider-handle" id="slider-handle">
       <div class="slider-handle-grip">\u2194</div>
     </div>
   </div>
@@ -2298,10 +2295,6 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
     overlayBtn.classList.toggle('active', m === 'overlay');
     sliderBtn.classList.toggle('active', m === 'slider');
     updateFooter();
-    // Focus the handle as soon as the Slider view becomes visible, so
-    // arrow keys work right away instead of requiring an extra click on
-    // the handle first just to give it focus.
-    if (m === 'slider') sliderHandle.focus();
   }}
   sideBtn.addEventListener('click', function(){{ setMode('side'); }});
   overlayBtn.addEventListener('click', function(){{ setMode('overlay'); }});
@@ -2403,9 +2396,6 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
     var range = sliderRange();
     sliderPos = Math.min(range.max, Math.max(range.min, pct));
     sliderWrap.style.setProperty('--pos', sliderPos + '%');
-    sliderHandle.setAttribute('aria-valuenow', String(Math.round(sliderPos)));
-    sliderHandle.setAttribute('aria-valuemin', String(Math.round(range.min)));
-    sliderHandle.setAttribute('aria-valuemax', String(Math.round(range.max)));
   }}
   function pctFromClientX(clientX){{
     var rect = sliderWrap.getBoundingClientRect();
@@ -2413,39 +2403,9 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
     return (clientX - rect.left) / rect.width * 100;
   }}
   var dragging = false;
-  // Manual focus-ring tracking for the slider handle. Native
-  // :focus-visible heuristics turned out not to behave predictably once
-  // an explicit script focus() call is involved -- confirmed the hard
-  // way across two rounds of this exact bug (suppressed correctly at
-  // first, then re-appeared after a subsequent arrow-key press, which
-  // some browsers treat as a fresh signal to re-show it). This instead
-  // tracks input modality directly: Tab is the only key that means "this
-  // is keyboard navigation"; any pointerdown means the opposite and wins.
-  // The ring is decided once, at focus time, from whatever this flag
-  // currently is -- not re-evaluated on later key presses like arrow
-  // keys while the handle stays focused.
-  var usingKeyboard = false;
-  document.addEventListener('keydown', function(e){{
-    if (e.key === 'Tab') usingKeyboard = true;
-  }}, true);
-  document.addEventListener('pointerdown', function(){{
-    usingKeyboard = false;
-  }}, true);
-  sliderHandle.addEventListener('focus', function(){{
-    sliderHandle.classList.toggle('show-ring', usingKeyboard);
-  }});
-  sliderHandle.addEventListener('blur', function(){{
-    sliderHandle.classList.remove('show-ring');
-  }});
-
   sliderWrap.addEventListener('pointerdown', function(e){{
     dragging = true;
     sliderWrap.setPointerCapture(e.pointerId);
-    // e.preventDefault() below (needed to stop native text-selection/
-    // drag while sliding) also suppresses the browser's default
-    // click-to-focus behavior, so arrow-key support after a drag/click
-    // requires focusing the handle explicitly here.
-    sliderHandle.focus();
     setSliderPos(pctFromClientX(e.clientX));
     e.preventDefault();
   }});
@@ -2459,14 +2419,6 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
   }}
   sliderWrap.addEventListener('pointerup', endSliderDrag);
   sliderWrap.addEventListener('pointercancel', endSliderDrag);
-  sliderHandle.addEventListener('keydown', function(e){{
-    var range = sliderRange();
-    var step = e.shiftKey ? 10 : 2;
-    if (e.key === 'ArrowLeft') {{ setSliderPos(sliderPos - step); e.preventDefault(); }}
-    else if (e.key === 'ArrowRight') {{ setSliderPos(sliderPos + step); e.preventDefault(); }}
-    else if (e.key === 'Home') {{ setSliderPos(range.min); e.preventDefault(); }}
-    else if (e.key === 'End') {{ setSliderPos(range.max); e.preventDefault(); }}
-  }});
 }})();
 </script>
 </body></html>"""
