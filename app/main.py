@@ -2125,10 +2125,9 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 .footer{padding:10px 20px;text-align:center;font-size:13px;border-top:1px solid #ddd;color:#999}
 .overlay-view{flex:1;display:flex;flex-direction:column}
 .overlay-label{padding:8px 16px;font-size:12px;text-align:center;color:#888;background:#fafaf5;user-select:none}
-.overlay-wrap{flex:1;display:flex;align-items:center;justify-content:center;overflow:auto;padding:16px;background:#f0f0eb;cursor:pointer}
-.overlay-img{width:100%;height:100%;min-width:0;min-height:0;object-fit:contain}
-.overlay-wrap.zoom-100{align-items:flex-start;justify-content:flex-start}
-.overlay-img.zoom-100{width:auto;height:auto;max-width:none;max-height:none}
+.overlay-wrap{flex:1;position:relative;overflow:auto;background:#f0f0eb;cursor:pointer}
+.overlay-img{position:absolute;top:16px;right:16px;bottom:16px;left:16px;width:auto;height:auto;object-fit:contain}
+.overlay-img.zoom-100{position:static;width:auto;height:auto;max-width:none;max-height:none;margin:16px}
 .zoom-toggle{display:flex;gap:4px}
 .slider-view{flex:1;display:flex;flex-direction:column}
 .slider-label{padding:8px 16px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#888;background:#fafaf5;user-select:none;display:flex;justify-content:space-between;gap:16px}
