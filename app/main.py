@@ -2142,8 +2142,7 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 .slider-handle{position:absolute;top:0;bottom:0;left:var(--pos);width:32px;margin-left:-16px;cursor:ew-resize;display:flex;align-items:center;justify-content:center;touch-action:none}
 .slider-handle::before{content:"";position:absolute;top:0;bottom:0;left:50%;width:2px;background:#fff;box-shadow:0 0 0 1px rgba(0,0,0,.25);transform:translateX(-50%)}
 .slider-handle-grip{position:relative;width:28px;height:28px;border-radius:50%;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;color:#666;font-size:13px}
-.slider-handle:focus-visible .slider-handle-grip{outline:2px solid #333;outline-offset:2px}
-.slider-handle.pointer-focus:focus-visible .slider-handle-grip{outline:none}
+.slider-handle.show-ring .slider-handle-grip{outline:2px solid #333;outline-offset:2px}
 </style>
 </head><body>"""
     result = None
@@ -2306,16 +2305,7 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
   }}
   sideBtn.addEventListener('click', function(){{ setMode('side'); }});
   overlayBtn.addEventListener('click', function(){{ setMode('overlay'); }});
-  sliderBtn.addEventListener('click', function(e){{
-    // A click from a real mouse/touch has e.detail >= 1 (click count); a
-    // "click" synthesized by pressing Space/Enter on a focused button has
-    // e.detail === 0. setMode('slider') focuses the handle below, and
-    // only the mouse/touch case should suppress its focus ring -- a
-    // keyboard user tabbing to this button and activating it should still
-    // see the ring when focus lands on the handle.
-    if (e.detail !== 0) sliderHandle.classList.add('pointer-focus');
-    setMode('slider');
-  }});
+  sliderBtn.addEventListener('click', function(){{ setMode('slider'); }});
 
   function setZoom(mode){{
     zoomedIn = mode === '100';
@@ -2423,28 +2413,41 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
     return (clientX - rect.left) / rect.width * 100;
   }}
   var dragging = false;
+  // Manual focus-ring tracking for the slider handle. Native
+  // :focus-visible heuristics turned out not to behave predictably once
+  // an explicit script focus() call is involved -- confirmed the hard
+  // way across two rounds of this exact bug (suppressed correctly at
+  // first, then re-appeared after a subsequent arrow-key press, which
+  // some browsers treat as a fresh signal to re-show it). This instead
+  // tracks input modality directly: Tab is the only key that means "this
+  // is keyboard navigation"; any pointerdown means the opposite and wins.
+  // The ring is decided once, at focus time, from whatever this flag
+  // currently is -- not re-evaluated on later key presses like arrow
+  // keys while the handle stays focused.
+  var usingKeyboard = false;
+  document.addEventListener('keydown', function(e){{
+    if (e.key === 'Tab') usingKeyboard = true;
+  }}, true);
+  document.addEventListener('pointerdown', function(){{
+    usingKeyboard = false;
+  }}, true);
+  sliderHandle.addEventListener('focus', function(){{
+    sliderHandle.classList.toggle('show-ring', usingKeyboard);
+  }});
+  sliderHandle.addEventListener('blur', function(){{
+    sliderHandle.classList.remove('show-ring');
+  }});
+
   sliderWrap.addEventListener('pointerdown', function(e){{
     dragging = true;
     sliderWrap.setPointerCapture(e.pointerId);
     // e.preventDefault() below (needed to stop native text-selection/
     // drag while sliding) also suppresses the browser's default
     // click-to-focus behavior, so arrow-key support after a drag/click
-    // requires focusing the handle explicitly here -- but browsers'
-    // :focus-visible heuristics tend to treat an explicit, script-called
-    // focus() as "show the ring" even though this one came from a mouse/
-    // touch interaction, not the keyboard. `pointer-focus` records that
-    // this particular focus session started from a pointer so the CSS
-    // above can suppress the ring for it; it's cleared on blur so a real
-    // Tab-triggered focus still shows the ring normally. The `focusVisible:
-    // false` option is a newer, more direct way to say the same thing and
-    // is simply ignored by browsers that don't support it yet.
-    sliderHandle.classList.add('pointer-focus');
-    sliderHandle.focus({{focusVisible: false}});
+    // requires focusing the handle explicitly here.
+    sliderHandle.focus();
     setSliderPos(pctFromClientX(e.clientX));
     e.preventDefault();
-  }});
-  sliderHandle.addEventListener('blur', function(){{
-    sliderHandle.classList.remove('pointer-focus');
   }});
   sliderWrap.addEventListener('pointermove', function(e){{
     if (!dragging) return;
