@@ -17,6 +17,15 @@ from PIL import Image, ImageOps
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 HEX_COLOR_RE = re.compile(r"^#?[0-9A-Fa-f]{6}$")
 
+# How long a single pngquant/oxipng/cjpeg/avifenc invocation is allowed to
+# run before it's treated as hung rather than legitimately slow. Generous
+# enough for a large image on slow storage; a compression call for one
+# file still running past this is far more likely stuck (malformed input,
+# a bug in the binary, a stalled network drive) than working. Mirrors the
+# timeout already used for the much cheaper `where`/`which` binary lookup
+# in _find_binary.
+SUBPROCESS_TIMEOUT = 120
+
 # EXIF tag ids used by the retention logic below. Orientation is stripped
 # because `exif_transpose` already bakes it into the pixel grid — re-writing
 # it would double-rotate in any reader that
@@ -129,6 +138,37 @@ class Optimizer:
         if local.exists():
             return local.resolve()
         return None
+
+    @staticmethod
+    async def _communicate_with_timeout(
+        proc: "asyncio.subprocess.Process", timeout: Optional[float] = None
+    ) -> tuple[bytes, bytes]:
+        """await proc.communicate() with a timeout, so a hung external
+        binary (malformed input, a bug in the tool itself, a stalled
+        network drive) fails just the one file being processed instead of
+        blocking its worker -- and the concurrency-limiting semaphore slot
+        it holds -- forever. On timeout the process is killed and reaped
+        (so it doesn't linger as a zombie), and a synthetic stderr message
+        is returned so every call site's existing
+        `if <output missing/returncode != 0>: msg = stderr.decode()` error
+        path picks this up exactly like any other subprocess failure, with
+        no extra branching needed at each of the four call sites.
+
+        `timeout=None` reads the module global SUBPROCESS_TIMEOUT lazily at
+        call time rather than as a Python default argument value (which
+        would freeze whatever it was at class-definition time) -- same
+        reasoning as CONCURRENT_WORKERS in main.py's _run_worker_pool, and
+        what lets tests shrink this to something fast without threading an
+        explicit timeout through optimize_png/optimize_jpeg/optimize_webp/
+        optimize_avif."""
+        if timeout is None:
+            timeout = SUBPROCESS_TIMEOUT
+        try:
+            return await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return b"", f"timed out after {timeout:.0f}s (process killed)".encode()
 
     def _detect_binaries(self):
         # See the comment on self._detect_lock in __init__: two concurrent
@@ -673,7 +713,7 @@ class Optimizer:
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
-                    _, stderr = await proc.communicate()
+                    _, stderr = await self._communicate_with_timeout(proc)
 
                 if pngquant_tmp.exists():
                     working_path = pngquant_tmp
@@ -739,7 +779,7 @@ class Optimizer:
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
-                    await proc.communicate()
+                    await self._communicate_with_timeout(proc)
 
                 if oxipng_tmp.exists():
                     # Registered as a temp BEFORE the replace: if replace()
@@ -975,7 +1015,7 @@ class Optimizer:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                _, stderr = await proc.communicate()
+                _, stderr = await self._communicate_with_timeout(proc)
 
             if tmp_jpg.exists():
                 if keep_exif and cleaned_exif:
@@ -1155,7 +1195,7 @@ class Optimizer:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                _, stderr = await proc.communicate()
+                _, stderr = await self._communicate_with_timeout(proc)
 
             if tmp_avif.exists() and tmp_avif.stat().st_size > 0:
                 tmp_avif.replace(output_path)

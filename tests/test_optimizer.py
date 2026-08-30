@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import stat
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -965,4 +968,76 @@ class TestConcurrentBinaryDetection:
             f"{b_end:.4f}) overlap — concurrent _detect_binaries() calls "
             f"are not serialized"
         )
+
+
+class TestSubprocessTimeout:
+    """pngquant/oxipng/cjpeg/avifenc calls used to await proc.communicate()
+    with no timeout at all -- a hung external binary (malformed input, a
+    bug in the tool, a stalled network drive) would block its worker, and
+    the concurrency-limiting semaphore slot it holds, forever. See
+    CHANGELOG."""
+
+    def test_communicate_with_timeout_kills_a_genuinely_hung_process(self):
+        """Unit-level check against a real subprocess (not a mock), so
+        this exercises the actual kill/reap mechanics, not just the
+        control flow around them."""
+        async def scenario():
+            import time as _time
+            from app.optimizer import Optimizer
+
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-c", "import time; time.sleep(999)",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            t0 = _time.perf_counter()
+            stdout, stderr = await Optimizer._communicate_with_timeout(proc, timeout=0.3)
+            elapsed = _time.perf_counter() - t0
+            return elapsed, stdout, stderr, proc
+
+        elapsed, stdout, stderr, proc = asyncio.run(scenario())
+        assert elapsed < 5.0, f"took {elapsed:.2f}s -- did not return promptly after the 0.3s timeout"
+        assert b"timed out" in stderr
+        assert stdout == b""
+        # The process must actually be dead, not orphaned/left running.
+        assert proc.returncode is not None
+
+    def test_pngquant_timeout_produces_warning_and_still_succeeds_via_fallback(
+        self, optimizer, test_images, tmp_path, monkeypatch
+    ):
+        """Integration-level: pngquant hangs, main.py's existing
+        `elif proc.returncode != 0: result["warning"] = msg` path (nothing
+        new needed there) picks up the synthetic timeout message, and the
+        file still succeeds via the lossless/oxipng fallback rather than
+        the whole call hanging for the full production timeout."""
+        import app.optimizer as optimizer_module
+
+        hang_script = tmp_path / "pngquant_hangs"
+        hang_script.write_text(
+            f"#!/usr/bin/env python3\nimport time\ntime.sleep(999)\n"
+        )
+        hang_script.chmod(hang_script.stat().st_mode | stat.S_IEXEC)
+        if sys.platform == "win32":
+            wrapper = tmp_path / "pngquant_hangs.bat"
+            wrapper.write_text(f'@echo off\r\n"{sys.executable}" "{hang_script}" %*\r\n')
+            optimizer.pngquant_path = wrapper
+        else:
+            wrapper = tmp_path / "pngquant_hangs.sh"
+            wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{hang_script}"\n')
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC)
+            optimizer.pngquant_path = wrapper
+
+        monkeypatch.setattr(optimizer_module, "SUBPROCESS_TIMEOUT", 0.3)
+
+        src = test_images / "2023" / "vacation" / "IMG_0001.png"
+        out = tmp_path / "out.png"
+
+        t0 = time.time()
+        result = asyncio.run(optimizer.optimize_png(src, out, max_width=0))
+        elapsed = time.time() - t0
+
+        assert elapsed < 10.0, f"took {elapsed:.2f}s -- pngquant hang was not bounded by SUBPROCESS_TIMEOUT"
+        assert result["success"] is True, "oxipng fallback should still produce a usable output"
+        assert "timed out" in (result.get("warning") or "")
+        assert out.exists()
 
