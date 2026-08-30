@@ -1,6 +1,6 @@
 """Regression tests for EXIF metadata retention (optimization item #1).
 
-Design rules captured by these tests (see OPTIMIZATION_PLAN.md):
+Design rules captured by these tests:
 - `keep_exif` defaults to False — current strip-everything behavior is
   preserved exactly.
 - When `keep_exif=True`, a *curated* EXIF subset is retained; GPS,

@@ -112,7 +112,7 @@ class PreviewRequest(BaseModel):
     """Single-file pre-compression dry run. Carries the same compression
     parameters as OptimizeRequest for one file, but no batch/output
     controls (no output_dir, skip_existing, retry, file_ids list) — a
-    preview never persists anything. See OPTIMIZATION_PLAN.md §2."""
+    preview never persists anything."""
     file_id: str
     quality: str = "medium"
     max_width: int = 0

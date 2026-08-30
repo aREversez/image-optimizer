@@ -1298,13 +1298,13 @@ CONCURRENT_WORKERS = 4  # default; overridden by main() from config.json / --wor
 # THUMBNAIL_WORKERS is the independent scan-thumbnail concurrency knob —
 # splitting the two lets a scan that's I/O-bound on thumbnail generation not
 # starve (or be starved by) a concurrent compression run in another session,
-# and lets each be tuned to the machine. See OPTIMIZATION_PLAN.md §6.
+# and lets each be tuned to the machine.
 THUMBNAIL_WORKERS = 4  # default; overridden by main() from config.json / --thumbnail-workers
 
 # Fields a per-file override may set. Fixed list so the request shape can't
-# drift between frontend and backend (see OPTIMIZATION_PLAN.md §3). Unknown
-# fields in an override are rejected with 400 rather than silently ignored —
-# a typo'd "qualitiy" must fail loudly, not silently do nothing.
+# drift between frontend and backend. Unknown fields in an override are
+# rejected with 400 rather than silently ignored — a typo'd "qualitiy" must
+# fail loudly, not silently do nothing.
 OVERRIDEABLE_FIELDS = (
     "quality", "compression_mode", "max_width", "dithering",
     "protected_colors", "keep_exif", "output_format",
@@ -1983,7 +1983,7 @@ async def preview_optimize(data: PreviewRequest, state: AppState = Depends(get_s
     the size, then deletes the temp. Must NOT mutate state.results /
     state.current / state.total / state.output_version / state.logs /
     state.is_running, and must NOT copy anything into a persistent
-    output_dir. See OPTIMIZATION_PLAN.md §2.
+    output_dir.
 
     Allowed while a batch is running — it only contends for the optimizer
     semaphore, never for batch state. The progress_callback is a no-op so

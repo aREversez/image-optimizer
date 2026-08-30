@@ -17,9 +17,9 @@ from PIL import Image, ImageOps
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 HEX_COLOR_RE = re.compile(r"^#?[0-9A-Fa-f]{6}$")
 
-# EXIF tag ids used by the retention logic (see OPTIMIZATION_PLAN.md §1).
-# Orientation is stripped because `exif_transpose` already bakes it into
-# the pixel grid — re-writing it would double-rotate in any reader that
+# EXIF tag ids used by the retention logic below. Orientation is stripped
+# because `exif_transpose` already bakes it into the pixel grid — re-writing
+# it would double-rotate in any reader that
 # honors EXIF orientation. GPSInfo is dropped for privacy (images may be
 # publicly shared). MakerNote is vendor-specific bulk with no display value.
 EXIF_TAG_ORIENTATION = 0x0112
@@ -382,7 +382,7 @@ class Optimizer:
         img.save(dst, format="PNG")
         return True
 
-    # --- EXIF retention helpers (see OPTIMIZATION_PLAN.md §1) ---
+    # --- EXIF retention helpers ---
     @staticmethod
     def _clean_exif(exif) -> None:
         """Strip EXIF fields that must NOT survive into optimized output.
