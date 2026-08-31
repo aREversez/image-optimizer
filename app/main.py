@@ -1177,6 +1177,11 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
             )
         # Restore previous results for the UI (compare, progress display)
         previous_results = bs.get("results", [])
+        # input_dir was persisted at batch-creation time (see below) but
+        # never read back out here — state.input_dir stayed None through
+        # every resume, so /api/state kept reporting no source folder even
+        # though the batch clearly has one. Restore it alongside results.
+        state.input_dir = bs.get("input_dir", "")
         batch_state = bs
         # Create a workspace for this session (the old one is gone if the
         # server restarted — _process_files needs one for its output dir).

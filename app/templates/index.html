@@ -2875,13 +2875,14 @@ batchResumeBtn.addEventListener('click', async () => {
     });
     const d = await r.json();
     if (!r.ok) { showNotice(d.error || t('notice.resumeFailed'), 'err'); return; }
-    STATE.isRunning = true;
-    STATE.runStartTime = Date.now();
-    STATE.resultCursor = 0;
-    STATE.logCursor = 0;
-    cancelBtn.style.display = '';
-    updateStartButtonState();
-    startSSE();
+    // /api/optimize only kicks the run off — it doesn't hand back this
+    // session's files/input_dir/ws_name. Pull those from /api/state (the
+    // same call used to reattach after a page refresh) so the source-path
+    // field and compare/preview links are correct right away, instead of
+    // sitting blank/broken until finalizeRun() re-derives them at the end.
+    // restoreState() also starts SSE itself when the run is in progress,
+    // so it replaces the manual isRunning/startSSE setup below.
+    await restoreState();
   } catch(e) {
     showNotice(t('notice.resumeFailedPrefix') + e.message, 'err');
   }
