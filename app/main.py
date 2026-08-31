@@ -2076,12 +2076,35 @@ async def get_source_file(ws_name: str, file_id: str, state: AppState = Depends(
     return Response(status_code=404)
 
 
-@app.get("/api/result/{ws_name}/{result_path:path}")
-async def get_result(ws_name: str, result_path: str, state: AppState = Depends(get_session)):
-    if state.workspace and state.workspace.name == ws_name:
+def _resolve_result_file(state: "AppState", result_path: str) -> Optional[Path]:
+    """Locate a completed result's output image on disk.
+
+    Prefers the live workspace copy. Falls back to the copy already placed
+    in the user's chosen output folder (result["final_output_path"], written
+    immediately as each file finishes — see _process_files) for results
+    that were restored on resume: state.workspace is a fresh temp dir every
+    process start (new_workspace), so a result completed before a server
+    restart never has a file at the workspace path even though it's a
+    legitimate result of this session.
+    """
+    if state.workspace:
         p = (state.workspace / "output" / result_path).resolve()
         base = str((state.workspace / "output").resolve())
         if p.exists() and (str(p) == base or str(p).startswith(base + os.sep)):
+            return p
+    for r in state.results:
+        if r.get("output_name") == result_path and r.get("final_output_path"):
+            fp = Path(r["final_output_path"])
+            if fp.exists():
+                return fp
+    return None
+
+
+@app.get("/api/result/{ws_name}/{result_path:path}")
+async def get_result(ws_name: str, result_path: str, state: AppState = Depends(get_session)):
+    if state.workspace and state.workspace.name == ws_name:
+        p = _resolve_result_file(state, result_path)
+        if p:
             return FileResponse(str(p), media_type=_media_type_for(p))
     return Response(status_code=404)
 
@@ -2168,19 +2191,15 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 
     comp_url = _html.escape(f"/api/result/{ws_name}/{comp_rel}", quote=True) if comp_rel else ""
 
-    # Same resolve-and-prefix-check as /api/result, applied here too even
-    # though comp_rel isn't directly attacker-controlled at this call site
-    # (file_id was already validated against state.results above) — cheap
-    # to keep the guarantee consistent rather than assume it holds because
-    # of how this call site happens to be reached today.
+    # Same resolution _resolve_result_file uses for /api/result, applied
+    # here too — this is the size/dimensions label shown next to the image,
+    # and used to silently show "unavailable" for pre-restart results
+    # before /api/result grew a fallback for them, even though the image
+    # itself was reachable.
     orig_path = Path(result["original_path"]) if result.get("original_path") else None
     orig_info = _get_image_info(orig_path) if orig_path and orig_path.exists() else None
-    comp_info = None
-    if comp_rel and state.workspace:
-        comp_path = (state.workspace / "output" / comp_rel).resolve()
-        comp_base = str((state.workspace / "output").resolve())
-        if str(comp_path) == comp_base or str(comp_path).startswith(comp_base + os.sep):
-            comp_info = _get_image_info(comp_path) if comp_path.exists() else None
+    comp_path = _resolve_result_file(state, comp_rel) if comp_rel else None
+    comp_info = _get_image_info(comp_path) if comp_path else None
 
     def _fmt_info(info: Optional[dict]) -> str:
         if not info:
@@ -2701,6 +2720,12 @@ async def get_state(state: AppState = Depends(get_session)):
         "is_running": state.is_running,
         "current": state.current,
         "total": state.total,
+        # Explicit, so the frontend doesn't have to derive it by parsing
+        # files[0].thumbnail — that string is "" for files rebuilt on
+        # resume (thumbnails aren't regenerated there), which silently
+        # broke compare/preview URLs for the whole session, not just the
+        # resumed files. See STATE.wsName in index.html.
+        "ws_name": state.workspace.name if state.workspace else "",
     })
 
 

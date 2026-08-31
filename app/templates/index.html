@@ -2385,7 +2385,11 @@ function finalizeRun() {
   stopSSE();
   setRunButtons(false, false);
   if (STATE.results.length > 0) {
-    STATE.wsName = STATE.files[0]?.thumbnail?.split('/')[3] || '';
+    // Don't clobber a wsName that's already correct (e.g. set by
+    // restoreState() after a resume) — this thumbnail-based derivation
+    // gives '' for files rebuilt on resume, since those never get a
+    // regenerated thumbnail.
+    if (!STATE.wsName) STATE.wsName = STATE.files[0]?.thumbnail?.split('/')[3] || '';
     showResults();
     showPersistentNotice(`Compression complete! ${STATE.results.filter(r => r.success).length}/${STATE.results.length} files optimized.`, 'ok');
   } else {
@@ -2587,7 +2591,11 @@ async function restoreState() {
     const d = await r.json();
     if (!d.files || !d.files.length) return;
     STATE.files = d.files;
-    STATE.wsName = d.files[0]?.thumbnail?.split('/')[3] || '';
+    // Prefer the explicit field — thumbnail-parsing is "" for files
+    // rebuilt on resume (no thumbnail regeneration there), which silently
+    // broke compare/preview URLs for the whole session. Keep the old
+    // derivation only as a fallback for older server versions.
+    STATE.wsName = d.ws_name || (d.files[0]?.thumbnail?.split('/')[3] || '');
     if (d.input_dir) dirPath.value = d.input_dir;
     renderFiles();
     showConfigSection();

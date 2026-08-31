@@ -75,3 +75,79 @@ class TestResumeRestoresInputDir:
 
         d = client.get("/api/state", headers=auth_headers).json()
         assert d["input_dir"] == str(test_images)
+
+
+class TestResumeCompareAfterRestart:
+    def test_state_exposes_ws_name(self, client, auth_headers, test_images, tmp_path):
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        _make_batch(test_images, output_dir)
+
+        client.post("/api/optimize", json={
+            "resume": True,
+            "output_dir": str(output_dir),
+            "output_format": "png",
+            "compression_mode": "lossless",
+        }, headers=auth_headers)
+
+        d = client.get("/api/state", headers=auth_headers).json()
+        assert d["ws_name"], "ws_name should be non-empty right after resume"
+        # files[0].thumbnail is legitimately still "" here (resume doesn't
+        # regenerate thumbnails) — ws_name must not depend on it.
+        assert d["files"][0]["thumbnail"] == ""
+
+    def test_result_served_for_pre_restart_file(self, client, auth_headers, test_images, tmp_path):
+        """The file that finished before the restart must still be
+        comparable — served from final_output_path since the old workspace
+        that had it is gone."""
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        _make_batch(test_images, output_dir)
+
+        client.post("/api/optimize", json={
+            "resume": True,
+            "output_dir": str(output_dir),
+            "output_format": "png",
+            "compression_mode": "lossless",
+        }, headers=auth_headers)
+
+        ws_name = client.get("/api/state", headers=auth_headers).json()["ws_name"]
+        assert ws_name
+
+        r = client.get(f"/api/result/{ws_name}/done.png", headers=auth_headers)
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("image/")
+
+    def test_preview_page_loads_for_pre_restart_file(self, client, auth_headers, test_images, tmp_path):
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        _make_batch(test_images, output_dir)
+
+        client.post("/api/optimize", json={
+            "resume": True,
+            "output_dir": str(output_dir),
+            "output_format": "png",
+            "compression_mode": "lossless",
+        }, headers=auth_headers)
+
+        ws_name = client.get("/api/state", headers=auth_headers).json()["ws_name"]
+        r = client.get(f"/api/preview/{ws_name}/0", headers=auth_headers)
+        assert r.status_code == 200
+        assert f"/api/result/{ws_name}/done.png" in r.text
+
+    def test_result_404s_for_unrelated_ws_name(self, client, auth_headers, test_images, tmp_path):
+        """Ownership check must still hold — a mismatched ws_name is still
+        rejected, fallback or not."""
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        _make_batch(test_images, output_dir)
+
+        client.post("/api/optimize", json={
+            "resume": True,
+            "output_dir": str(output_dir),
+            "output_format": "png",
+            "compression_mode": "lossless",
+        }, headers=auth_headers)
+
+        r = client.get("/api/result/not-the-real-workspace/done.png", headers=auth_headers)
+        assert r.status_code == 404
