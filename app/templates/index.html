@@ -814,6 +814,7 @@ const STATE = {
   isRunning: false,
   isPaused: false,
   pollTimer: null,
+  thumbPollTimer: null,
   runStartTime: 0,
   resultSort: 'default',
   resultFilter: 'all',
@@ -2382,6 +2383,7 @@ function renderLogs() {
 
 function finalizeRun() {
   if (STATE.pollTimer) { clearInterval(STATE.pollTimer); STATE.pollTimer = null; }
+  if (STATE.thumbPollTimer) { clearInterval(STATE.thumbPollTimer); STATE.thumbPollTimer = null; }
   stopSSE();
   setRunButtons(false, false);
   if (STATE.results.length > 0) {
@@ -2585,6 +2587,45 @@ resetBtn.addEventListener('click', async () => {
 // Restore server-side session state after a page refresh — the server
 // keeps files/results per session, but the UI used to come back blank
 // (and /api/state sat unused). Also reattaches to a still-running batch.
+// Backfills STATE.files' thumbnails after a resume reattach (see the call
+// site in restoreState()) by re-polling /api/state until every file has
+// one, merging by id rather than replacing STATE.files wholesale so it
+// can't clobber anything else concurrent code touches on that array.
+// Bounded and self-clearing: stops on completion, on run end, or after a
+// generous cap — same "never outlive the run" discipline as STATE.pollTimer,
+// after the orphaned-task issues this project has hit before.
+function pollThumbnailsUntilReady() {
+  if (STATE.thumbPollTimer) return;
+  let attempts = 0;
+  const MAX_ATTEMPTS = 60; // ~60s at 1/s — plenty for thumbnailing a batch
+  STATE.thumbPollTimer = setInterval(async () => {
+    attempts++;
+    if (!STATE.isRunning || attempts > MAX_ATTEMPTS) {
+      clearInterval(STATE.thumbPollTimer);
+      STATE.thumbPollTimer = null;
+      return;
+    }
+    try {
+      const r = await fetch('/api/state');
+      const d = await r.json();
+      const byId = new Map(d.files.map(f => [f.id, f.thumbnail]));
+      let changed = false;
+      for (const f of STATE.files) {
+        const t = byId.get(f.id);
+        if (t && t !== f.thumbnail) { f.thumbnail = t; changed = true; }
+      }
+      if (changed) renderFiles();
+      if (STATE.files.every(f => f.thumbnail)) {
+        clearInterval(STATE.thumbPollTimer);
+        STATE.thumbPollTimer = null;
+      }
+    } catch (e) {
+      // Transient fetch error — leave the timer running, try again next
+      // tick; MAX_ATTEMPTS is the backstop if this keeps failing.
+    }
+  }, 1000);
+}
+
 async function restoreState() {
   try {
     const r = await fetch('/api/state');
@@ -2629,6 +2670,14 @@ async function restoreState() {
       // so the client re-syncs everything accumulated so far, then continues
       // live. Falls back to polling on failure/silence.
       startSSE();
+      // Files rebuilt on resume start with thumbnail: "" and fill in on the
+      // server asynchronously (_backfill_resume_thumbnails) — nothing else
+      // re-fetches state.files after this point, so without this the grid
+      // would just stay blank until the next full page load, even though
+      // the thumbnails were sitting there ready on the server the whole
+      // time. Normal (non-resume) reattaches already have real thumbnails
+      // from scan, so this is a no-op for them.
+      if (d.files.some(f => !f.thumbnail)) pollThumbnailsUntilReady();
     } else if (d.results && d.results.length) {
       STATE.results = d.results;
       showResults();
