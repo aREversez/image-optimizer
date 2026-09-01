@@ -999,6 +999,53 @@ async def _scan_and_thumbnail(state: AppState, directory: Path, recursive: bool)
     _push_recent("scan_dirs", str(directory.resolve()))
 
 
+async def _backfill_resume_thumbnails(state: "AppState", files: list):
+    """Generate thumbnails for files reconstructed on resume, concurrently
+    with the compression task the resume branch of start_optimization
+    already kicked off.
+
+    Deliberately NOT a call into _scan_and_thumbnail: that walks the whole
+    directory fresh and overwrites state.files/state.total at the end,
+    which would race with the compression task mutating state.total/
+    state.current/state.results at the same time — same class of bug as
+    the worker-pool/session-leak issues this project has already been bit
+    by. This only ever writes each file dict's own "thumbnail" key, on a
+    *fixed* list (the one resume already rebuilt) — it never touches
+    state.total or the list's membership/order, so there's nothing here
+    for the compression task (which writes "status"/state.results, not
+    "thumbnail") to race against.
+    """
+    ws = state.workspace
+    if ws is None or not files:
+        return
+
+    async def process_item(item):
+        idx, f = item
+        img_path = Path(f["path"])
+        if not img_path.exists():
+            return
+        thumb_rel = f"thumb/resume_{idx}_{img_path.stem}.jpg"
+        thumb_path = ws / thumb_rel
+        if not thumb_path.exists():
+            await asyncio.to_thread(_gen_thumbnail, img_path, thumb_path)
+        f["thumbnail"] = f"/api/thumb/{ws.name}/{thumb_rel}"
+
+    def on_item_error(item, e):
+        # Leave thumbnail as "" — same graceful degradation as a normal
+        # scan's on_item_error. Don't fail the whole backfill over one
+        # unreadable file; compression will report its own error for it
+        # independently if it's still pending.
+        pass
+
+    await _run_worker_pool(
+        list(enumerate(files)),
+        process_item,
+        n_workers=THUMBNAIL_WORKERS,
+        cancel_check=lambda: state.cancelled,
+        on_item_error=on_item_error,
+    )
+
+
 @app.post("/api/scan")
 async def scan_directory(data: ScanRequest, state: AppState = Depends(get_session), _auth: None = Depends(require_token)):
     if state.is_running:
@@ -1220,6 +1267,12 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
         # Restore previous results from the batch so the UI shows the full
         # picture (earlier successes + new ones as they complete).
         state.results = list(previous_results)
+        # Thumbnails were never regenerated for the rebuilt file list (see
+        # the resume branch above) — backfill them concurrently with the
+        # compression task about to be kicked off below, rather than
+        # blocking this response on it or leaving the grid empty for the
+        # whole run.
+        asyncio.create_task(_backfill_resume_thumbnails(state, state.files))
     elif data.retry:
         # Retry re-runs only the previously-failed files. Keep every result
         # that isn't being retried (the earlier successes and their outputs
@@ -2722,10 +2775,12 @@ async def get_state(state: AppState = Depends(get_session)):
         "total": state.total,
         "paused": state.paused,
         # Explicit, so the frontend doesn't have to derive it by parsing
-        # files[0].thumbnail — that string is "" for files rebuilt on
-        # resume (thumbnails aren't regenerated there), which silently
-        # broke compare/preview URLs for the whole session, not just the
-        # resumed files. See STATE.wsName in index.html.
+        # files[0].thumbnail — that string starts "" for files rebuilt on
+        # resume and only fills in once _backfill_resume_thumbnails'
+        # background task gets to each one, which silently broke
+        # compare/preview URLs for the whole session (not just the still-
+        # blank files) until this field existed. See STATE.wsName in
+        # index.html.
         "ws_name": state.workspace.name if state.workspace else "",
     })
 

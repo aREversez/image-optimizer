@@ -92,9 +92,10 @@ class TestResumeCompareAfterRestart:
 
         d = client.get("/api/state", headers=auth_headers).json()
         assert d["ws_name"], "ws_name should be non-empty right after resume"
-        # files[0].thumbnail is legitimately still "" here (resume doesn't
-        # regenerate thumbnails) — ws_name must not depend on it.
-        assert d["files"][0]["thumbnail"] == ""
+        # ws_name must come from the explicit field, not from parsing
+        # files[0].thumbnail — true regardless of whether the concurrent
+        # backfill (see TestResumeThumbnailBackfill) has already populated
+        # it by the time this request lands or not.
 
     def test_result_served_for_pre_restart_file(self, client, auth_headers, test_images, tmp_path):
         """The file that finished before the restart must still be
@@ -175,3 +176,61 @@ class TestResumeProgressState:
         d = client.get("/api/state", headers=auth_headers).json()
         assert d["total"] == 1
         assert d["paused"] is False
+
+
+class TestResumeThumbnailBackfill:
+    """Thumbnails for files rebuilt on resume are backfilled by a
+    concurrent background task (see _backfill_resume_thumbnails), separate
+    from the compression task started in the same request."""
+
+    def test_thumbnails_are_backfilled_for_all_resumed_files(self, client, auth_headers, test_images, tmp_path):
+        from .conftest import wait_for
+
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        _make_batch(test_images, output_dir)
+
+        client.post("/api/optimize", json={
+            "resume": True,
+            "output_dir": str(output_dir),
+            "output_format": "png",
+            "compression_mode": "lossless",
+        }, headers=auth_headers)
+
+        def all_have_thumbnails():
+            d = client.get("/api/state", headers=auth_headers).json()
+            return d["files"] and all(f["thumbnail"] for f in d["files"])
+
+        wait_for(all_have_thumbnails, timeout=10.0)
+
+        d = client.get("/api/state", headers=auth_headers).json()
+        # Both the previously-done file and the pending one get a thumbnail
+        # — the grid shouldn't have a gap depending on which side of the
+        # restart a file happened to finish on.
+        assert len(d["files"]) == 2
+        for f in d["files"]:
+            assert f["thumbnail"].startswith(f"/api/thumb/{d['ws_name']}/")
+
+    def test_backfill_does_not_disturb_total_or_current(self, client, auth_headers, test_images, tmp_path):
+        """The whole reason this isn't just a call into _scan_and_thumbnail:
+        that function overwrites state.total, which would race with the
+        compression task setting state.current as files complete."""
+        from .conftest import wait_for
+
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        _make_batch(test_images, output_dir)
+
+        r = client.post("/api/optimize", json={
+            "resume": True,
+            "output_dir": str(output_dir),
+            "output_format": "png",
+            "compression_mode": "lossless",
+        }, headers=auth_headers)
+        expected_total = r.json()["total"]
+
+        wait_for(lambda: client.get("/api/state", headers=auth_headers).json()["is_running"] is False, timeout=10.0)
+
+        d = client.get("/api/state", headers=auth_headers).json()
+        assert d["total"] == expected_total
+        assert d["current"] == expected_total
