@@ -1452,6 +1452,7 @@ def _validate_overrides(
 
 def _resolve_collision_free_output_paths(
     items: list[tuple[str, str, str]], output_dir: Path,
+    reserved_names: Optional[set[str]] = None,
 ) -> dict[str, Optional[Path]]:
     """Pre-assign an output path per item so name collisions are resolved
     deterministically: "photo.png" and "photo.jpg" both map to "photo.png"
@@ -1466,6 +1467,22 @@ def _resolve_collision_free_output_paths(
     file_info/overrides dict shape, so this same function is usable by any
     caller (web batch, CLI) without adapting to that shape first.
 
+    `reserved_names` seeds used_names with output names a *previous* call
+    already claimed against this same output_dir (already-completed results
+    kept in state.results across a resume or retry — see _process_files).
+    Without this, each call starts with an empty used_names and only sees
+    the items in front of it, so a name that's already spoken for by a
+    result restored from before a server restart (resume) or a completed
+    result being kept around (retry) doesn't block a *new* item from being
+    assigned that same name. On resume specifically that produced two
+    state.results entries with the same output_name — one pointing at the
+    stale pre-restart file (via final_output_path), one at the freshly
+    written workspace file — and _resolve_result_file's workspace-first
+    check then silently served the new file's bytes for the old result's
+    compare/preview link. Expected pre-lowercased (matching the
+    case-folded strings used_names already stores) so this function can
+    stay a simple string-set union without extra casing logic.
+
     A None value in the returned dict marks a name whose resolved path
     escapes output_dir (should be impossible after the caller's own
     sanitization — this is defense in depth, not the primary check) and
@@ -1473,7 +1490,7 @@ def _resolve_collision_free_output_paths(
     """
     base_resolved = str(output_dir.resolve())
     out_paths: dict[str, Optional[Path]] = {}
-    used_names: set[str] = set()
+    used_names: set[str] = set(reserved_names or ())
     for item_id, name, eff_fmt in items:
         base = (output_dir / name).with_suffix(f".{eff_fmt}")
         candidate = base
@@ -1571,12 +1588,24 @@ async def _process_files(
     # A per-file output_format override changes that file's suffix (and thus
     # its collision slot) — see _resolve_collision_free_output_paths for the
     # actual algorithm this now shares with CLI mode.
+    #
+    # Seed used_names with output_name values state.results already holds
+    # (previous_results on resume; the kept, non-retried results on retry)
+    # — otherwise a name already claimed by one of those doesn't block a
+    # *new* item in this call from being assigned it too, since each call
+    # to _resolve_collision_free_output_paths only sees the items passed to
+    # it. See that function's docstring for the resume scenario this fixes.
+    _reserved_output_names = {
+        str(opt_output_dir / r["output_name"]).lower()
+        for r in state.results if r.get("output_name")
+    }
     out_paths = _resolve_collision_free_output_paths(
         [
             (f["id"], f["name"], overrides.get(f["id"], {}).get("output_format", output_format))
             for f in files
         ],
         opt_output_dir,
+        reserved_names=_reserved_output_names,
     )
 
     async def log(msg):
