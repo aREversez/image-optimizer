@@ -151,3 +151,27 @@ class TestResumeCompareAfterRestart:
 
         r = client.get("/api/result/not-the-real-workspace/done.png", headers=auth_headers)
         assert r.status_code == 404
+
+
+class TestResumeProgressState:
+    """restoreState() (called right after clicking resume, and on a page
+    refresh mid-run) reads total/paused straight off /api/state — a client
+    fallback of `d.total ?? STATE.total` is only as good as whatever
+    STATE.total already is, so /api/state must carry the real values."""
+
+    def test_state_reports_total_and_paused_after_resume(self, client, auth_headers, test_images, tmp_path):
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        _make_batch(test_images, output_dir)
+
+        r = client.post("/api/optimize", json={
+            "resume": True,
+            "output_dir": str(output_dir),
+            "output_format": "png",
+            "compression_mode": "lossless",
+        }, headers=auth_headers)
+        assert r.json()["total"] == 1  # only the pending file is resumed
+
+        d = client.get("/api/state", headers=auth_headers).json()
+        assert d["total"] == 1
+        assert d["paused"] is False

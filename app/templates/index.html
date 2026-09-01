@@ -2601,6 +2601,11 @@ async function restoreState() {
     showConfigSection();
     if (d.is_running) {
       STATE.isRunning = true;
+      STATE.isPaused = !!d.paused;
+      // total/current weren't set anywhere on this path — renderProgressBar
+      // falls back to STATE.total whenever an SSE event doesn't carry its
+      // own total, so it silently showed "Processing N/undefined" here.
+      STATE.total = d.total;
       // We didn't see this run start, so treat "now" as t0 for ETA. The
       // estimate will be rough until a few more files complete under our
       // own timing, then converge — good enough for a reattach.
@@ -2610,7 +2615,14 @@ async function restoreState() {
       STATE.resultCursor = 0;
       STATE.logCursor = 0;
       STATE.logLines = [];
-      cancelBtn.style.display = '';
+      // Same section/button setup as starting a fresh run (see the top of
+      // the optimize click handler) — restoreState() only ever synced
+      // data, never made the progress card itself visible, so a reattach
+      // (resume, or a page refresh mid-run) left it hidden the whole time.
+      progressSection.classList.add('active');
+      resultsSection.classList.remove('active');
+      setRunButtons(true, STATE.isPaused);
+      renderProgressBar(true, STATE.isPaused, d.current || 0, d.total || 0);
       updateStartButtonState();
       // Reattach via SSE (primary): a fresh EventSource replays from r0:l0
       // so the client re-syncs everything accumulated so far, then continues

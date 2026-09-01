@@ -2720,6 +2720,7 @@ async def get_state(state: AppState = Depends(get_session)):
         "is_running": state.is_running,
         "current": state.current,
         "total": state.total,
+        "paused": state.paused,
         # Explicit, so the frontend doesn't have to derive it by parsing
         # files[0].thumbnail — that string is "" for files rebuilt on
         # resume (thumbnails aren't regenerated there), which silently
