@@ -991,12 +991,13 @@ class TestSubprocessTimeout:
                 stderr=asyncio.subprocess.PIPE,
             )
             t0 = _time.perf_counter()
-            stdout, stderr = await Optimizer._communicate_with_timeout(proc, timeout=0.3)
+            stdout, stderr, timed_out = await Optimizer._communicate_with_timeout(proc, timeout=0.3)
             elapsed = _time.perf_counter() - t0
-            return elapsed, stdout, stderr, proc
+            return elapsed, stdout, stderr, timed_out, proc
 
-        elapsed, stdout, stderr, proc = asyncio.run(scenario())
+        elapsed, stdout, stderr, timed_out, proc = asyncio.run(scenario())
         assert elapsed < 5.0, f"took {elapsed:.2f}s -- did not return promptly after the 0.3s timeout"
+        assert timed_out is True
         assert b"timed out" in stderr
         assert stdout == b""
         # The process must actually be dead, not orphaned/left running.
@@ -1041,3 +1042,167 @@ class TestSubprocessTimeout:
         assert "timed out" in (result.get("warning") or "")
         assert out.exists()
 
+    def test_communicate_with_timeout_kills_child_on_cancellation(self):
+        """Cancelling the awaiting task must still raise CancelledError (as
+        a bare communicate() always did -- the worker unblocks the same
+        way) but must now also kill the child first, instead of leaving it
+        running as an orphan in the background."""
+        from app.optimizer import Optimizer
+
+        async def scenario():
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-c", "import time; time.sleep(999)",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            task = asyncio.ensure_future(Optimizer._communicate_with_timeout(proc, timeout=300))
+            await asyncio.sleep(0.2)  # let the subprocess actually start
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            return proc
+
+        proc = asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+        assert proc.returncode is not None, "child process must be reaped (not orphaned) after cancellation"
+
+    @staticmethod
+    def _make_real_bin(tmp_path: Path, name: str, script: str) -> Path:
+        """Wrap `script` (a Python source string) as a real, directly
+        executable binary -- .bat on Windows, a shell shim on POSIX --
+        similar to fake_bin_dir's own technique in conftest.py, with one
+        deliberate difference: the POSIX wrapper uses `exec` rather than
+        subprocess.call(). subprocess.call() forks a *child* process that
+        inherits the wrapper's stdout/stderr pipe file descriptors; when
+        the wrapper itself is later killed (the whole point of the tests
+        below), that child is orphaned but keeps holding the pipe open,
+        and asyncio's proc.wait()/communicate() then hangs indefinitely
+        waiting for the pipe to close (confirmed empirically -- this
+        isn't theoretical). `exec` replaces the shell process in place
+        instead of forking, so there's only ever one real process to
+        kill, exactly like a genuine hung pngquant/oxipng/cjpeg/avifenc
+        binary (none of which fork children of their own)."""
+        bin_dir = tmp_path / f"{name}_bin"
+        bin_dir.mkdir()
+        impl = bin_dir / f"{name}_impl.py"
+        impl.write_text(script)
+        if sys.platform == "win32":
+            wrapper = bin_dir / f"{name}.bat"
+            wrapper.write_text(f'@echo off\r\n"{sys.executable}" "{impl}" %*\r\n')
+        else:
+            wrapper = bin_dir / name
+            wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{impl}" "$@"\n')
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC)
+        return wrapper
+
+    def _partial_write_then_hang_bin(self, tmp_path: Path, out_flag: str) -> Path:
+        """Writes garbage to its own output path (mimicking a real binary
+        caught mid-write) and then hangs -- proves the timeout path
+        actually removes that partial file, rather than letting a later
+        exists()-only (or exists()-and-size>0) check mistake it for a
+        completed, valid result."""
+        script = (
+            "import sys, time\n"
+            f"i = sys.argv.index({out_flag!r})\n"
+            "open(sys.argv[i + 1], 'wb').write(b'GARBAGE-PARTIAL-WRITE' * 500)\n"
+            "time.sleep(999)\n"
+        )
+        return self._make_real_bin(tmp_path, "partialhang", script)
+
+    def test_oxipng_timeout_does_not_ship_a_truncated_file_as_output(
+        self, optimizer, tmp_path, monkeypatch
+    ):
+        """The highest-severity version of the partial-write hazard:
+        oxipng's own success check is just "--out path exists", and
+        oxipng_tmp is replace()'d directly onto output_path -- the file
+        the user actually receives. A killed process can leave a
+        non-empty but truncated/corrupt file at that exact path; without
+        explicit cleanup on timeout, this would get shipped as a
+        success=True result instead of falling back to the still-valid
+        pre-oxipng output."""
+        import app.optimizer as optimizer_module
+
+        monkeypatch.setattr(optimizer_module, "SUBPROCESS_TIMEOUT", 0.3)
+        optimizer.oxipng_path = self._partial_write_then_hang_bin(tmp_path, "--out")
+
+        src = tmp_path / "src.png"
+        Image.new("RGB", (48, 48), (46, 204, 113)).save(src, format="PNG")
+        out = tmp_path / "out.png"
+
+        result = asyncio.run(
+            asyncio.wait_for(optimizer.optimize_png(src, out, compression_mode="standard"), timeout=5.0)
+        )
+
+        assert result["success"] is True, result
+        assert "timed out" in (result.get("warning") or ""), result
+        assert out.read_bytes()[:8] == PNG_MAGIC
+        assert b"GARBAGE-PARTIAL-WRITE" not in out.read_bytes()
+
+    def test_avifenc_timeout_does_not_ship_a_truncated_file_as_output(
+        self, optimizer, tmp_path, monkeypatch
+    ):
+        """avifenc's existing success check already requires size > 0, not
+        just exists() -- but a killed process can still leave a
+        non-empty, truncated bitstream that would pass that check on its
+        own. Confirms the timeout path's explicit cleanup is what
+        actually prevents this from being shipped, not the pre-existing
+        size check alone."""
+        import app.optimizer as optimizer_module
+
+        monkeypatch.setattr(optimizer_module, "SUBPROCESS_TIMEOUT", 0.3)
+        optimizer.avifenc_path = self._partial_write_then_hang_bin(tmp_path, "-o")
+
+        src = tmp_path / "src.png"
+        Image.new("RGB", (48, 48), (10, 20, 30)).save(src, format="PNG")
+        out = tmp_path / "out.avif"
+
+        result = asyncio.run(
+            asyncio.wait_for(
+                optimizer.optimize_png(src, out, output_format="avif"), timeout=5.0
+            )
+        )
+
+        assert result["success"] is False, result
+        assert not out.exists(), "a truncated avifenc output must not be shipped as the final file"
+
+    def test_cjpeg_timeout_does_not_ship_a_truncated_file_as_output(
+        self, optimizer, tmp_path, monkeypatch
+    ):
+        import app.optimizer as optimizer_module
+
+        monkeypatch.setattr(optimizer_module, "SUBPROCESS_TIMEOUT", 0.3)
+        optimizer.cjpeg_path = self._partial_write_then_hang_bin(tmp_path, "-outfile")
+
+        src = tmp_path / "src.png"
+        Image.new("RGB", (48, 48), (200, 50, 50)).save(src, format="PNG")
+        out = tmp_path / "out.jpg"
+
+        result = asyncio.run(
+            asyncio.wait_for(optimizer.optimize_png(src, out, output_format="jpg"), timeout=5.0)
+        )
+
+        assert result["success"] is False, result
+        assert not out.exists(), "a truncated cjpeg output must not be shipped as the final file"
+
+    def test_oxipng_non_timeout_failure_now_surfaces_a_warning(self, optimizer, tmp_path):
+        """Bug predating this fix, not introduced by it: unlike pngquant,
+        the oxipng branch never captured stdout/stderr at all, so *any*
+        failure (timeout or otherwise) fell through to the copy2 fallback
+        completely silently -- no warning, no indication oxipng's pass
+        was skipped. Fixed as part of adding timeout handling here, since
+        capturing stderr was needed for the timeout message anyway."""
+        optimizer.oxipng_path = self._make_real_bin(
+            tmp_path, "alwaysfail",
+            "import sys\nsys.stderr.write('oxipng: synthetic failure\\n')\nsys.exit(1)\n",
+        )
+
+        src = tmp_path / "src.png"
+        Image.new("RGB", (48, 48), (46, 204, 113)).save(src, format="PNG")
+        out = tmp_path / "out.png"
+
+        result = asyncio.run(
+            asyncio.wait_for(optimizer.optimize_png(src, out, compression_mode="standard"), timeout=5.0)
+        )
+
+        assert result["success"] is True, result
+        assert "synthetic failure" in (result.get("warning") or ""), result
+        assert out.exists() and out.read_bytes()[:8] == PNG_MAGIC

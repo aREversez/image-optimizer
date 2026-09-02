@@ -142,7 +142,7 @@ class Optimizer:
     @staticmethod
     async def _communicate_with_timeout(
         proc: "asyncio.subprocess.Process", timeout: Optional[float] = None
-    ) -> tuple[bytes, bytes]:
+    ) -> tuple[bytes, bytes, bool]:
         """await proc.communicate() with a timeout, so a hung external
         binary (malformed input, a bug in the tool itself, a stalled
         network drive) fails just the one file being processed instead of
@@ -154,21 +154,53 @@ class Optimizer:
         path picks this up exactly like any other subprocess failure, with
         no extra branching needed at each of the four call sites.
 
+        On cancellation (e.g. the user hits Cancel): wait_for propagates
+        CancelledError the same as a bare communicate() would, so existing
+        cancel handling is unaffected -- but the child is now also killed
+        on the way out. Without this, cancelling unblocks the *worker*
+        (the await raises) but never signals the child process itself,
+        which would otherwise keep running as an orphan in the background.
+
+        The third element of the return value, `timed_out`, lets callers
+        remove any partial file the binary may have left at its own
+        output path before checking whether that path exists -- a killed
+        process can leave a non-empty but truncated/corrupt file there,
+        which an exists()-only (or exists()-and-size>0) check can't tell
+        apart from a completed one.
+
         `timeout=None` reads the module global SUBPROCESS_TIMEOUT lazily at
         call time rather than as a Python default argument value (which
         would freeze whatever it was at class-definition time) -- same
         reasoning as CONCURRENT_WORKERS in main.py's _run_worker_pool, and
         what lets tests shrink this to something fast without threading an
         explicit timeout through optimize_png/optimize_jpeg/optimize_webp/
-        optimize_avif."""
+        optimize_avif.
+
+        Returns (stdout, stderr, timed_out)."""
         if timeout is None:
             timeout = SUBPROCESS_TIMEOUT
         try:
-            return await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            return stdout, stderr, False
         except asyncio.TimeoutError:
+            await Optimizer._kill_and_reap(proc)
+            return b"", f"timed out after {timeout:.0f}s (process killed)".encode(), True
+        except asyncio.CancelledError:
+            await Optimizer._kill_and_reap(proc)
+            raise
+
+    @staticmethod
+    async def _kill_and_reap(proc: "asyncio.subprocess.Process") -> None:
+        """Force-terminate a subprocess and wait for it to actually exit,
+        so it's neither left running as an orphan nor left as a zombie."""
+        try:
             proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
             await proc.wait()
-            return b"", f"timed out after {timeout:.0f}s (process killed)".encode()
+        except Exception:
+            pass
 
     def _detect_binaries(self):
         # See the comment on self._detect_lock in __init__: two concurrent
@@ -713,7 +745,17 @@ class Optimizer:
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
-                    _, stderr = await self._communicate_with_timeout(proc)
+                    _, stderr, timed_out = await self._communicate_with_timeout(proc)
+
+                if timed_out:
+                    # A killed pngquant can leave a partial file at its own
+                    # --output path mid-write; remove it so the exists()
+                    # check below can't mistake a truncated PNG for a
+                    # completed quantization pass.
+                    try:
+                        pngquant_tmp.unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
                 if pngquant_tmp.exists():
                     working_path = pngquant_tmp
@@ -779,7 +821,15 @@ class Optimizer:
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
-                    await self._communicate_with_timeout(proc)
+                    _, stderr, timed_out = await self._communicate_with_timeout(proc)
+
+                if timed_out:
+                    # Same partial-write hazard as pngquant above: a killed
+                    # oxipng can leave a truncated file at --out.
+                    try:
+                        oxipng_tmp.unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
                 if oxipng_tmp.exists():
                     # Registered as a temp BEFORE the replace: if replace()
@@ -789,6 +839,19 @@ class Optimizer:
                     temp_files.append(oxipng_tmp)
                     oxipng_tmp.replace(output_path)
                 else:
+                    # Unlike pngquant above, a failed oxipng pass (timeout,
+                    # non-zero exit, or anything else that left no --out
+                    # file) previously fell through to this copy with no
+                    # signal at all -- stdout/stderr weren't even captured.
+                    # The file still came out compressed (via whatever
+                    # pngquant/normalization already produced), but
+                    # oxipng's own depth-compression pass was silently
+                    # skipped. Surface it the same way pngquant already
+                    # does above.
+                    msg = stderr.decode().strip()
+                    if progress_callback:
+                        await progress_callback(f"oxipng: {msg or 'skipped'} (skipped)")
+                    result["warning"] = msg or "oxipng produced no output"
                     shutil.copy2(working_path, output_path)
             else:
                 if working_path != output_path:
@@ -1015,7 +1078,14 @@ class Optimizer:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                _, stderr = await self._communicate_with_timeout(proc)
+                _, stderr, timed_out = await self._communicate_with_timeout(proc)
+
+            if timed_out:
+                # Killed cjpeg can leave a partial file at -outfile.
+                try:
+                    tmp_jpg.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
             if tmp_jpg.exists():
                 if keep_exif and cleaned_exif:
@@ -1195,7 +1265,16 @@ class Optimizer:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                _, stderr = await self._communicate_with_timeout(proc)
+                _, stderr, timed_out = await self._communicate_with_timeout(proc)
+
+            if timed_out:
+                # Killed avifenc can leave a partial file at -o; the
+                # size>0 check below isn't enough on its own to catch a
+                # truncated-but-nonempty AVIF bitstream.
+                try:
+                    tmp_avif.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
             if tmp_avif.exists() and tmp_avif.stat().st_size > 0:
                 tmp_avif.replace(output_path)
