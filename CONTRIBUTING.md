@@ -25,6 +25,13 @@ Contributions are welcome! Please follow these guidelines:
 - CSS: use CSS custom properties (variables) from `:root`
 - No commented-out code; delete what you don't need
 
+## Releasing (maintainers)
+
+1. Bump the version in `pyproject.toml` and move the `[Unreleased]` entries in `CHANGELOG.md` under the new version
+2. Optional dry run: run the **Release** workflow from the Actions tab and check the artifacts it produces
+3. Tag and push: `git tag v1.2.3 && git push origin v1.2.3`. The **Release** workflow builds the Windows, macOS and Linux downloads and attaches them to a GitHub Release for the tag
+4. To build locally instead: `python scripts/fetch_tools.py && python build_exe.py` (PyInstaller builds only for the OS it runs on)
+
 ## License
 
 By contributing, you agree that your contributions will be licensed under the MIT License.

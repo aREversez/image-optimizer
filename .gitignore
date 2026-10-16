@@ -18,3 +18,6 @@ build/
 bin/*.exe
 bin/pngquant
 bin/oxipng
+bin/cjpeg
+bin/cjpeg-static
+bin/avifenc

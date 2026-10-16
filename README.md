@@ -42,15 +42,21 @@ compression of UI/software screenshots.
 - **Session state restoration** — page refresh restores files/results and re-attaches to a still-running batch
 - **Auto-detect binaries** — finds `pngquant`/`oxipng`/`cjpeg`/`avifenc` in `bin/` folder or system PATH
 - **CLI mode** — `--source`/`--output` runs a batch headlessly (no browser, no server) and exits with a process exit code, for scripts and CI; shares the exact same compression pipeline and settings validation as the web UI
-- **Cross-platform** — Windows, macOS, Linux (pre-built exe for Windows; macOS/Linux users need `pngquant`/`oxipng`/`cjpeg`/`avifenc` on PATH)
+- **Cross-platform** — Windows, macOS, Linux (pre-built downloads for Windows, Apple Silicon Macs and Linux x86-64; running from source needs `pngquant`/`oxipng`/`cjpeg`/`avifenc` in `bin/` or on PATH)
 
 ## Quick Start
 
-### Option 1: Standalone EXE (Windows, no Python required)
+### Option 1: Standalone download (no Python required)
 
-Download the latest release from the [Releases page](https://github.com/aREversez/image-optimizer/releases) and run `ImageOptimizer.exe`.
+Download the latest release from the [Releases page](https://github.com/aREversez/image-optimizer/releases):
 
-> **Windows SmartScreen:** The exe is unsigned (code signing certificates cost $200+/year for open-source projects). On first run, SmartScreen may show "Windows protected your PC" — click **More info** → **Run anyway**. This is normal for unsigned open-source software.
+- **Windows:** run `ImageOptimizer-windows-x64.exe`
+- **macOS (Apple Silicon):** open `ImageOptimizer-macos-arm64.dmg` and follow the `README.txt` inside
+- **Linux (x86-64):** `tar -xzf ImageOptimizer-linux-x64.tar.gz && ./ImageOptimizer`
+
+The macOS and Linux builds run in a terminal; open <http://127.0.0.1:8090> in your browser once they start.
+
+> **Windows SmartScreen:** The exe is unsigned (code signing certificates cost $200+/year for open-source projects). On first run, SmartScreen may show "Windows protected your PC" — click **More info** → **Run anyway**. This is normal for unsigned open-source software. The macOS build is unsigned too (see the `README.txt` in the disk image).
 
 ### Option 2: From source
 
@@ -198,7 +204,7 @@ reading or writing files on your machine through it.
   fallbacks don't need them)
 - **JPG output:** `cjpeg` from mozjpeg (keeps JPEG format instead of converting; see `bin/README.md`)
 - **AVIF output:** `avifenc` from libavif (optional — without it the AVIF format simply isn't offered; see `bin/README.md`)
-- **Standalone EXE:** Windows 10/11 64-bit, no Python required (all four encoders bundled)
+- **Standalone download:** Windows 10/11 64-bit, macOS on Apple Silicon, or Linux x86-64 (built on Ubuntu 24.04, so it needs a similarly recent glibc); no Python required (all four encoders bundled)
 
 ## Project Structure
 

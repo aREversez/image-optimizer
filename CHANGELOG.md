@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Automated releases.** Pushing a version tag now builds the Windows exe,
+  a macOS (Apple Silicon) dmg and a Linux x86-64 tar.gz on GitHub Actions
+  and attaches them to the release (`.github/workflows/release.yml`). Each
+  build is smoke-tested first: the packaged app must start and find all four
+  encoders inside the bundle. The workflow can also be run by hand as a dry
+  run that publishes nothing.
+- `scripts/fetch_tools.py` downloads or builds pngquant, oxipng, cjpeg
+  (mozjpeg) and avifenc into `bin/` on any platform, so the encoders no
+  longer have to be collected by hand for a build.
+- `scripts/smoke_test.py` starts a built executable and checks `/api/health`.
+
+### Changed
+- `build_exe.py` now builds on macOS and Linux as well as Windows (path
+  separator, binary names and icon handling are per platform). A missing
+  encoder is reported up front instead of failing inside PyInstaller; pass
+  `--allow-missing` to build without it.
+- Smaller executable. The build now excludes modules the app never uses
+  (build tooling, unused stdlib corners, and optional extras such as
+  `yaml`/`uvloop`/`httptools` that PyInstaller used to pick up whenever they
+  happened to be installed in the build environment) and strips symbols on
+  Linux. Measured on Linux: 22.2 MB -> 19.5 MB, and a build from a venv with
+  extra packages installed is now the same size as one from a clean venv.
+
 ## [1.0.4] - 2026-08-19
 
 ### Added
