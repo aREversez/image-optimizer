@@ -1,5 +1,19 @@
 # Image Optimizer - Binary Dependencies
 
+**A pip install does not use this folder.** `image_optimizer/binaries.py`
+downloads the pinned upstream release for the current platform on first run
+(verified against a SHA-256) into the per-user data directory:
+
+- Windows: `%LOCALAPPDATA%\ImageOptimizer\bin`
+- macOS: `~/Library/Application Support/ImageOptimizer/bin`
+- Linux: `$XDG_DATA_HOME/image-optimizer/bin` (default `~/.local/share/image-optimizer/bin`)
+
+This folder is the drop-in spot for a **source checkout** or the PyInstaller
+build, and it is searched last: PATH wins over both.
+
+Pinned versions fetched automatically: pngquant 2.17.0, oxipng 10.1.1,
+mozjpeg 4.0.3 (`cjpeg-static.exe`), libavif 1.4.2 (`avifenc.exe`).
+
 Place the following executables in this directory (or add to system PATH).
 
 ## pngquant

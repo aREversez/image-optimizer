@@ -14,7 +14,7 @@ Contributions are welcome! Please follow these guidelines:
 2. Create a feature branch: `git checkout -b feature/my-feature`
 3. Make your changes
 4. Run `pip install -r requirements.txt` to install dependencies
-5. Test manually by running `python -m app`
+5. Test manually by running `python -m image_optimizer`
 6. Ensure no new warnings or errors appear in the console or browser dev tools
 7. Submit a PR with a clear description of the change
 

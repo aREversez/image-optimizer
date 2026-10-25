@@ -40,13 +40,28 @@ compression of UI/software screenshots.
 - **Recent folder history** — quick-access chips with per-item removal and clear all
 - **In-app settings** — gear icon opens a settings panel (host, port, workers, timeouts, language) persisted to `config.json`
 - **Session state restoration** — page refresh restores files/results and re-attaches to a still-running batch
-- **Auto-detect binaries** — finds `pngquant`/`oxipng`/`cjpeg`/`avifenc` in `bin/` folder or system PATH
+- **Auto-detect binaries** — finds `pngquant`/`oxipng`/`cjpeg`/`avifenc` on PATH, in `bin/`, or in the per-user cache filled by the first-run download
 - **CLI mode** — `--source`/`--output` runs a batch headlessly (no browser, no server) and exits with a process exit code, for scripts and CI; shares the exact same compression pipeline and settings validation as the web UI
-- **Cross-platform** — Windows, macOS, Linux (pre-built downloads for Windows, Apple Silicon Macs and Linux x86-64; running from source needs `pngquant`/`oxipng`/`cjpeg`/`avifenc` in `bin/` or on PATH)
+- **Cross-platform** — Windows, macOS, Linux (pre-built downloads for Windows, Apple Silicon Macs and Linux x86-64; the pip package fetches verified upstream binaries on first run where the publisher ships one, otherwise the tools come from PATH)
 
 ## Quick Start
 
-### Option 1: Standalone download (no Python required)
+### Option 1: pip (any OS)
+
+```bash
+pip install image-optimizer-webui
+image-optimizer serve
+```
+
+Open http://127.0.0.1:8090. Bare `image-optimizer` does the same thing — `serve`
+is accepted as a synonym because that is the convention elsewhere.
+
+The first start downloads the encoder binaries this platform can get from
+upstream (see [Encoder binaries](#encoder-binaries)), verifies each against a
+pinned SHA-256, and caches it in your user data directory. The wheel itself is
+pure Python and ships no third-party executables.
+
+### Option 2: Standalone download (no Python required)
 
 Download the latest release from the [Releases page](https://github.com/aREversez/image-optimizer/releases):
 
@@ -58,18 +73,20 @@ The macOS and Linux builds run in a terminal; open <http://127.0.0.1:8090> in yo
 
 > **Windows SmartScreen:** The exe is unsigned (code signing certificates cost $200+/year for open-source projects). On first run, SmartScreen may show "Windows protected your PC" — click **More info** → **Run anyway**. This is normal for unsigned open-source software. The macOS build is unsigned too (see the `README.txt` in the disk image).
 
-### Option 2: From source
+### Option 3: From source
 
 ```bash
 git clone https://github.com/aREversez/image-optimizer.git
 cd image-optimizer
 pip install -r requirements.txt
-python -m app          # or: start.bat
+python -m image_optimizer   # or: image-optimizer, or start.bat
 ```
 
 Open http://127.0.0.1:8090 in your browser.
 
-The first run will auto-detect `pngquant` and `oxipng` in the `bin/` folder and system PATH. See `bin/README.md` if a binary is missing.
+The first run will auto-detect `pngquant`/`oxipng`/`cjpeg`/`avifenc` on PATH and
+in the `bin/` folder, and fetch the pinned releases that are missing. See
+`bin/README.md` if a binary is unavailable.
 
 ## Usage
 
@@ -89,12 +106,14 @@ exits with a process exit code (`0` if everything succeeded, `1` if
 anything failed — safe to check in a script or CI step).
 
 ```
-python -m app --source "D:\screenshots" --output "D:\screenshots-compressed"
+image-optimizer --source "D:\screenshots" --output "D:\screenshots-compressed"
 ```
 
 ```
-python -m app --source ./raw --output ./compressed --quality high --max-width 1920 --mode standard --no-dithering
+image-optimizer --source ./raw --output ./compressed --quality high --max-width 1920 --mode standard --no-dithering
 ```
+
+(From a source checkout, `python -m image_optimizer` works identically.)
 
 CLI mode runs every image through the exact same compression pipeline and
 settings validation as the web UI and Watch Mode — no separate "CLI
@@ -127,7 +146,7 @@ overrides (every file in the batch gets the same settings).
 Command-line flags:
 
 ```
-python -m app --host 127.0.0.1 --port 8090 --workers 4 --dir "D:\screenshots"
+image-optimizer --host 127.0.0.1 --port 8090 --workers 4 --dir "D:\screenshots"
 ```
 
 - `--host` — listen address (default `127.0.0.1`, see Security below)
@@ -197,28 +216,63 @@ reading or writing files on your machine through it.
 
 ## Requirements
 
-- **Source install:** Python 3.10+ with `fastapi`, `uvicorn`, `Pillow`, `jinja2`, `python-multipart`
-  (`pip install -r requirements.txt`, or `pip install -r requirements.lock` for the exact
-  versions this was tested against)
+- **pip install:** Python 3.10+ (dependencies are pulled in automatically)
+- **Source install:** `pip install -r requirements.txt`, or `pip install -r requirements.lock`
+  for the exact versions this was tested against
 - **PNG compression:** `pngquant` and `oxipng` (PNG-only modes; JPG/WebP output and lossless
   fallbacks don't need them)
 - **JPG output:** `cjpeg` from mozjpeg (keeps JPEG format instead of converting; see `bin/README.md`)
 - **AVIF output:** `avifenc` from libavif (optional — without it the AVIF format simply isn't offered; see `bin/README.md`)
 - **Standalone download:** Windows 10/11 64-bit, macOS on Apple Silicon, or Linux x86-64 (built on Ubuntu 24.04, so it needs a similarly recent glibc); no Python required (all four encoders bundled)
 
+## Encoder binaries
+
+The wheel is pure Python: `pngquant` is GPL-3.0-or-later, and every encoder is a
+platform-specific blob, so none of them are redistributed here. On startup the
+app looks for each one on PATH, then in the per-user directory below; whatever
+is still missing gets downloaded from the publisher, verified against a pinned
+SHA-256, and installed there.
+
+The digest is the trust anchor: a download that does not match is discarded,
+never executed.
+
+| OS | Install location |
+|---|---|
+| Windows | `%LOCALAPPDATA%\ImageOptimizer\bin` |
+| macOS | `~/Library/Application Support/ImageOptimizer/bin` |
+| Linux | `$XDG_DATA_HOME/image-optimizer/bin` (default `~/.local/share/image-optimizer/bin`) |
+
+Fetched automatically:
+
+- **Windows x64** — all four: pngquant 2.17.0, oxipng 10.1.1, mozjpeg 4.0.3, libavif 1.4.2
+- **macOS / Linux** — oxipng only; the others have no official standalone binary, so they
+  come from your package manager (`brew install pngquant oxipng mozjpeg libavif`,
+  `apt install pngquant oxipng mozjpeg libavif-bin`)
+
+Offline, behind a proxy, or on an air-gapped network:
+
+- `image-optimizer --no-download`, or set `IMAGE_OPTIMIZER_NO_DOWNLOAD=1`
+- the app still starts — WebP output needs no external binary at all, and the UI only
+  offers formats it can actually produce right now
+- install manually into the directory above (PATH is searched first), and use
+  `--force-download` later to replace a pinned copy
+- startup prints the exact URL, target path and expected SHA-256 for anything it
+  could not fetch
+
 ## Project Structure
 
 ```
 image-optimizer/
-├── app/              # Python web application
+├── image_optimizer/  # Python web application (import package)
 │   ├── main.py       # FastAPI server & routes
 │   ├── optimizer.py  # pngquant/oxipng/cjpeg/avifenc orchestration
+│   ├── binaries.py   # first-run download + SHA-256 verification
 │   ├── watcher.py    # Watch Mode directory poller
 │   ├── models.py     # Pydantic request models
 │   └── templates/    # HTML/CSS/JS frontend (single-page app with i18n)
 ├── assets/           # Logo, icons, banner images
-├── bin/              # Binary dependencies (pngquant, oxipng, cjpeg, avifenc)
-├── tests/            # pytest test suite (249 tests)
+├── bin/              # Local binary drop-in folder (dev/source runs)
+├── tests/            # pytest test suite
 ├── build_exe.py      # PyInstaller build script (onefile mode)
 ├── pyproject.toml    # pip-installable package config
 ├── requirements.txt
@@ -227,4 +281,11 @@ image-optimizer/
 
 ## License
 
-MIT
+MIT for this project's own code.
+
+The pip package redistributes no third-party binaries. The executables it
+downloads are unmodified upstream releases and stay under their own licenses —
+pngquant (GPL-3.0-or-later), oxipng (MIT), mozjpeg's cjpeg (IJG + BSD-3-Clause),
+libavif's avifenc (BSD-2-Clause) — each fetched from its own publisher, with
+source links in `bin/README.md`. The Windows standalone exe bundles them, so
+redistributing that exe carries their notice requirements.

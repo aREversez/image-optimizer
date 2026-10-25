@@ -15,6 +15,28 @@ All notable changes to this project will be documented in this file.
   (mozjpeg) and avifenc into `bin/` on any platform, so the encoders no
   longer have to be collected by hand for a build.
 - `scripts/smoke_test.py` starts a built executable and checks `/api/health`.
+- **PyPI distribution** (`pip install image-optimizer-webui` → `image-optimizer
+  serve`). The package is pure Python (`py3-none-any`); the import package is
+  `image_optimizer` (was `app`, a name that would collide with any other
+  distribution installing a top-level `app/`). Templates ship as package data,
+  and `tests/` is no longer swept into site-packages by auto-discovery.
+- **First-run encoder bootstrap** (`image_optimizer/binaries.py`). The app no
+  longer expects `bin/` to exist: missing tools are downloaded from their
+  publisher, verified against a pinned SHA-256, and cached per user
+  (`%LOCALAPPDATA%\ImageOptimizer\bin`, `~/Library/Application
+  Support/ImageOptimizer/bin`, `$XDG_DATA_HOME/image-optimizer/bin`). Only
+  files whose digest matches are ever executed; a mismatch is discarded.
+  Windows x64 fetches all four (pngquant 2.17.0, oxipng 10.1.1, mozjpeg 4.0.3,
+  libavif 1.4.2); macOS/Linux fetch oxipng only and print package-manager
+  commands for the rest, since the others have no official standalone binary.
+  The lookup order is PATH → user cache → repo `bin/`.
+- `serve` subcommand: `image-optimizer serve` is accepted as a synonym for the
+  bare command (all existing flat flags keep working).
+- `--download` / `--no-download` / `--force-download` flags, plus the
+  `IMAGE_OPTIMIZER_NO_DOWNLOAD=1` environment opt-out for offline and
+  air-gapped deployments. A failed fetch never blocks startup — WebP still
+  works with no external binary — and prints the URL, target path and expected
+  SHA-256 for manual installation.
 
 ### Changed
 - `build_exe.py` now builds on macOS and Linux as well as Windows (path
@@ -27,6 +49,15 @@ All notable changes to this project will be documented in this file.
   happened to be installed in the build environment) and strips symbols on
   Linux. Measured on Linux: 22.2 MB -> 19.5 MB, and a build from a venv with
   extra packages installed is now the same size as one from a clean venv.
+- **No third-party binaries are redistributed.** `pngquant` is
+  GPL-3.0-or-later, so bundling its `.exe` from PyPI would have put GPLv3 §6's
+  source-offer obligation on every downstream user. Downloading the unmodified
+  upstream release instead keeps the package MIT-clean and avoids shipping
+  per-architecture blobs in a platform-independent wheel. (The Windows
+  standalone exe still bundles them, unchanged, under their own licenses.)
+- Internal package renamed `app` → `image_optimizer`; entry point is now
+  `image_optimizer.main:main`, `python -m image_optimizer` replaces `python -m
+  app` (the old spelling no longer exists).
 
 ## [1.0.4] - 2026-08-19
 
