@@ -40,7 +40,7 @@ def optimize_and_wait(client, headers, **body):
 
 
 def session_workspace(client):
-    import app.main as m
+    import image_optimizer.main as m
     return m.SESSIONS[client.cookies.get("imgopt_session")].workspace
 
 
@@ -157,7 +157,7 @@ class TestOptimizeValidationAndWarning:
 
 class TestScanExtensions:
     def test_webp_and_mixed_case_are_found(self, tmp_path):
-        from app.main import _scan_images
+        from image_optimizer.main import _scan_images
         d = tmp_path / "exts"
         d.mkdir()
         Image.new("RGB", (10, 10)).save(d / "a.webp", format="WEBP")

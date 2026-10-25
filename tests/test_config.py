@@ -1,4 +1,4 @@
-"""Regression tests for app.main._load_app_config() (config.json support)."""
+"""Regression tests for image_optimizer.main._load_app_config() (config.json support)."""
 from __future__ import annotations
 
 import json
@@ -15,12 +15,12 @@ def isolate_config_dir(monkeypatch, tmp_path):
 
 class TestLoadAppConfig:
     def test_defaults_when_no_config_file(self, monkeypatch, tmp_path):
-        import app.main as m
+        import image_optimizer.main as m
         isolate_config_dir(monkeypatch, tmp_path)
         assert m._load_app_config() == m.DEFAULT_CONFIG
 
     def test_valid_overrides_are_applied(self, monkeypatch, tmp_path):
-        import app.main as m
+        import image_optimizer.main as m
         isolate_config_dir(monkeypatch, tmp_path)
         m._config_file().write_text(json.dumps({"port": 9999, "concurrent_workers": 8}))
 
@@ -30,7 +30,7 @@ class TestLoadAppConfig:
         assert cfg["host"] == m.DEFAULT_CONFIG["host"], "unset keys should keep their default"
 
     def test_invalid_values_fall_back_to_defaults_without_crashing(self, monkeypatch, tmp_path):
-        import app.main as m
+        import image_optimizer.main as m
         isolate_config_dir(monkeypatch, tmp_path)
         m._config_file().write_text(json.dumps({"port": "not-a-number", "concurrent_workers": -5}))
 
@@ -39,7 +39,7 @@ class TestLoadAppConfig:
         assert cfg["concurrent_workers"] == m.DEFAULT_CONFIG["concurrent_workers"]
 
     def test_unknown_keys_are_ignored_not_errors(self, monkeypatch, tmp_path):
-        import app.main as m
+        import image_optimizer.main as m
         isolate_config_dir(monkeypatch, tmp_path)
         m._config_file().write_text(json.dumps({"some_future_option": 123, "port": 8888}))
 
@@ -48,7 +48,7 @@ class TestLoadAppConfig:
         assert cfg["port"] == 8888
 
     def test_malformed_json_falls_back_to_defaults(self, monkeypatch, tmp_path):
-        import app.main as m
+        import image_optimizer.main as m
         isolate_config_dir(monkeypatch, tmp_path)
         m._config_file().write_text("{not valid json")
 
@@ -58,7 +58,7 @@ class TestLoadAppConfig:
         """A worker count of 0 would make the processing queue never
         drain (no worker tasks spun up at all) — must be rejected/clamped,
         not accepted as a valid-looking but broken configuration."""
-        import app.main as m
+        import image_optimizer.main as m
         isolate_config_dir(monkeypatch, tmp_path)
         m._config_file().write_text(json.dumps({"concurrent_workers": 0}))
 
@@ -74,12 +74,12 @@ class TestOptimizerConcurrencyIsConfigurable:
     replace with a real acquire-N-times-successfully-then-block test."""
 
     def test_semaphore_size_follows_max_concurrency(self, fake_bin_dir):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         opt = Optimizer(bin_dir=fake_bin_dir, max_concurrency=2)
         assert opt._semaphore._value == 2
 
     def test_zero_or_negative_concurrency_clamped_to_one(self, fake_bin_dir):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         opt = Optimizer(bin_dir=fake_bin_dir, max_concurrency=0)
         assert opt._semaphore._value == 1
 
@@ -94,12 +94,12 @@ class TestConfigExampleFile:
     def test_example_file_matches_default_config_exactly(self):
         import json
         from pathlib import Path
-        import app.main as m
+        import image_optimizer.main as m
 
         example_path = Path(__file__).resolve().parent.parent / "config.example.json"
         assert example_path.exists(), "config.example.json is missing from the repo root"
         example = json.loads(example_path.read_text(encoding="utf-8"))
         assert example == m.DEFAULT_CONFIG, (
-            "config.example.json has drifted from app.main.DEFAULT_CONFIG — "
+            "config.example.json has drifted from image_optimizer.main.DEFAULT_CONFIG — "
             "update one to match the other"
         )

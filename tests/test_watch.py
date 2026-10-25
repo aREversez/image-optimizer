@@ -246,7 +246,7 @@ class TestWatchSelfLoopPrevention:
         under the same relative name makes on_change fire repeatedly for
         the same file, indefinitely, instead of the expected once."""
         import asyncio
-        from app.watcher import FolderWatcher
+        from image_optimizer.watcher import FolderWatcher
 
         watch_dir = tmp_path / "watch"
         watch_dir.mkdir()
@@ -287,7 +287,7 @@ class TestFolderWatcherRenameDetection:
 
     def test_rename_reports_renamed_from(self, tmp_path):
         import asyncio
-        from app.watcher import FolderWatcher
+        from image_optimizer.watcher import FolderWatcher
 
         watch_dir = tmp_path / "watch"
         watch_dir.mkdir()
@@ -318,7 +318,7 @@ class TestFolderWatcherRenameDetection:
         stat must never be reported at all — not as a rename, not as
         anything else. Deletions alone are not the watcher's concern."""
         import asyncio
-        from app.watcher import FolderWatcher
+        from image_optimizer.watcher import FolderWatcher
 
         watch_dir = tmp_path / "watch"
         watch_dir.mkdir()

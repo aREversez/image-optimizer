@@ -35,7 +35,7 @@ class TestPoolsUseIndependentKnobs:
     def test_scan_pool_uses_thumbnail_workers_compress_pool_uses_compress_workers(
         self, client, auth_headers, test_images, monkeypatch
     ):
-        import app.main as m
+        import image_optimizer.main as m
         monkeypatch.setattr(m, "CONCURRENT_WORKERS", 5)
         monkeypatch.setattr(m, "THUMBNAIL_WORKERS", 2)
 
@@ -61,21 +61,21 @@ class TestPoolsUseIndependentKnobs:
 
 class TestThumbnailWorkersConfig:
     def test_thumbnail_workers_loaded_from_config(self, monkeypatch, tmp_path):
-        import app.main as m
+        import image_optimizer.main as m
         _isolate_config_dir(monkeypatch, tmp_path)
         m._config_file().write_text(json.dumps({"thumbnail_workers": 7}))
         cfg = m._load_app_config()
         assert cfg["thumbnail_workers"] == 7
 
     def test_invalid_thumbnail_workers_falls_back_to_default(self, monkeypatch, tmp_path):
-        import app.main as m
+        import image_optimizer.main as m
         _isolate_config_dir(monkeypatch, tmp_path)
         m._config_file().write_text(json.dumps({"thumbnail_workers": -3}))
         cfg = m._load_app_config()
         assert cfg["thumbnail_workers"] == m.DEFAULT_CONFIG["thumbnail_workers"]
 
     def test_zero_thumbnail_workers_clamped(self, monkeypatch, tmp_path):
-        import app.main as m
+        import image_optimizer.main as m
         _isolate_config_dir(monkeypatch, tmp_path)
         m._config_file().write_text(json.dumps({"thumbnail_workers": 0}))
         cfg = m._load_app_config()
@@ -86,7 +86,7 @@ class TestThumbnailWorkersConfig:
         # assertion is a local guard so a thumbnail_workers addition can't
         # silently desync the example template.
         from pathlib import Path
-        import app.main as m
+        import image_optimizer.main as m
         example = json.loads(
             (Path(__file__).resolve().parent.parent / "config.example.json").read_text(encoding="utf-8")
         )
@@ -100,7 +100,7 @@ class TestThumbnailWorkersCli:
         doesn't actually start."""
         import sys
         import uvicorn
-        import app.main as m
+        import image_optimizer.main as m
         _isolate_config_dir(monkeypatch, tmp_path)
 
         monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: None)

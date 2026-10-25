@@ -23,12 +23,13 @@ from PIL import Image
 if __package__ is None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.models import OptimizeRequest, PreviewRequest, RecentClearRequest, RecentRemoveRequest, RevealRequest, ScanRequest, WatchRequest
-from app.optimizer import HEX_COLOR_RE, Optimizer
-from app.watcher import FolderWatcher
+from image_optimizer import binaries
+from image_optimizer.models import OptimizeRequest, PreviewRequest, RecentClearRequest, RecentRemoveRequest, RevealRequest, ScanRequest, WatchRequest
+from image_optimizer.optimizer import HEX_COLOR_RE, Optimizer
+from image_optimizer.watcher import FolderWatcher
 
 if getattr(sys, "frozen", False):
-    BASE_DIR = Path(sys._MEIPASS) / "app"
+    BASE_DIR = Path(sys._MEIPASS) / "image_optimizer"
 else:
     BASE_DIR = Path(__file__).resolve().parent
 
@@ -541,7 +542,10 @@ async def lifespan(app: FastAPI):
     if tools:
         print(f"[Startup] Detected: {', '.join(tools)}")
     else:
-        print("[Startup] pngquant/oxipng/cjpeg not found — place binaries in the bin/ directory")
+        print(
+            "[Startup] pngquant/oxipng/cjpeg/avifenc not found — WebP output still works. "
+            f"Run with automatic download (default) or place binaries in {binaries.binary_dir()}"
+        )
     sweep_task = asyncio.create_task(_sweep_stale_sessions())
     yield
     sweep_task.cancel()
@@ -3417,13 +3421,45 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
     return 1 if counters["failed"] > 0 else 0
 
 
+def _download_enabled() -> bool:
+    """Default for --download, with an env opt-out for offline deployments.
+
+    A container image or an air-gapped machine must be able to start without
+    any outbound request, and setting one variable is friendlier than every
+    wrapper script having to remember --no-download.
+    """
+    raw = os.environ.get("IMAGE_OPTIMIZER_NO_DOWNLOAD", "").strip().lower()
+    return raw not in {"1", "true", "yes", "on"}
+
+
+def _strip_serve_subcommand(argv: list[str]) -> list[str]:
+    """Accept `image-optimizer serve ...` as an alias for `image-optimizer ...`.
+
+    A `serve` subcommand is what users of comparable web apps (open-webui,
+    jupyter) expect, and supporting it costs nothing here: the flags are flat,
+    so dropping the literal word is enough and every historical invocation
+    (`image-optimizer --source ...`) parses exactly as before. Only argv[1] is
+    considered, so a --dir path that happens to be named `serve` is never
+    eaten.
+    """
+    if len(argv) > 1 and argv[1] == "serve":
+        return [argv[0], *argv[2:]]
+    return argv
+
+
 def main():
     import argparse
+
+    sys.argv[:] = _strip_serve_subcommand(sys.argv)
 
     global CONCURRENT_WORKERS, THUMBNAIL_WORKERS, WORKSPACE_CLEANUP_DELAY, SESSION_IDLE_TIMEOUT
     config = _load_app_config()
 
-    parser = argparse.ArgumentParser(description="Image Optimizer Web UI")
+    parser = argparse.ArgumentParser(
+        prog="image-optimizer",
+        description="Image Optimizer Web UI",
+        epilog="`image-optimizer serve` is accepted as a synonym for the bare command.",
+    )
     parser.add_argument(
         "--host", default=config["host"],
         help=f"Listen address (default {config['host']!r} / localhost-only, or set 'host' in "
@@ -3518,7 +3554,27 @@ def main():
         help="Keep a curated subset of EXIF (camera make/model, date, exposure). GPS and "
              "Orientation are always stripped regardless. Default: strip all EXIF.",
     )
+
+    # The wheel ships no third-party executables (pngquant is GPL-3.0-or-later;
+    # see binaries.py). They are fetched once, verified, and cached per user.
+    bin_group = parser.add_argument_group("Encoder binaries (downloaded on first run)")
+    bin_group.add_argument(
+        "--download", action=argparse.BooleanOptionalAction, default=_download_enabled(),
+        help="Fetch the pinned pngquant/oxipng/cjpeg/avifenc releases on startup when they are "
+             "missing (default enabled). Every download is verified against a pinned SHA-256 "
+             f"and installed into {binaries.binary_dir()}. Use --no-download (or "
+             "IMAGE_OPTIMIZER_NO_DOWNLOAD=1) on an offline/air-gapped machine.",
+    )
+    bin_group.add_argument(
+        "--force-download", action="store_true",
+        help="Re-fetch the pinned binaries even when a matching copy is already installed.",
+    )
     args = parser.parse_args()
+
+    # Done before the CLI branch so headless `--source` runs get the encoders
+    # too. A failure here only degrades output formats; it must never stop the
+    # app from starting (WebP still works with no external binary at all).
+    binaries.ensure_binaries(download=args.download, force=args.force_download)
 
     if args.source:
         CONCURRENT_WORKERS = max(1, args.workers)

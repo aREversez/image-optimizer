@@ -2,7 +2,7 @@
 crashed / cancelled batch left off.
 
 Batch state is saved one file per output_dir under
-~/.image-optimizer/batches/ (see app.main._batch_state_file) so that two
+~/.image-optimizer/batches/ (see image_optimizer.main._batch_state_file) so that two
 unrelated batches — e.g. two browser tabs pointed at different output
 folders — never share, and can't clobber, each other's resume data. On
 resume, the backend loads the file for the requested output_dir,
@@ -22,7 +22,7 @@ from .test_api_optimize import scan_and_wait, optimize_and_wait
 
 
 def _batch_state_path(output_dir):
-    from app.main import _batch_state_file
+    from image_optimizer.main import _batch_state_file
     return _batch_state_file(str(output_dir))
 
 

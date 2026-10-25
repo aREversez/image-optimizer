@@ -1,4 +1,4 @@
-"""Unit tests for app/optimizer.py, independent of the FastAPI layer."""
+"""Unit tests for image_optimizer/optimizer.py, independent of the FastAPI layer."""
 from __future__ import annotations
 
 import asyncio
@@ -287,7 +287,7 @@ class TestProtectedColorsAndDithering:
         assert "--nofs" in argv
 
     def test_color_map_file_contains_requested_colors(self, tmp_path):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         dst = tmp_path / "map.png"
         ok = Optimizer._make_color_map(["#2ecc71", "#ff0000"], dst)
         assert ok is True
@@ -297,7 +297,7 @@ class TestProtectedColorsAndDithering:
         assert (255, 0, 0) in pixels     # #ff0000
 
     def test_invalid_colors_are_skipped_not_crashed(self, tmp_path):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         dst = tmp_path / "map.png"
         ok = Optimizer._make_color_map(["not-a-color", "#zzzzzz"], dst)
         assert ok is False
@@ -346,7 +346,7 @@ class TestWebP:
         pngquant/oxipng are completely absent (deliberately does NOT use
         the `optimizer` fixture, since the whole point is testing with no
         binaries configured at all)."""
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         src = tmp_path / "src.png"
         Image.new("RGB", (40, 40)).save(src)
         out = tmp_path / "out.webp"
@@ -425,7 +425,7 @@ class TestJPEG:
             assert img.format == "JPEG"
 
     def test_jpeg_requires_cjpeg(self, tmp_path):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         opt = Optimizer(bin_dir=tmp_path / "nonexistent_bin_dir")
         assert opt.cjpeg_path is None
 
@@ -534,7 +534,7 @@ class TestMetadataStrippers:
     testing in isolation from the async pipelines that call them."""
 
     def test_strip_png_metadata_removes_exif_keeps_pixels(self, tmp_path):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         path = tmp_path / "x.png"
         TestGrowthGuard._png_with_exif_chunk(path, b"II*\x00some-exif-bytes")
         data = path.read_bytes()
@@ -548,7 +548,7 @@ class TestMetadataStrippers:
         assert list(Image.open(path).getdata()) == list(Image.open(out).getdata())
 
     def test_strip_png_metadata_leaves_color_chunks_alone(self):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         import io
         buf = io.BytesIO()
         Image.new("RGB", (10, 10), (1, 2, 3)).save(buf, format="PNG", pnginfo=None)
@@ -557,7 +557,7 @@ class TestMetadataStrippers:
         assert Optimizer._strip_png_metadata(data) == data
 
     def test_strip_jpeg_metadata_removes_exif_keeps_pixels(self, tmp_path):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         path = tmp_path / "x.jpg"
         img = Image.new("RGB", (40, 40), (9, 8, 7))
         exif = img.getexif()
@@ -572,7 +572,7 @@ class TestMetadataStrippers:
         assert Image.open(out).size == (40, 40)
 
     def test_strip_jpeg_metadata_noop_on_clean_jpeg(self, tmp_path):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         path = tmp_path / "x.jpg"
         Image.new("RGB", (20, 20), (1, 1, 1)).save(path, format="JPEG")
         data = path.read_bytes()
@@ -582,13 +582,13 @@ class TestMetadataStrippers:
         assert list(Image.open(path).getdata()) == list(Image.open(out).getdata())
 
     def test_strip_jpeg_metadata_handles_malformed_input_without_raising(self):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         assert Optimizer._strip_jpeg_metadata(b"") == b""
         assert Optimizer._strip_jpeg_metadata(b"not a jpeg") == b"not a jpeg"
         assert Optimizer._strip_jpeg_metadata(b"\xff\xd8\xff") == b"\xff\xd8\xff"
 
     def test_strip_webp_metadata_removes_exif_keeps_pixels(self, tmp_path):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         path = tmp_path / "x.webp"
         img = Image.new("RGB", (30, 30), (4, 5, 6))
         exif = img.getexif()
@@ -603,14 +603,14 @@ class TestMetadataStrippers:
         assert list(Image.open(path).convert("RGB").getdata()) == list(Image.open(out).convert("RGB").getdata())
 
     def test_strip_webp_metadata_noop_on_clean_webp(self, tmp_path):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         path = tmp_path / "x.webp"
         Image.new("RGB", (20, 20), (2, 2, 2)).save(path, format="WEBP", lossless=True)
         data = path.read_bytes()
         assert Optimizer._strip_webp_metadata(data) == data
 
     def test_strip_webp_metadata_handles_malformed_input_without_raising(self):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         assert Optimizer._strip_webp_metadata(b"") == b""
         assert Optimizer._strip_webp_metadata(b"not a webp") == b"not a webp"
 
@@ -641,7 +641,7 @@ class TestAvailableModes:
                 ("avif", "standard"), ("avif", "lossless"), ("avif", "resize_only")} == modes
 
     def test_no_binaries_drops_standard_png_and_all_jpeg(self, tmp_path):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         # No binaries found in bin_dir → all paths None.
         opt = Optimizer(bin_dir=tmp_path / "nonexistent_bin_dir")
         assert opt.pngquant_path is None
@@ -748,7 +748,7 @@ class TestAVIF:
         assert "-q" not in argv, f"resize_only should not use a lossy quality flag, got: {argv}"
 
     def test_avif_requires_avifenc(self, tmp_path):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         opt = Optimizer(bin_dir=tmp_path / "nonexistent")
         src = tmp_path / "input.png"
         out = tmp_path / "output.avif"
@@ -881,7 +881,7 @@ class TestScreenshotModeRealBinaries:
         if not pq or not ox:
             pytest.skip("real pngquant/oxipng not on PATH — this validates against the actual binaries, not the CI test doubles")
 
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         opt = Optimizer(bin_dir=tmp_path)
         opt.pngquant_path = Path(pq)
         opt.oxipng_path = Path(ox)
@@ -912,7 +912,7 @@ class TestScreenshotModeRealBinaries:
 
 class TestConcurrentBinaryDetection:
     """_detect_binaries() runs once at construction and again on every
-    /api/health request via asyncio.to_thread (see app/main.py) — by
+    /api/health request via asyncio.to_thread (see image_optimizer/main.py) — by
     design, so a binary installed after the app started gets picked up
     without a restart. Two overlapping /api/health calls therefore run
     this on two different thread-pool threads at once; without a lock
@@ -983,7 +983,7 @@ class TestSubprocessTimeout:
         control flow around them."""
         async def scenario():
             import time as _time
-            from app.optimizer import Optimizer
+            from image_optimizer.optimizer import Optimizer
 
             proc = await asyncio.create_subprocess_exec(
                 sys.executable, "-c", "import time; time.sleep(999)",
@@ -1011,7 +1011,7 @@ class TestSubprocessTimeout:
         new needed there) picks up the synthetic timeout message, and the
         file still succeeds via the lossless/oxipng fallback rather than
         the whole call hanging for the full production timeout."""
-        import app.optimizer as optimizer_module
+        import image_optimizer.optimizer as optimizer_module
 
         hang_script = tmp_path / "pngquant_hangs"
         hang_script.write_text(
@@ -1047,7 +1047,7 @@ class TestSubprocessTimeout:
         a bare communicate() always did -- the worker unblocks the same
         way) but must now also kill the child first, instead of leaving it
         running as an orphan in the background."""
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
 
         async def scenario():
             proc = await asyncio.create_subprocess_exec(
@@ -1119,7 +1119,7 @@ class TestSubprocessTimeout:
         explicit cleanup on timeout, this would get shipped as a
         success=True result instead of falling back to the still-valid
         pre-oxipng output."""
-        import app.optimizer as optimizer_module
+        import image_optimizer.optimizer as optimizer_module
 
         monkeypatch.setattr(optimizer_module, "SUBPROCESS_TIMEOUT", 0.3)
         optimizer.oxipng_path = self._partial_write_then_hang_bin(tmp_path, "--out")
@@ -1146,7 +1146,7 @@ class TestSubprocessTimeout:
         own. Confirms the timeout path's explicit cleanup is what
         actually prevents this from being shipped, not the pre-existing
         size check alone."""
-        import app.optimizer as optimizer_module
+        import image_optimizer.optimizer as optimizer_module
 
         monkeypatch.setattr(optimizer_module, "SUBPROCESS_TIMEOUT", 0.3)
         optimizer.avifenc_path = self._partial_write_then_hang_bin(tmp_path, "-o")
@@ -1167,7 +1167,7 @@ class TestSubprocessTimeout:
     def test_cjpeg_timeout_does_not_ship_a_truncated_file_as_output(
         self, optimizer, tmp_path, monkeypatch
     ):
-        import app.optimizer as optimizer_module
+        import image_optimizer.optimizer as optimizer_module
 
         monkeypatch.setattr(optimizer_module, "SUBPROCESS_TIMEOUT", 0.3)
         optimizer.cjpeg_path = self._partial_write_then_hang_bin(tmp_path, "-outfile")

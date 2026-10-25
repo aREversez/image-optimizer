@@ -1,14 +1,32 @@
 [build-system]
-requires = ["setuptools>=68.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "image-optimizer"
-version = "1.0.4"
-description = "Batch PNG compression with a local web UI"
+name = "image-optimizer-webui"
+dynamic = ["version"]
+description = "Batch image compression with a local web UI (PNG/JPEG/WebP/AVIF)"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
+authors = [{name = "aREversez"}]
+keywords = ["image", "optimizer", "compression", "png", "webp", "avif", "webui", "fastapi"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Web Environment",
+    "Framework :: FastAPI",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Graphics :: Graphics Conversion",
+]
 dependencies = [
     "fastapi>=0.104.0",
     "uvicorn>=0.24.0",
@@ -18,14 +36,46 @@ dependencies = [
 ]
 
 [project.scripts]
-image-optimizer = "app.main:main"
+image-optimizer = "image_optimizer.main:main"
+
+[project.urls]
+Homepage = "https://github.com/aREversez/image-optimizer"
+Issues = "https://github.com/aREversez/image-optimizer/issues"
+Changelog = "https://github.com/aREversez/image-optimizer/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.4.0",
     "httpx>=0.24.0",
+    "build>=1.0.0",
+    "twine>=4.0.0",
 ]
+
+# The wheel is pure Python on purpose: pngquant is GPL-3.0-or-later and the
+# other encoders are per-platform blobs, so none of them belong in a
+# py3-none-any artifact. image_optimizer/binaries.py fetches the pinned
+# upstream releases on first run instead (verified by SHA-256).
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+# Explicit: without this, setuptools' auto-discovery also ships tests/ (it has
+# an __init__.py) as a top-level package and silently collides with any other
+# installed `tests` package.
+include = ["image_optimizer*"]
+
+[tool.setuptools.package-data]
+image_optimizer = ["templates/index.html", "templates/favicon.ico"]
+
+[tool.setuptools.exclude-package-data]
+"*" = ["__pycache__/*", "*.pyc", "*.pyo"]
+
+[tool.setuptools.dynamic]
+version = {attr = "image_optimizer.__version__"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+markers = [
+    "real_binary_bootstrap: exercises the real first-run downloader against a loopback server (exempt from conftest's download stub)",
+]

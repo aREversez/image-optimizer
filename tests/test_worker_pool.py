@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 async def call_helper(items, process_item, **kwargs):
     """Run the helper to completion. Wrapped so tests stay one-liners."""
-    from app.main import _run_worker_pool
+    from image_optimizer.main import _run_worker_pool
     await _run_worker_pool(items, process_item, **kwargs)
 
 
@@ -127,7 +127,7 @@ class TestRealConcurrency:
         at call time, not freeze the value at module import. This test
         sets the global to something distinctive (7) right before calling
         and verifies the helper actually picked it up."""
-        import app.main as m
+        import image_optimizer.main as m
         monkeypatch.setattr(m, "CONCURRENT_WORKERS", 7)
         observed_peak = {"n": 0}
         in_flight = {"n": 0}

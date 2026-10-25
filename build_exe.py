@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-APP = ROOT / "app"
+APP = ROOT / "image_optimizer"
 BIN = ROOT / "bin"
 ASSETS = ROOT / "assets"
 OUT = ROOT / "dist"
@@ -100,8 +100,8 @@ def _pyinstaller_args(tools: list[Path]) -> list[str]:
         *(["--strip"] if sys.platform.startswith("linux") else []),
         *[arg for mod in EXCLUDES for arg in ("--exclude-module", mod)],
         f"--distpath={OUT}",
-        "--add-data", f"{APP / 'templates' / 'index.html'}{SEP}app/templates/",
-        "--add-data", f"{APP / 'templates' / 'favicon.ico'}{SEP}app/templates/",
+        "--add-data", f"{APP / 'templates' / 'index.html'}{SEP}image_optimizer/templates/",
+        "--add-data", f"{APP / 'templates' / 'favicon.ico'}{SEP}image_optimizer/templates/",
         # pngquant/oxipng plus the JPEG (mozjpeg) and AVIF encoders — without
         # the latter two the frozen build silently lacks both output formats
         # (see CHANGELOG 1.0.3).

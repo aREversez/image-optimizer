@@ -14,6 +14,8 @@ from typing import Callable, Optional
 
 from PIL import Image, ImageOps
 
+from image_optimizer import binaries
+
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 HEX_COLOR_RE = re.compile(r"^#?[0-9A-Fa-f]{6}$")
 
@@ -39,19 +41,28 @@ EXIF_TAG_MAKER_NOTE = 0x927C
 
 class Optimizer:
     def __init__(self, bin_dir: Optional[Path] = None, max_concurrency: int = 4):
+        # Searched in order, after PATH. The per-user data directory is where
+        # binaries fetched on first run land (see binaries.py); the repo's own
+        # bin/ stays last so an existing source checkout / dev workflow that
+        # drops the .exe next to the code keeps working unchanged.
         if bin_dir:
-            self.bin_dir = Path(bin_dir)
+            self._bin_dirs = [Path(bin_dir)]
         elif getattr(sys, "frozen", False):
-            self.bin_dir = Path(sys._MEIPASS) / "bin"
+            self._bin_dirs = [Path(sys._MEIPASS) / "bin"]
         else:
-            self.bin_dir = Path(__file__).resolve().parent.parent / "bin"
+            self._bin_dirs = [
+                binaries.binary_dir(),
+                Path(__file__).resolve().parent.parent / "bin",
+            ]
+        # Kept as the headline location for logging; _bin_dirs is authoritative.
+        self.bin_dir = self._bin_dirs[0]
         self.pngquant_path: Optional[Path] = None
         self.oxipng_path: Optional[Path] = None
         self.cjpeg_path: Optional[Path] = None
         self.avifenc_path: Optional[Path] = None
         # Guards _detect_binaries: it's called once here (main thread) and
         # again on every /api/health request via asyncio.to_thread (see
-        # app/main.py), each on its own thread-pool thread. A real
+        # image_optimizer/main.py), each on its own thread-pool thread. A real
         # threading.Lock (not asyncio.Lock, which doesn't coordinate across
         # OS threads) keeps two overlapping detections from interleaving
         # their writes to the four *_path attributes below, which a reader
@@ -134,9 +145,10 @@ class Optimizer:
         except Exception:
             pass
         exe_name = f"{name}.exe" if sys.platform == "win32" else name
-        local = self.bin_dir / exe_name
-        if local.exists():
-            return local.resolve()
+        for directory in self._bin_dirs:
+            local = directory / exe_name
+            if local.exists():
+                return local.resolve()
         return None
 
     @staticmethod

@@ -117,12 +117,12 @@ class TestStaleSessionSweepCancelsWatch:
     requests all run on its own internal loop (via its portal) -- a task
     created through a client.post(...) call can't be awaited from a
     separately asyncio.run()'d loop. So these construct the session and
-    watch task directly against app.main's module-level SESSIONS dict, on
+    watch task directly against image_optimizer.main's module-level SESSIONS dict, on
     a single self-contained event loop, mirroring what watch_start
     actually does."""
 
     def test_stale_sweep_cancels_orphaned_watch_task(self, app_module, tmp_path):
-        import app.main as m
+        import image_optimizer.main as m
 
         async def scenario():
             watched_dir = tmp_path / "watched"
@@ -161,7 +161,7 @@ class TestStaleSessionSweepCancelsWatch:
         """Control case: a session that's still active (last_seen recent)
         must survive the sweep with its watch task untouched -- the fix
         must not become "cancel watch mode on every sweep pass"."""
-        import app.main as m
+        import image_optimizer.main as m
 
         async def scenario():
             watched_dir = tmp_path / "watched2"

@@ -75,7 +75,7 @@ class TestCleanExifUnit:
     Orientation / GPS / MakerNote while keeping camera tags."""
 
     def test_drops_orientation_and_keeps_camera_tags(self, tmp_path):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
 
         src = tmp_path / "src.jpg"
         _make_oriented_jpeg(src)
@@ -89,7 +89,7 @@ class TestCleanExifUnit:
         assert exif.get(TAG_MODEL) == "TestModel"
 
     def test_drops_gps(self, tmp_path):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
 
         src = tmp_path / "gps.jpg"
         _make_jpeg_with_gps(src)
@@ -103,7 +103,7 @@ class TestCleanExifUnit:
         assert TAG_GPS_INFO not in exif, "GPSInfo pointer must be removed"
 
     def test_drops_maker_note(self, tmp_path):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
 
         src = tmp_path / "src.jpg"
         _make_oriented_jpeg(src)
@@ -326,7 +326,7 @@ class TestExifViaApi:
         assert len(prog["results"]) == 1
         assert prog["results"][0]["success"]
 
-        import app.main as m
+        import image_optimizer.main as m
         ws = m.SESSIONS[client.cookies.get("imgopt_session")].workspace
         out_file = ws / "output" / "portrait.png"
         assert out_file.exists()
@@ -365,7 +365,7 @@ class TestExifViaApi:
         assert len(prog["results"]) == 2
         assert all(res["success"] for res in prog["results"])
 
-        import app.main as m
+        import image_optimizer.main as m
         st = m.SESSIONS[client.cookies.get("imgopt_session")]
         ws_name = st.workspace.name
         # Exactly one bump for this run — the EXIF finalize step must not
