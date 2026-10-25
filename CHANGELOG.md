@@ -37,6 +37,12 @@ All notable changes to this project will be documented in this file.
   air-gapped deployments. A failed fetch never blocks startup — WebP still
   works with no external binary — and prints the URL, target path and expected
   SHA-256 for manual installation.
+- **Trusted Publishing workflow** (`.github/workflows/publish.yml`). Pushing a
+  `v*` tag builds the sdist and wheel, refuses to publish when the tag and
+  `image_optimizer.__version__` disagree, asserts that both artifacts still
+  carry `templates/`, runs `twine check --strict`, smoke-tests the installed
+  wheel from outside the checkout, and only then uploads through PyPI's OIDC
+  trusted publisher (`environment: pypi`). No API token is stored anywhere.
 
 ### Changed
 - `build_exe.py` now builds on macOS and Linux as well as Windows (path

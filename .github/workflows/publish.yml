@@ -1,0 +1,129 @@
+name: Publish
+
+# Trusted Publishing: PyPI accepts this workflow only because the repository
+# (aREversez/image-optimizer), this exact filename (publish.yml) and the
+# environment below (pypi) were entered on PyPI as a pending publisher. There is
+# no API token in this file and none in the repository secrets, which is the
+# point -- a stolen PAT cannot publish, and nothing has to be rotated.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Deliberately a separate job from the upload: everything here runs
+    # arbitrary project code, and the OIDC token that can publish to PyPI is
+    # only minted in the publish job below.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # A tag that disagrees with __version__ publishes a release whose metadata
+      # claims something the git history never agreed to, and PyPI versions can
+      # never be reused or overwritten once uploaded.
+      - name: Check that the tag matches the package version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(python -c "import image_optimizer; print(image_optimizer.__version__)")"
+          echo "tag=$tag package=$version"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match image_optimizer.__version__ ($version)"
+            exit 1
+          fi
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+
+      # twine check only validates the rendered metadata, so it passes a wheel
+      # that ships without templates/ and then fails at request time for every
+      # user. A pure-Python distribution of this app has exactly that exposure,
+      # and an upload cannot be undone, only yanked.
+      - name: Check that the artifacts carry the web templates
+        run: |
+          python - <<'PY'
+          import sys
+          import tarfile
+          import zipfile
+          from pathlib import Path
+
+          required = {
+              "image_optimizer/templates/index.html",
+              "image_optimizer/templates/favicon.ico",
+          }
+          dist = Path("dist")
+          wheels = sorted(dist.glob("*.whl"))
+          sdists = sorted(dist.glob("*.tar.gz"))
+          if len(wheels) != 1 or len(sdists) != 1:
+              sys.exit(f"expected exactly one wheel and one sdist, got {wheels} / {sdists}")
+
+          problems = []
+
+          with zipfile.ZipFile(wheels[0]) as zf:
+              names = set(zf.namelist())
+          problems += [f"{wheels[0].name} is missing {n}" for n in required - names]
+
+          with tarfile.open(sdists[0]) as tf:
+              names = {name.split("/", 1)[-1] for name in tf.getnames() if "/" in name}
+          problems += [f"{sdists[0].name} is missing {n}" for n in required - names]
+
+          if problems:
+              print("\n".join(problems))
+              sys.exit(1)
+          print("templates present in both artifacts")
+          PY
+
+      - name: Check the distribution metadata
+        run: twine check --strict dist/*
+
+      # Run the console script from outside the checkout, so a passing check
+      # cannot be the repository's own image_optimizer/ package shadowing the
+      # installed one. --no-download keeps the bootstrap from reaching upstream
+      # during a release.
+      - name: Smoke-test the installed wheel
+        run: |
+          python -m venv "$RUNNER_TEMP/verify"
+          "$RUNNER_TEMP/verify/bin/pip" install dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/verify/bin/image-optimizer" serve --no-download --help
+
+      - name: Stash the distributions for the publish job
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # Guards the release behind a GitHub environment so the upload can require
+    # a reviewer. The name must match what PyPI was told, character for
+    # character; a mismatch fails as invalid-publisher, not as a permissions
+    # error, which makes it easy to misread.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/image-optimizer-webui
+    permissions:
+      id-token: write
+      actions: read
+    steps:
+      - name: Download the built distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
