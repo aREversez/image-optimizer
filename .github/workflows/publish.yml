@@ -5,9 +5,12 @@ name: Publish
 # environment below (pypi) were entered on PyPI as a pending publisher. There is
 # no API token in this file and none in the repository secrets, which is the
 # point -- a stolen PAT cannot publish, and nothing has to be rotated.
+#
+# Both spellings are accepted: every release so far is tagged V1.0.x, and
+# release.yml (the exe build) already matches either case.
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*", "V*"]
 
 permissions:
   contents: read
@@ -31,7 +34,8 @@ jobs:
       # never be reused or overwritten once uploaded.
       - name: Check that the tag matches the package version
         run: |
-          tag="${GITHUB_REF_NAME#v}"
+          # Strip either case: this repository tags releases as V1.0.x.
+          tag="${GITHUB_REF_NAME#[vV]}"
           version="$(python -c "import image_optimizer; print(image_optimizer.__version__)")"
           echo "tag=$tag package=$version"
           if [ "$tag" != "$version" ]; then
