@@ -3468,6 +3468,9 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
 
     total = len(images)
     counters = {"done": 0, "ok": 0, "failed": 0, "orig": 0, "comp": 0, "cached": 0}
+    # Entry paths stored during this run; handed to evict(protect=...) so a
+    # run never deletes the results it just wrote (see cache.ContentCache.evict).
+    protected_entries: set = set()
     lock = asyncio.Lock()
     # No manual semaphore here — Optimizer already bounds concurrent work
     # internally via its own max_concurrency, so every image is dispatched
@@ -3517,7 +3520,9 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
             )
             if cache is not None and cache_key is not None and result["success"]:
                 try:
-                    await asyncio.to_thread(cache.store, cache_key, out_path)
+                    stored = await asyncio.to_thread(cache.store, cache_key, out_path)
+                    if stored is not None:
+                        protected_entries.add(stored)
                 except OSError as e:
                     print(f"[Warning] cache write failed for {rel}: {e}", file=sys.stderr)
         async with lock:
@@ -3559,12 +3564,38 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
 
     await asyncio.gather(*(process(i, p) for i, p in enumerate(images)))
 
+    if cache is not None:
+        try:
+            # Crash leftovers are swept on every run, regardless of the size
+            # cap: with --cache-max-size-mb 0 evict() would never run, and
+            # stale .tmp-* files would accumulate forever.
+            await asyncio.to_thread(cache.sweep_stale_tmp)
+        except OSError as e:
+            print(f"[Warning] cache tmp sweep failed: {e}", file=sys.stderr)
+
     if cache is not None and cache_max_mb > 0:
         try:
-            evicted = await asyncio.to_thread(cache.evict, cache_max_mb * 1024 * 1024)
+            evict_stats: dict = {}
+            evicted = await asyncio.to_thread(
+                cache.evict,
+                cache_max_mb * 1024 * 1024,
+                protected_entries,
+                evict_stats,
+            )
         except OSError as e:
             evicted = 0
             print(f"[Warning] cache eviction failed: {e}", file=sys.stderr)
+        else:
+            if evict_stats.get("total_after", 0) > cache_max_mb * 1024 * 1024:
+                # Only reachable when the cache cannot get under the cap by
+                # evicting unprotected entries: a single entry larger than
+                # the cap, or everything left is this run's fresh writes.
+                print(
+                    "[Warning] cache is still over --cache-max-size-mb after eviction "
+                    "(entries written this run are protected until the next run, and "
+                    "single entries larger than the cap always get evicted)",
+                    file=sys.stderr,
+                )
     else:
         evicted = 0
 

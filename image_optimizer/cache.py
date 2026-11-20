@@ -98,7 +98,9 @@ _FORMAT_ENCODERS = {
     "avif": ("avifenc_path",),
 }
 
-# Stale temp files from a crashed writer are swept by evict() after this long.
+# Stale temp files from a crashed writer are swept at the end of every CLI
+# run after this long (ContentCache.sweep_stale_tmp), independent of the
+# size cap.
 _STALE_TMP_SECONDS = 3600
 
 
@@ -187,9 +189,11 @@ class ContentCache:
             pass
         return CacheProbe(key, original_size, os.path.getsize(out_path))
 
-    def store(self, key: str, produced: Path) -> None:
+    def store(self, key: str, produced: Path) -> Path:
         """Atomically publish a successful result under `key`. Never call
-        for a failed result."""
+        for a failed result. Returns the entry path, so the caller can hand
+        this run's fresh entries to evict(protect=...) instead of having
+        them deleted in the very run that wrote them."""
         entry = self.entry_path(key)
         entry.parent.mkdir(parents=True, exist_ok=True)
         tmp = entry.with_name(f"{entry.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
@@ -201,15 +205,59 @@ class ContentCache:
                 tmp.unlink()
             except FileNotFoundError:
                 pass
+        return entry
 
-    def evict(self, max_bytes: int) -> int:
+    def sweep_stale_tmp(self) -> int:
+        """Delete .tmp-* leftovers from crashed writers older than
+        _STALE_TMP_SECONDS. Called at the end of every CLI run regardless of
+        the size cap: with --cache-max-size-mb 0 evict() never runs, and
+        without this sweep those files would accumulate forever. Returns the
+        number of files removed."""
+        if not self.root.is_dir():
+            return 0
+        now = time.time()
+        removed = 0
+        for shard in self._shards():
+            for f in shard.iterdir():
+                try:
+                    st = f.stat()
+                except OSError:
+                    continue
+                if not f.is_file() or ".tmp-" not in f.name:
+                    continue
+                if now - st.st_mtime > _STALE_TMP_SECONDS:
+                    try:
+                        f.unlink()
+                        removed += 1
+                    except OSError:
+                        pass
+        return removed
+
+    def evict(
+        self,
+        max_bytes: int,
+        protect: Optional[set] = None,
+        stats: Optional[dict] = None,
+    ) -> int:
         """Delete least-recently-used entries (oldest mtime first) until the
         total is at or under max_bytes. max_bytes <= 0 means unlimited.
         Returns the number of entries removed. Entries whose source image is
-        gone are never touched by hits, so they age out here naturally."""
+        gone are never touched by hits, so they age out here naturally.
+
+        `protect` lists entry paths that must not be chosen as victims: the
+        entries written during the current run. Without this, a cap smaller
+        than one entry (or already-full cache plus a fresh write) would
+        delete the just-written entry in the very run that produced it, so
+        the cache could never serve a single hit; the cap may transiently be
+        exceeded because of them, and they are the oldest-next-run victims
+        if nothing hits them meanwhile.
+
+        `stats`, when given a dict, receives {"total_after": bytes} so the
+        caller can warn when the cap is still exceeded (e.g. a single entry
+        larger than the cap, or everything left protected)."""
         if max_bytes <= 0 or not self.root.is_dir():
             return 0
-        now = time.time()
+        protected = protect or set()
         entries: list[tuple[float, int, Path]] = []
         total = 0
         for shard in self._shards():
@@ -221,11 +269,8 @@ class ContentCache:
                 if not f.is_file():
                     continue
                 if ".tmp-" in f.name:
-                    if now - st.st_mtime > _STALE_TMP_SECONDS:
-                        try:
-                            f.unlink()
-                        except OSError:
-                            pass
+                    # Crash leftovers are sweep_stale_tmp()'s job; never
+                    # counted toward the cap, never chosen as victims.
                     continue
                 entries.append((st.st_mtime, st.st_size, f))
                 total += st.st_size
@@ -233,12 +278,16 @@ class ContentCache:
         for _mtime, size, f in sorted(entries, key=lambda e: e[0]):
             if total <= max_bytes:
                 break
+            if f in protected:
+                continue
             try:
                 f.unlink()
             except OSError:
                 continue
             total -= size
             removed += 1
+        if stats is not None:
+            stats["total_after"] = total
         return removed
 
     def _shards(self) -> Iterable[Path]:

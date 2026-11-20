@@ -4,11 +4,13 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+import time
 from pathlib import Path
 
 import pytest
 from PIL import Image, features as pil_features
 
+import image_optimizer.cache as _cache_mod
 from image_optimizer.cache import CACHE_SCHEMA_VERSION, ContentCache, file_sha256
 from tests.test_cli import cli_args
 
@@ -324,3 +326,83 @@ class TestAvifEntries:
         _run(app_module, optimizer, src, tmp_path / "o", tmp_path / "cache",
              format="avif")
         assert "will never hit for AVIF" in capsys.readouterr().err
+
+
+class TestStaleTmpSweep:
+    """Crash leftovers (.tmp-* files) must be swept even when no size cap is
+    set: with --cache-max-size-mb 0 evict() never runs, and before the
+    dedicated sweep those files accumulated forever."""
+
+    @staticmethod
+    def _stale_tmp(cache: Path) -> Path:
+        p = cache / "ab" / ("ab" + "0" * 62 + ".png.tmp-123-deadbeef")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"partial write")
+        old = time.time() - 2 * _cache_mod._STALE_TMP_SECONDS
+        os.utime(p, (old, old))
+        return p
+
+    def test_sweep_removes_only_stale_tmp(self, tmp_path):
+        cache = tmp_path / "c"
+        stale = self._stale_tmp(cache)
+        fresh = cache / "ab" / ("cd" + "0" * 62 + ".png.tmp-123-cafebabe")
+        fresh.write_bytes(b"just written")
+        entry = cache / "cd" / ("cd" + "0" * 62 + ".png")
+        entry.parent.mkdir(parents=True, exist_ok=True)
+        entry.write_bytes(b"real entry")
+        c = ContentCache(cache, "png", "s", "e")
+        assert c.sweep_stale_tmp() == 1
+        assert not stale.exists()
+        assert fresh.exists()  # younger than the threshold
+        assert entry.exists()  # real entries are never swept
+
+    def test_unlimited_run_still_sweeps(self, app_module, optimizer, tmp_path):
+        src, cache = _make_src(tmp_path, 1), tmp_path / "cache"
+        stale = self._stale_tmp(cache)
+        assert _run(app_module, optimizer, src, tmp_path / "o", cache,
+                    cache_max_size_mb=0) == 0
+        assert not stale.exists()
+
+
+class TestEvictGrace:
+    """Entries written during the current run must survive that run's own
+    eviction: with a cap smaller than one entry, every run would otherwise
+    store a result and immediately delete it, so the cache could never serve
+    a single hit."""
+
+    def test_evict_never_picks_protected_entries(self, tmp_path):
+        c = ContentCache(tmp_path / "c", "png", "s", "e")
+        old = c.entry_path("aa" + "0" * 62)
+        old.parent.mkdir(parents=True, exist_ok=True)
+        old.write_bytes(b"x" * 100)
+        os.utime(old, (1_000, 1_000))
+        fresh = c.entry_path("bb" + "0" * 62)
+        fresh.parent.mkdir(parents=True, exist_ok=True)
+        fresh.write_bytes(b"x" * 100)
+        os.utime(fresh, (2_000, 2_000))
+        stats: dict = {}
+        assert c.evict(90, {fresh}, stats) == 1  # only the old entry goes
+        assert not old.exists()
+        assert fresh.exists()
+        # The caller learns the cap is still exceeded (fresh 100 B > 90 B).
+        assert stats["total_after"] == 100
+
+    def test_run_warns_when_still_over_cap(self, app_module, optimizer, tmp_path, capsys):
+        # One incompressible PNG larger than a 1 MB cap: the fresh entry is
+        # protected from same-run eviction, so the cap stays exceeded and the
+        # operator gets a warning instead of silent thrash on every run.
+        raw = random.Random(7).randbytes(600 * 600 * 3)
+        src = tmp_path / "src"
+        src.mkdir()
+        Image.frombytes("RGB", (600, 600), raw).save(src / "big.png")
+        cache = tmp_path / "cache"
+        assert _run(app_module, optimizer, src, tmp_path / "o", cache,
+                    cache_max_size_mb=1) == 0
+        assert "still over --cache-max-size-mb" in capsys.readouterr().err
+        # The just-written entry survived its own run's eviction.
+        assert len(_entries(cache)) == 1
+
+    def test_under_cap_run_does_not_warn(self, app_module, optimizer, tmp_path, capsys):
+        src, cache = _make_src(tmp_path, 1), tmp_path / "cache"
+        _run(app_module, optimizer, src, tmp_path / "o", cache, cache_max_size_mb=1024)
+        assert "still over" not in capsys.readouterr().err
