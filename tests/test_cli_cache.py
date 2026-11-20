@@ -4,11 +4,15 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 from PIL import Image, features as pil_features
+
+from image_optimizer.cache import is_valid_reusable_output
 
 import image_optimizer.cache as _cache_mod
 from image_optimizer.cache import CACHE_SCHEMA_VERSION, ContentCache, file_sha256
@@ -425,3 +429,93 @@ class TestEvictGrace:
         src, cache = _make_src(tmp_path, 1), tmp_path / "cache"
         _run(app_module, optimizer, src, tmp_path / "o", cache, cache_max_size_mb=1024)
         assert "still over" not in capsys.readouterr().err
+
+
+class TestConcurrency:
+    """The cache is lock-free by design (atomic os.replace, last write
+    wins); these smoke tests hammer the paths a reviewer would worry about:
+    concurrent same-key writers and probes landing while writers replace
+    entries. Every served file must be a complete, valid image."""
+
+    def test_same_key_writers_last_write_wins(self, tmp_path):
+        c = ContentCache(tmp_path / "c", "png", "s", "e")
+        src = tmp_path / "in.png"
+        Image.new("RGB", (8, 8)).save(src)
+        key = c.key_for_digest(file_sha256(src))
+        produced = tmp_path / "produced"
+        produced.mkdir()
+
+        def write(i: int) -> None:
+            p = produced / f"v{i}.png"
+            Image.new("RGB", (8, 8), (i, i, i)).save(p, format="PNG")
+            c.store(key, p)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(write, range(8)))
+
+        probe = c.probe(src, tmp_path / "out.png")
+        assert probe.hit_size is not None
+        assert is_valid_reusable_output(c.entry_path(key), "png")
+
+    def test_probe_while_writing_never_serves_partial_bytes(self, tmp_path):
+        c = ContentCache(tmp_path / "c", "png", "s", "e")
+        src = tmp_path / "in.png"
+        Image.new("RGB", (8, 8)).save(src)
+        key = c.key_for_digest(file_sha256(src))
+        big = tmp_path / "big.png"
+        # A few MB so the copy takes long enough to overlap with probes.
+        raw = random.Random(3).randbytes(1024 * 1024 * 3)
+        Image.frombytes("RGB", (1024, 1024), raw).save(big, format="PNG")
+        stop = threading.Event()
+        errors: list = []
+
+        def writer(writer_id: int) -> None:
+            while not stop.is_set():
+                try:
+                    c.store(key, big)
+                except Exception as e:  # pragma: no cover - failure IS the bug
+                    errors.append(e)
+                    return
+
+        def reader(reader_id: int) -> None:
+            # Distinct out paths: in real runs every file gets its own output
+            # path; two writers to the SAME out path would clobber each other
+            # with or without the cache (pre-existing, out of scope here).
+            out = tmp_path / f"out{reader_id}.png"
+            while not stop.is_set():
+                probe = c.probe(src, out)
+                if probe.hit_size is not None:
+                    try:
+                        with Image.open(out) as img:
+                            img.verify()
+                    except Exception:
+                        errors.append("probe served a partial/invalid file")
+                        return
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = [pool.submit(writer, 0), pool.submit(reader, 1), pool.submit(reader, 2)]
+            time.sleep(1.0)
+            stop.set()
+            for fut in futures:
+                fut.result()
+
+        assert errors == []
+
+    def test_probe_failure_falls_through_to_recompression(
+        self, app_module, optimizer, counting, tmp_path, monkeypatch
+    ):
+        """An unreadable input (probe raises OSError) must degrade into a
+        normal recompression, not a crash: the runcli wrapper catches the
+        error and the regular pipeline reports a real input error itself."""
+        src, cache = _make_src(tmp_path, 1), tmp_path / "cache"
+
+        def boom(path):
+            raise OSError("simulated unreadable input")
+
+        monkeypatch.setattr(_cache_mod, "file_sha256", boom)
+        assert _run(app_module, optimizer, src, tmp_path / "o", cache) == 0
+        assert counting["n"] == 1  # fell through to the pipeline
+        # Nothing stored, by design: the cache key IS the input hash, so a
+        # run that could not hash the input has no key to store under. The
+        # file is still optimized and the run still exits 0.
+        assert len(_entries(cache)) == 0
