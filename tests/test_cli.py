@@ -4,9 +4,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 from PIL import Image
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def cli_args(**overrides) -> argparse.Namespace:
@@ -309,3 +314,31 @@ class TestCliJson:
         ))
         cap = capsys.readouterr()
         assert code == 1 and cap.out == "" and "not a directory" in cap.err
+
+
+class TestCliEntrypointJson:
+    """--json stdout purity must hold through the real main() entry point,
+    not just _run_cli: the binary bootstrap and the config load both print
+    before _run_cli runs, so only a subprocess test can see what a real
+    invocation puts on stdout. Runs with --no-download so it needs no
+    network and no real encoders (PNG/WebP fall back to Pillow)."""
+
+    def test_stdout_is_exactly_one_json_object(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        Image.new("RGB", (16, 16), (90, 40, 40)).save(src / "a.png")
+        proc = subprocess.run(
+            [sys.executable, "-m", "image_optimizer",
+             "--source", str(src), "--output", str(tmp_path / "out"),
+             "--json", "--no-download", "--workers", "1"],
+            capture_output=True, text=True, cwd=REPO_ROOT, timeout=120,
+        )
+        assert proc.returncode == 0, proc.stderr
+        # Raises if anything else (e.g. "[Binaries] ..." bootstrap lines) is
+        # on stdout alongside the report.
+        report = json.loads(proc.stdout)
+        assert report["summary"]["total"] == 1
+        assert report["files"][0]["status"] in ("compressed", "kept_original")
+        assert "[Binaries]" not in proc.stdout
+        # Startup chatter still reaches the operator, just on stderr.
+        assert "[Binaries]" in proc.stderr

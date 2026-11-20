@@ -421,12 +421,15 @@ def _load_app_config() -> dict:
     except FileNotFoundError:
         return cfg
     except Exception as e:
-        print(f"[Warning] Ignoring unreadable config.json ({_config_file()}): {e}")
+        # Startup diagnostics always go to stderr: with --source --json the
+        # stdout contract is "exactly one JSON object" (see _run_cli), and the
+        # config load runs before that report is produced.
+        print(f"[Warning] Ignoring unreadable config.json ({_config_file()}): {e}", file=sys.stderr)
         return cfg
 
     for key, value in raw.items():
         if key not in cfg:
-            print(f"[Warning] Ignoring unknown config.json key: {key!r}")
+            print(f"[Warning] Ignoring unknown config.json key: {key!r}", file=sys.stderr)
             continue
         cfg[key] = value
 
@@ -443,7 +446,7 @@ def _load_app_config() -> dict:
         if not (1 <= cfg["port"] <= 65535):
             raise ValueError("port out of range 1-65535")
     except Exception:
-        print(f"[Warning] Invalid config.json 'port' ({cfg['port']!r}), using default {DEFAULT_CONFIG['port']}")
+        print(f"[Warning] Invalid config.json 'port' ({cfg['port']!r}), using default {DEFAULT_CONFIG['port']}", file=sys.stderr)
         cfg["port"] = DEFAULT_CONFIG["port"]
     try:
         cfg["concurrent_workers"] = int(cfg["concurrent_workers"])
@@ -452,7 +455,8 @@ def _load_app_config() -> dict:
     except Exception:
         print(
             f"[Warning] Invalid config.json 'concurrent_workers' ({cfg['concurrent_workers']!r}), "
-            f"using default {DEFAULT_CONFIG['concurrent_workers']}"
+            f"using default {DEFAULT_CONFIG['concurrent_workers']}",
+            file=sys.stderr,
         )
         cfg["concurrent_workers"] = DEFAULT_CONFIG["concurrent_workers"]
     try:
@@ -462,7 +466,8 @@ def _load_app_config() -> dict:
     except Exception:
         print(
             f"[Warning] Invalid config.json 'thumbnail_workers' ({cfg['thumbnail_workers']!r}), "
-            f"using default {DEFAULT_CONFIG['thumbnail_workers']}"
+            f"using default {DEFAULT_CONFIG['thumbnail_workers']}",
+            file=sys.stderr,
         )
         cfg["thumbnail_workers"] = DEFAULT_CONFIG["thumbnail_workers"]
     try:
@@ -3750,7 +3755,17 @@ def main():
     # Done before the CLI branch so headless `--source` runs get the encoders
     # too. A failure here only degrades output formats; it must never stop the
     # app from starting (WebP still works with no external binary at all).
-    binaries.ensure_binaries(download=args.download, force=args.force_download)
+    # In --json CLI mode every human-readable line must stay off stdout: the
+    # binary bootstrap talks before _run_cli even runs, and its messages would
+    # otherwise break the "exactly one JSON object on stdout" contract
+    # (ensure_binaries defaults to stdout). Web mode and plain CLI runs keep
+    # the historical stdout placement.
+    cli_json = bool(args.source and getattr(args, "json", False))
+    binaries.ensure_binaries(
+        download=args.download,
+        force=args.force_download,
+        out=sys.stderr if cli_json else None,
+    )
 
     if args.source:
         CONCURRENT_WORKERS = max(1, args.workers)
