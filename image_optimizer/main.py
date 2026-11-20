@@ -19,7 +19,7 @@ from zipfile import ZipFile
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
-from PIL import Image
+from PIL import Image, features as pil_features
 
 if __package__ is None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -3429,6 +3429,17 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
             except OSError as e:
                 print(f"[Error] cannot create --cache-dir {cache_dir}: {e}", file=sys.stderr)
                 return 1
+            if args.format == "avif" and not pil_features.check("avif"):
+                # is_valid_reusable_output() validates an AVIF entry by opening
+                # it with Pillow; without AVIF read support every entry fails
+                # that check, so the cache silently never hits for this format
+                # (fail-closed, but worth telling the operator instead of just
+                # burning space). Newer entries are still stored and evicted.
+                print(
+                    "[Warning] --cache-dir will never hit for AVIF: this Pillow build "
+                    "cannot read AVIF (needs Pillow >= 11.3 with libavif or pillow-avif-plugin)",
+                    file=sys.stderr,
+                )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     items = [(str(i), str(p.relative_to(source)), args.format) for i, p in enumerate(images)]

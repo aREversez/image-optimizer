@@ -7,7 +7,7 @@ import random
 from pathlib import Path
 
 import pytest
-from PIL import Image
+from PIL import Image, features as pil_features
 
 from image_optimizer.cache import CACHE_SCHEMA_VERSION, ContentCache, file_sha256
 from tests.test_cli import cli_args
@@ -278,3 +278,49 @@ class TestEvictOrder:
         k1 = c.key_for_digest("d")
         monkeypatch.setattr(cache_mod, "CACHE_SCHEMA_VERSION", CACHE_SCHEMA_VERSION + 1)
         assert c.key_for_digest("d") != k1
+
+
+class TestAvifEntries:
+    """AVIF cache hits depend on Pillow being able to open AVIF files:
+    is_valid_reusable_output() validates an entry by reading it, so a Pillow
+    without AVIF support would fail every AVIF entry (fail-closed) and the
+    cache would silently never hit for that format. pyproject pins
+    Pillow>=11.3 for exactly this reason; the run also warns on stderr when
+    the feature is missing."""
+
+    def test_real_avif_bytes_are_served(self, tmp_path):
+        if not pil_features.check("avif"):
+            pytest.skip("this Pillow build cannot read AVIF")
+        src = tmp_path / "in.png"
+        Image.new("RGB", (16, 16), (30, 90, 120)).save(src)
+        c = ContentCache(tmp_path / "c", "avif", "s", "e")
+        key = c.key_for_digest(file_sha256(src))
+        entry = c.entry_path(key)
+        entry.parent.mkdir(parents=True, exist_ok=True)
+        # Real AVIF bytes (what a real avifenc run produces), not the fake
+        # pipeline's PNG-with-.avif-extension stand-in.
+        Image.new("RGB", (16, 16), (30, 90, 120)).save(entry, format="AVIF")
+        probe = c.probe(src, tmp_path / "out.avif")
+        assert probe.hit_size == entry.stat().st_size
+
+    def test_non_avif_bytes_in_avif_entry_are_rejected(self, tmp_path):
+        """A file that is not really AVIF must not be served, whatever wrote
+        it (this is what keeps the fake-binary test env from false-hitting)."""
+        src = tmp_path / "in.png"
+        Image.new("RGB", (16, 16)).save(src)
+        c = ContentCache(tmp_path / "c", "avif", "s", "e")
+        key = c.key_for_digest(file_sha256(src))
+        entry = c.entry_path(key)
+        entry.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (16, 16)).save(entry, format="PNG")
+        assert c.probe(src, tmp_path / "out.avif").hit_size is None
+
+    def test_run_warns_when_pillow_cannot_read_avif(
+        self, app_module, optimizer, monkeypatch, tmp_path, capsys
+    ):
+        if pil_features.check("avif"):
+            pytest.skip("this Pillow build can read AVIF; warning path not reachable")
+        src = _make_src(tmp_path, 1)
+        _run(app_module, optimizer, src, tmp_path / "o", tmp_path / "cache",
+             format="avif")
+        assert "will never hit for AVIF" in capsys.readouterr().err
