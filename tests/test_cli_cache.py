@@ -199,6 +199,25 @@ class TestRobustness:
         assert code == 1
         assert "--cache-max-size-mb" in capsys.readouterr().err
 
+    def test_cache_dir_inside_output_is_rejected(self, app_module, optimizer, tmp_path, capsys):
+        """Same reasoning as --source: key-named entries would land in the
+        deliverable output directory (and vanish when LRU evicts them)."""
+        src = _make_src(tmp_path, 1)
+        out = tmp_path / "out"
+        assert _run(app_module, optimizer, src, out, out / ".cache") == 1
+        assert "must not be inside --output" in capsys.readouterr().err
+        # Equal to --output is rejected too.
+        assert _run(app_module, optimizer, src, tmp_path / "out2", tmp_path / "out2") == 1
+        assert "must not be inside --output" in capsys.readouterr().err
+
+    def test_cache_dir_ancestor_of_output_is_allowed(self, app_module, optimizer, tmp_path):
+        """Only containment is forbidden: a cache dir that merely *contains*
+        --output does not pollute anything (same asymmetry as --source)."""
+        src = _make_src(tmp_path, 1)
+        parent = tmp_path / "work"
+        code = _run(app_module, optimizer, src, parent / "out", parent)
+        assert code == 0
+
 
 def _big_src(tmp_path: Path, n: int) -> Path:
     """n incompressible ~480 KB PNGs (the fake pngquant copies bytes through)."""

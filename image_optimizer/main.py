@@ -3417,9 +3417,27 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
     cache: Optional[ContentCache] = None
     if cache_dir_arg:
         cache_dir = Path(cache_dir_arg).resolve()
-        if cache_dir == source or source in cache_dir.parents:
+
+        # normcase: Windows paths are case-insensitive filesystem-wise but
+        # Path comparison is not before Python 3.12, so "C:\Src" and
+        # "C:\src" would otherwise slip through the containment checks and
+        # the scan would pick the cache up as input on the next run.
+        cache_dir_nc = os.path.normcase(str(cache_dir))
+        cache_parents_nc = {os.path.normcase(str(p)) for p in cache_dir.parents}
+
+        def _cache_dir_inside(root: Path) -> bool:
+            root_nc = os.path.normcase(str(root))
+            return cache_dir_nc == root_nc or root_nc in cache_parents_nc
+
+        if _cache_dir_inside(source):
             # The scan would pick the cached images up as new sources.
             print("[Error] --cache-dir must not be inside --source", file=sys.stderr)
+            return 1
+        if _cache_dir_inside(output_dir):
+            # Less fatal than --source, but the key-named cache entries would
+            # land in the deliverable output directory and vanish when LRU
+            # evicts them.
+            print("[Error] --cache-dir must not be inside --output", file=sys.stderr)
             return 1
         if args.format not in CACHEABLE_FORMATS:
             log(f"[Warning] --cache-dir ignored: {args.format} output is not cacheable")
@@ -3441,7 +3459,14 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
                     file=sys.stderr,
                 )
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        # Setup error: nothing has been processed yet, so exit 1 with a
+        # message on stderr and no report (same contract as the argument
+        # checks above).
+        print(f"[Error] cannot create --output directory {output_dir}: {e}", file=sys.stderr)
+        return 1
     items = [(str(i), str(p.relative_to(source)), args.format) for i, p in enumerate(images)]
     out_paths = _resolve_collision_free_output_paths(items, output_dir)
 
@@ -3492,7 +3517,24 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
                 }
             log(f"[{d}/{total}] FAIL {rel}: resolved output path escapes --output directory")
             return
-        out_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            # Output I/O failure mid-run must look like any other failure: a
+            # per-file record and a clean exit 1, never an unhandled crash
+            # that would abort asyncio.gather() and (with --json) skip the
+            # report entirely.
+            async with lock:
+                counters["done"] += 1
+                counters["failed"] += 1
+                d = counters["done"]
+                records[img_path] = {
+                    "rel": img_path.relative_to(source).as_posix(), "output_name": None,
+                    "original_size": None, "compressed_size": None, "status": "failed",
+                    "error": f"cannot create output directory {out_path.parent}: {e}",
+                }
+            log(f"[{d}/{total}] FAIL {rel}: cannot create output directory {out_path.parent}: {e}")
+            return
         cache_key = None
         cached_hit = False
         result = None

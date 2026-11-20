@@ -342,3 +342,46 @@ class TestCliEntrypointJson:
         assert "[Binaries]" not in proc.stdout
         # Startup chatter still reaches the operator, just on stderr.
         assert "[Binaries]" in proc.stderr
+
+
+class TestCliOutputIoErrors:
+    """Output I/O failures must degrade into per-file failed records (or a
+    clean setup error), never an unhandled crash that would abort
+    asyncio.gather() and skip the --json report."""
+
+    def test_output_dir_creation_failure_is_a_setup_error(self, app_module, optimizer, tmp_path, capsys):
+        src = tmp_path / "src"
+        src.mkdir()
+        Image.new("RGB", (16, 16)).save(src / "a.png")
+        blocker = tmp_path / "blocker"
+        blocker.write_bytes(b"a file, not a directory")
+        code = asyncio.run(app_module._run_cli(
+            cli_args(source=str(src), output=str(blocker / "out")),
+            optimizer_instance=optimizer,
+        ))
+        cap = capsys.readouterr()
+        assert code == 1
+        assert "cannot create --output directory" in cap.err
+        assert cap.out == ""
+
+    def test_output_subdir_creation_failure_is_a_failed_record(self, app_module, optimizer, tmp_path, capsys):
+        src = tmp_path / "src"
+        (src / "sub").mkdir(parents=True)
+        Image.new("RGB", (24, 24), (10, 60, 120)).save(src / "sub" / "deep.png")
+        Image.new("RGB", (24, 24), (60, 10, 120)).save(src / "top.png")
+        out = tmp_path / "out"
+        out.mkdir()
+        # A FILE where the run needs a subdirectory: mkdir for that one file
+        # fails, everything else must still go through.
+        (out / "sub").write_bytes(b"not a directory")
+        code = asyncio.run(app_module._run_cli(
+            cli_args(source=str(src), output=str(out), json=True),
+            optimizer_instance=optimizer,
+        ))
+        assert code == 1
+        report = json.loads(capsys.readouterr().out)  # report still emitted
+        files = {f["rel"]: f for f in report["files"]}
+        assert files["sub/deep.png"]["status"] == "failed"
+        assert "cannot create output directory" in files["sub/deep.png"]["error"]
+        assert files["top.png"]["status"] in ("compressed", "kept_original")
+        assert report["summary"]["failed"] == 1
