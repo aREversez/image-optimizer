@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **CLI result cache** (`--cache-dir PATH`, `--cache-max-size-mb N`). Unchanged
+  inputs with the same settings are copied from a content-addressed cache
+  instead of recompressed, even when `--output` is a fresh directory every
+  run. Keyed on the input bytes, the pixel-affecting settings and the
+  encoder binaries; only successful results are stored; least-recently-used
+  entries are evicted to stay under the size cap (default 1024 MB).
+- **CLI `--exclude` / `--include` globs.** Repeatable; a pattern without `/`
+  matches the file name at any depth, one with `/` matches the path relative
+  to `--source`. Case-insensitive; `--exclude` always wins.
+- **CLI `--json` report.** One JSON object on stdout with a per-file status
+  (`compressed`, `cached`, `kept_original`, `excluded`, `failed`) and a
+  summary; human-readable output moves to stderr.
+- Byte-determinism regression tests for the compression pipeline
+  (`tests/test_determinism.py`), including a `real_encoders` marker that runs
+  against the real encoder binaries when they are installed.
 - **Automated releases.** Pushing a version tag now builds the Windows exe,
   a macOS (Apple Silicon) dmg and a Linux x86-64 tar.gz on GitHub Actions
   and attaches them to the release (`.github/workflows/release.yml`). Each

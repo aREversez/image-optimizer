@@ -131,15 +131,70 @@ version" of the logic to drift out of sync, so the same `--quality`/
 - `--keep-exif` — keep a curated subset of EXIF (camera make/model, date, exposure); GPS and orientation are always stripped regardless (default: strip all EXIF)
 - `--recursive` / `--no-recursive` — scan subfolders too (default `--recursive`; shared with `--dir`, see Configuration below)
 - `--workers` — concurrent compression workers (shared with the web server's `--workers`, see Configuration below)
+- `--cache-dir PATH` - enable the content-hash result cache (see below); default: no cache
+- `--cache-max-size-mb N` - cache size cap, enforced after each run by evicting least-recently-used entries (default `1024`, `0` = unlimited)
+- `--exclude GLOB` / `--include GLOB` - filter which files are processed; repeatable (see below)
+- `--json` - print the final report as one JSON object on stdout (see below)
 
 Output mirrors the source folder's directory structure. Name collisions
 after a format conversion (e.g. `photo.png` and `photo.jpg` both becoming
 `photo.png`) get a numbered suffix (`photo_2.png`) rather than silently
 overwriting one another.
 
-Not yet supported in CLI mode: `--skip-existing`'s settings-aware caching
-(every CLI run recompresses everything under `--source`) and per-file
-overrides (every file in the batch gets the same settings).
+Not yet supported in CLI mode: per-file overrides (every file in the batch
+gets the same settings). Without `--cache-dir`, every CLI run recompresses
+everything under `--source`.
+
+### Result cache
+
+`--cache-dir` keeps finished results in a content-addressed cache, so an
+unchanged image with the same settings is copied from the cache instead of
+being recompressed. It does not depend on `--output`: a caller that uses a
+fresh temporary output directory on every run still gets hits.
+
+```
+image-optimizer --source ./raw --output "$(mktemp -d)" --cache-dir ~/.cache/image-optimizer-cli
+```
+
+- The key covers the input file's bytes, the pixel-affecting settings (`--quality`, `--mode`, `--max-width`, `--protect-colors`, `--dithering`/`--no-dithering`, `--keep-exif`, `--format`) and the encoders in use (the content of the pngquant/oxipng/cjpeg/avifenc binaries, plus the Pillow version). Changing `--workers`, `--recursive`, `--include` or `--exclude` does not invalidate anything, and renaming or moving a file still hits.
+- Only successful results are stored, never failures. A corrupt or truncated entry is treated as a miss and overwritten.
+- The cache directory must not be inside `--source`.
+- After each run the cache is trimmed to `--cache-max-size-mb` (default 1024 MB, `0` = unlimited) by deleting the least recently used entries first. Entries whose source image no longer exists are never hit again, so they age out on their own.
+- The compression pipeline is covered by byte-determinism tests (`tests/test_determinism.py`); the cache is only valid because the same input and settings always produce the same bytes.
+
+### Filtering with --exclude / --include
+
+```
+image-optimizer --source ./raw --output ./out --exclude "*.bak" --exclude "drafts/*"
+image-optimizer --source ./raw --output ./out --include "icons/*" --exclude "*_old.png"
+```
+
+- A pattern without `/` is matched against the file name at any depth (`*.bak` also hits `sub/dir/a.bak`). A pattern with `/` is matched against the path relative to `--source`, written with forward slashes (`drafts/*`, `icons/*.png`).
+- Matching is case-insensitive on every platform, and `*` also matches `/` (`drafts/*` covers `drafts/old/a.png`).
+- With `--include`, a file must match at least one include pattern. `--exclude` is applied afterwards and always wins when both match.
+- Excluded files are not compressed, produce no output and never count as failures.
+
+### Machine-readable report (--json)
+
+With `--json`, the final report is a single JSON object on stdout and all human-readable output (progress lines, summary, warnings) goes to stderr, so stdout can be piped straight into a parser:
+
+```
+image-optimizer --source ./raw --output ./out --json | jq .summary
+```
+
+```json
+{
+  "files": [
+    {"rel": "icons/a.png", "output_name": "a.png", "original_size": 20480,
+     "compressed_size": 5120, "status": "compressed", "error": null}
+  ],
+  "summary": {"total": 1, "compressed": 1, "cached": 0, "excluded": 0, "failed": 0,
+              "kept_original": 0, "original_size": 20480, "compressed_size": 5120,
+              "saved_percent": 75.0}
+}
+```
+
+`status` is one of `compressed`, `cached` (served from `--cache-dir`), `kept_original` (the result was not smaller, so the original's pixels were kept with metadata stripped), `excluded` or `failed`. Size totals and `saved_percent` cover the successful statuses; `total` counts every scanned file, excluded ones included. The exit code is unchanged: `1` only if a file failed. Setup errors (bad arguments, missing `--source`) exit `1` with a message on stderr and no JSON.
 
 ## Configuration
 
