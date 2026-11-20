@@ -132,23 +132,27 @@ _REPLACE_ATTEMPTS = 6
 _REPLACE_BACKOFF_SECONDS = 0.005
 
 
-def _publish(tmp: Path, entry: Path) -> None:
+def _publish(tmp: Path, entry: Path, output_format: str) -> None:
     """Atomically move a finished temp file into place.
 
     os.replace() is atomic on every platform, but on Windows it can fail
     with PermissionError while the destination is open elsewhere: a reader
     (probe) has the entry open, or another writer is replacing the same key
     at the same moment. Retry briefly; when the final attempt still fails
-    but the entry now exists, another writer has already published a
-    complete file for this key, which is just as valid a result as ours, so
-    there is nothing left to do."""
+    but the entry now exists AND passes the same structural check a hit
+    would, another writer has already published a complete file for this
+    key, which is just as valid a result as ours, so there is nothing left
+    to do. An entry that exists but fails the check (a corrupt leftover that
+    probe() just treated as a miss) is not a result: the PermissionError is
+    re-raised so the caller reports the failed write instead of silently
+    leaving the bad entry in place to miss again on every run."""
     for attempt in range(_REPLACE_ATTEMPTS):
         try:
             os.replace(tmp, entry)
             return
         except PermissionError:
             if attempt == _REPLACE_ATTEMPTS - 1:
-                if entry.is_file():
+                if entry.is_file() and is_valid_reusable_output(entry, output_format):
                     return
                 raise
             time.sleep(_REPLACE_BACKOFF_SECONDS * (2 ** attempt))
@@ -254,7 +258,7 @@ class ContentCache:
         tmp = entry.with_name(f"{entry.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
         try:
             shutil.copyfile(produced, tmp)
-            _publish(tmp, entry)
+            _publish(tmp, entry, self.output_format)
         finally:
             try:
                 tmp.unlink()

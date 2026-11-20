@@ -613,13 +613,81 @@ class TestReplaceRetry:
         key = c.key_for_digest(file_sha256(src))
         entry = c.entry_path(key)
         entry.parent.mkdir(parents=True, exist_ok=True)
-        entry.write_bytes(b"already published by the winning writer")
+        # The winning writer published a complete, valid entry (different
+        # pixels from ours, so the assertion below can tell them apart).
+        Image.new("RGB", (8, 8), (9, 9, 9)).save(entry)
+        winner = entry.read_bytes()
 
         def always_denied(a, b):
             raise PermissionError("destination stays open for the whole run")
 
         monkeypatch.setattr(_cache_mod.os, "replace", always_denied)
         assert c.store(key, src) == entry
-        assert entry.read_bytes() == b"already published by the winning writer"
+        assert entry.read_bytes() == winner
         assert [p.name for p in entry.parent.iterdir() if ".tmp-" in p.name] == []
 
+    @pytest.mark.parametrize("bad", [b"", b"already published by the winning writer", b"\x89PNG\r\n\x1a\n"])
+    def test_store_does_not_accept_a_corrupt_existing_entry(self, tmp_path, monkeypatch, bad):
+        """A corrupt leftover is what probe() just treated as a miss. If the
+        replace keeps failing, store() must not report success over it: the
+        caller would never learn the bad entry was not repaired."""
+        c = ContentCache(tmp_path / "c", "png", "s", "e")
+        src = tmp_path / "in.png"
+        Image.new("RGB", (8, 8)).save(src)
+        key = c.key_for_digest(file_sha256(src))
+        entry = c.entry_path(key)
+        entry.parent.mkdir(parents=True, exist_ok=True)
+        entry.write_bytes(bad)
+
+        def always_denied(a, b):
+            raise PermissionError("destination stays open for the whole run")
+
+        monkeypatch.setattr(_cache_mod.os, "replace", always_denied)
+        with pytest.raises(PermissionError):
+            c.store(key, src)
+        assert [p.name for p in entry.parent.iterdir() if ".tmp-" in p.name] == []
+
+    def test_store_rejects_an_entry_of_the_wrong_format(self, tmp_path, monkeypatch):
+        """A valid image in the wrong format is not a valid entry for this
+        cache either (same rule as a hit)."""
+        c = ContentCache(tmp_path / "c", "png", "s", "e")
+        src = tmp_path / "in.png"
+        Image.new("RGB", (8, 8)).save(src)
+        key = c.key_for_digest(file_sha256(src))
+        entry = c.entry_path(key)
+        entry.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (8, 8)).save(entry, format="JPEG")
+
+        monkeypatch.setattr(
+            _cache_mod.os, "replace",
+            lambda a, b: (_ for _ in ()).throw(PermissionError("locked")),
+        )
+        with pytest.raises(PermissionError):
+            c.store(key, src)
+
+    def test_cli_reports_a_failed_cache_write_and_still_succeeds(
+        self, app_module, optimizer, tmp_path, monkeypatch, capsys
+    ):
+        """End to end: an unrepairable corrupt entry surfaces as the existing
+        '[Warning] cache write failed' on stderr, the file itself is still
+        compressed and delivered, and the exit code stays 0."""
+        src_dir = _make_src(tmp_path, 1)
+        cache = tmp_path / "cache"
+        assert _run(app_module, optimizer, src_dir, tmp_path / "o1", cache) == 0
+        (entry,) = _entries(cache)
+        entry.write_bytes(entry.read_bytes()[:20])  # corrupt it
+        capsys.readouterr()
+
+        # os is a process-wide module: only deny replaces INTO the cache, so
+        # the compression pipeline's own os.replace calls keep working.
+        real_replace = os.replace
+
+        def deny_cache_replace(a, b):
+            if cache in Path(b).parents:
+                raise PermissionError("locked")
+            return real_replace(a, b)
+
+        monkeypatch.setattr(_cache_mod.os, "replace", deny_cache_replace)
+        assert _run(app_module, optimizer, src_dir, tmp_path / "o2", cache) == 0
+        assert "cache write failed" in capsys.readouterr().err
+        assert (tmp_path / "o2" / "img0.png").exists()

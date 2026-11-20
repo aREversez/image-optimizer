@@ -88,6 +88,10 @@ All notable changes to this project will be documented in this file.
   has it open; `store()` now retries briefly and treats "another writer
   already published a complete entry" as success, so duplicate images in one
   batch no longer produce `cache write failed` warnings or skipped writes.
+  "Complete" is checked with the same structural validation a hit uses: if
+  the replace keeps failing and the existing entry is corrupt (or the wrong
+  format), `store()` now raises and the run reports `cache write failed`
+  instead of silently leaving the bad entry to miss again on every run.
 - **The cache never deletes files it did not write.** Eviction and the temp
   sweep now accept only the module's own names (`<64 hex>.<format>` and its
   `.tmp-<pid>-<8 hex>` form inside a two-hex-digit shard), so pointing
