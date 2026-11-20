@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -12,10 +13,13 @@ from pathlib import Path
 import pytest
 from PIL import Image, features as pil_features
 
-from image_optimizer.cache import is_valid_reusable_output
-
 import image_optimizer.cache as _cache_mod
-from image_optimizer.cache import CACHE_SCHEMA_VERSION, ContentCache, file_sha256
+from image_optimizer.cache import (
+    CACHE_SCHEMA_VERSION,
+    ContentCache,
+    file_sha256,
+    is_valid_reusable_output,
+)
 from tests.test_cli import cli_args
 
 
@@ -214,6 +218,21 @@ class TestRobustness:
         assert _run(app_module, optimizer, src, tmp_path / "out2", tmp_path / "out2") == 1
         assert "must not be inside --output" in capsys.readouterr().err
 
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="case-insensitive path containment is Windows-only",
+    )
+    def test_cache_dir_case_variant_of_output_is_rejected(
+        self, app_module, optimizer, tmp_path, capsys
+    ):
+        """Windows compares paths case-insensitively on disk; before
+        os.path.normcase, 'Out' vs 'out' slipped past the containment check
+        and the cache landed inside the deliverable directory."""
+        src = _make_src(tmp_path, 1)
+        out = tmp_path / "Out"
+        assert _run(app_module, optimizer, src, out, tmp_path / "out") == 1
+        assert "must not be inside --output" in capsys.readouterr().err
+
     def test_cache_dir_ancestor_of_output_is_allowed(self, app_module, optimizer, tmp_path):
         """Only containment is forbidden: a cache dir that merely *contains*
         --output does not pollute anything (same asymmetry as --source)."""
@@ -368,7 +387,8 @@ class TestStaleTmpSweep:
     def test_sweep_removes_only_stale_tmp(self, tmp_path):
         cache = tmp_path / "c"
         stale = self._stale_tmp(cache)
-        fresh = cache / "ab" / ("cd" + "0" * 62 + ".png.tmp-123-cafebabe")
+        fresh = cache / "cd" / ("cd" + "0" * 62 + ".png.tmp-123-cafebabe")
+        fresh.parent.mkdir(parents=True, exist_ok=True)
         fresh.write_bytes(b"just written")
         entry = cache / "cd" / ("cd" + "0" * 62 + ".png")
         entry.parent.mkdir(parents=True, exist_ok=True)
@@ -519,3 +539,87 @@ class TestConcurrency:
         # run that could not hash the input has no key to store under. The
         # file is still optimized and the run still exits 0.
         assert len(_entries(cache)) == 0
+
+
+class TestForeignFilesInCacheDir:
+    """--cache-dir is user-supplied, so it can point at a directory that
+    already holds unrelated files. Eviction and the temp sweep must never
+    count, delete or overwrite anything that is not shaped like a cache
+    entry - otherwise a typo'd path turns LRU into a file shredder."""
+
+    def test_evict_ignores_foreign_files(self, tmp_path):
+        cache = tmp_path / "c"
+        victim = cache / "20" / "holiday.jpg"
+        victim.parent.mkdir(parents=True)
+        victim.write_bytes(b"x" * 500)
+        # A valid entry name, but in the wrong shard (keys live under
+        # their own first two hex digits), so it is not one of ours either.
+        mismatched = cache / "ab" / ("cd" + "0" * 62 + ".png")
+        mismatched.parent.mkdir(parents=True, exist_ok=True)
+        mismatched.write_bytes(b"y" * 500)
+        real = ContentCache(cache, "png", "s", "e")
+        # A real entry above the cap still gets evicted, proving the safety
+        # check narrowed the victims rather than disabling eviction.
+        real_entry = real.entry_path("ef" + "0" * 62)
+        real_entry.parent.mkdir(parents=True, exist_ok=True)
+        real_entry.write_bytes(b"z" * 500)
+        assert real.evict(100) == 1
+        assert not real_entry.exists()
+        assert victim.exists()
+        assert mismatched.exists()
+
+    def test_sweep_ignores_foreign_tmp_files(self, tmp_path):
+        cache = tmp_path / "c"
+        foreign = cache / "ab" / "notes.tmp-1-deadbeef"
+        foreign.parent.mkdir(parents=True)
+        foreign.write_bytes(b"unrelated")
+        old = time.time() - 2 * _cache_mod._STALE_TMP_SECONDS
+        os.utime(foreign, (old, old))
+        assert ContentCache(cache, "png", "s", "e").sweep_stale_tmp() == 0
+        assert foreign.exists()
+
+
+class TestReplaceRetry:
+    """os.replace() fails with PermissionError on Windows while the
+    destination is open elsewhere (a probe copying it, or another writer
+    replacing the same key). store() retries, and when the entry exists by
+    the last attempt another writer already published a complete file."""
+
+    def test_store_retries_transient_permission_errors(self, tmp_path, monkeypatch):
+        c = ContentCache(tmp_path / "c", "png", "s", "e")
+        src = tmp_path / "in.png"
+        Image.new("RGB", (8, 8)).save(src)
+        key = c.key_for_digest(file_sha256(src))
+        real_replace = os.replace
+        calls = {"n": 0}
+
+        def flaky_replace(a, b):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise PermissionError("simulated Windows reader holding the entry open")
+            return real_replace(a, b)
+
+        monkeypatch.setattr(_cache_mod.os, "replace", flaky_replace)
+        entry = c.store(key, src)
+        assert calls["n"] == 3
+        assert is_valid_reusable_output(entry, "png")
+        # No temp leftovers, even for the failed attempts.
+        assert [p.name for p in entry.parent.iterdir() if ".tmp-" in p.name] == []
+
+    def test_store_accepts_entry_published_by_another_writer(self, tmp_path, monkeypatch):
+        c = ContentCache(tmp_path / "c", "png", "s", "e")
+        src = tmp_path / "in.png"
+        Image.new("RGB", (8, 8)).save(src)
+        key = c.key_for_digest(file_sha256(src))
+        entry = c.entry_path(key)
+        entry.parent.mkdir(parents=True, exist_ok=True)
+        entry.write_bytes(b"already published by the winning writer")
+
+        def always_denied(a, b):
+            raise PermissionError("destination stays open for the whole run")
+
+        monkeypatch.setattr(_cache_mod.os, "replace", always_denied)
+        assert c.store(key, src) == entry
+        assert entry.read_bytes() == b"already published by the winning writer"
+        assert [p.name for p in entry.parent.iterdir() if ".tmp-" in p.name] == []
+

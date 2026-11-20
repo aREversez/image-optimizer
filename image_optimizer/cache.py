@@ -11,7 +11,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
+import stat
 import time
 import uuid
 from pathlib import Path
@@ -88,6 +90,11 @@ CACHE_SCHEMA_VERSION = 1
 # removed from this set (and noted in the README).
 CACHEABLE_FORMATS = frozenset({"png", "jpg", "webp", "avif"})
 
+# CLI default for --cache-max-size-mb (0 = unlimited). Shared with argparse so
+# the "flag without --cache-dir" hint and the post-run warning cannot drift
+# from the flag's own default.
+DEFAULT_CACHE_MAX_MB = 1024
+
 # Which external encoder binaries (Optimizer attribute names) feed each
 # output format. WebP is Pillow-only, so it is covered by the Pillow version
 # in the encoder fingerprint instead.
@@ -102,6 +109,49 @@ _FORMAT_ENCODERS = {
 # run after this long (ContentCache.sweep_stale_tmp), independent of the
 # size cap.
 _STALE_TMP_SECONDS = 3600
+
+# `--cache-dir` is user-supplied, so it may point at an existing folder full
+# of unrelated files. Only paths shaped exactly like the ones this module
+# writes are ever counted, swept or evicted: a shard is a two-hex-digit
+# directory, an entry is "<64 hex key>.<format>", and a temp file is an entry
+# name plus ".tmp-<pid>-<8 hex>". Everything else is left alone. The format
+# list comes from CACHEABLE_FORMATS so adding a cacheable format cannot leave
+# its entries unevictable or unsweepable.
+_CACHE_EXTENSIONS = "|".join(sorted(CACHEABLE_FORMATS))
+_SHARD_RE = re.compile(r"^[0-9a-f]{2}$")
+_ENTRY_RE = re.compile(rf"^[0-9a-f]{{64}}\.(?:{_CACHE_EXTENSIONS})$")
+_TMP_RE = re.compile(
+    rf"^[0-9a-f]{{64}}\.(?:{_CACHE_EXTENSIONS})\.tmp-\d+-[0-9a-f]{{8}}$"
+)
+
+# Retries for os.replace() on Windows, where replacing a destination that is
+# momentarily open for reading (probe() validating or copying an entry) or
+# being replaced by another writer fails with PermissionError instead of
+# waiting. Backoff is short: every retry is already an unusual collision.
+_REPLACE_ATTEMPTS = 6
+_REPLACE_BACKOFF_SECONDS = 0.005
+
+
+def _publish(tmp: Path, entry: Path) -> None:
+    """Atomically move a finished temp file into place.
+
+    os.replace() is atomic on every platform, but on Windows it can fail
+    with PermissionError while the destination is open elsewhere: a reader
+    (probe) has the entry open, or another writer is replacing the same key
+    at the same moment. Retry briefly; when the final attempt still fails
+    but the entry now exists, another writer has already published a
+    complete file for this key, which is just as valid a result as ours, so
+    there is nothing left to do."""
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(tmp, entry)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_ATTEMPTS - 1:
+                if entry.is_file():
+                    return
+                raise
+            time.sleep(_REPLACE_BACKOFF_SECONDS * (2 ** attempt))
 
 
 def file_sha256(path: Path) -> str:
@@ -152,8 +202,12 @@ class ContentCache:
 
     All methods are blocking file I/O; call them via asyncio.to_thread.
     Concurrent writers to the same key are fine: entries are written to a
-    temp file and moved into place with os.replace, so last write wins and a
-    reader never observes a partial file.
+    temp file and moved into place with os.replace, so a reader never
+    observes a partial file. On Windows a replace can transiently fail while
+    the destination is open (a reader copying it, or another writer); store()
+    retries and treats "another writer already published an entry" as
+    success, so last write wins whenever both succeed and any complete entry
+    is a valid result for the key.
     """
 
     def __init__(self, cache_dir: Path, output_format: str, settings_fp: str, encoder_fp: str):
@@ -193,13 +247,14 @@ class ContentCache:
         """Atomically publish a successful result under `key`. Never call
         for a failed result. Returns the entry path, so the caller can hand
         this run's fresh entries to evict(protect=...) instead of having
-        them deleted in the very run that wrote them."""
+        them deleted in the very run that wrote them (the returned path also
+        exists when another writer published the entry first)."""
         entry = self.entry_path(key)
         entry.parent.mkdir(parents=True, exist_ok=True)
         tmp = entry.with_name(f"{entry.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
         try:
             shutil.copyfile(produced, tmp)
-            os.replace(tmp, entry)
+            _publish(tmp, entry)
         finally:
             try:
                 tmp.unlink()
@@ -212,18 +267,21 @@ class ContentCache:
         _STALE_TMP_SECONDS. Called at the end of every CLI run regardless of
         the size cap: with --cache-max-size-mb 0 evict() never runs, and
         without this sweep those files would accumulate forever. Returns the
-        number of files removed."""
+        number of files removed.
+
+        Only names this module writes are considered (see _TMP_RE): the cache
+        directory is user-supplied and may contain unrelated files."""
         if not self.root.is_dir():
             return 0
         now = time.time()
         removed = 0
         for shard in self._shards():
             for f in shard.iterdir():
+                if not _TMP_RE.match(f.name) or not f.name.startswith(shard.name):
+                    continue
                 try:
                     st = f.stat()
                 except OSError:
-                    continue
-                if not f.is_file() or ".tmp-" not in f.name:
                     continue
                 if now - st.st_mtime > _STALE_TMP_SECONDS:
                     try:
@@ -249,8 +307,9 @@ class ContentCache:
         than one entry (or already-full cache plus a fresh write) would
         delete the just-written entry in the very run that produced it, so
         the cache could never serve a single hit; the cap may transiently be
-        exceeded because of them, and they are the oldest-next-run victims
-        if nothing hits them meanwhile.
+        exceeded because of them. They are ordinary candidates again on the
+        next run, where LRU order decides (they are the newest, so they go
+        last).
 
         `stats`, when given a dict, receives {"total_after": bytes} so the
         caller can warn when the cap is still exceeded (e.g. a single entry
@@ -262,15 +321,18 @@ class ContentCache:
         total = 0
         for shard in self._shards():
             for f in shard.iterdir():
+                # Only real cache entries count and only they may be
+                # deleted: the directory is user-supplied and may hold
+                # unrelated files. Temp files are sweep_stale_tmp()'s job;
+                # they are never counted toward the cap nor chosen as
+                # victims.
+                if not _ENTRY_RE.match(f.name) or not f.name.startswith(shard.name):
+                    continue
                 try:
                     st = f.stat()
                 except OSError:
                     continue
-                if not f.is_file():
-                    continue
-                if ".tmp-" in f.name:
-                    # Crash leftovers are sweep_stale_tmp()'s job; never
-                    # counted toward the cap, never chosen as victims.
+                if not stat.S_ISREG(st.st_mode):
                     continue
                 entries.append((st.st_mtime, st.st_size, f))
                 total += st.st_size
@@ -292,5 +354,5 @@ class ContentCache:
 
     def _shards(self) -> Iterable[Path]:
         for d in self.root.iterdir():
-            if d.is_dir() and len(d.name) == 2:
+            if _SHARD_RE.match(d.name) and d.is_dir():
                 yield d
