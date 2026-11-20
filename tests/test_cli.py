@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 
+import pytest
 from PIL import Image
 
 
@@ -14,7 +16,7 @@ def cli_args(**overrides) -> argparse.Namespace:
         source=None, output=None, quality="medium", format="png", mode="standard",
         max_width=0, dithering=True, protect_colors="", keep_exif=False, recursive=True,
         workers=4, cache_dir=None, cache_max_size_mb=1024,
-        exclude=[], include=[],
+        exclude=[], include=[], json=False,
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -182,3 +184,128 @@ class TestCliRun:
         ))
         assert code == 1
         assert (out / "good.png").exists()
+
+
+class TestCliJson:
+    """--json: one parseable JSON object on stdout, human output on stderr."""
+
+    @staticmethod
+    def _mixed_src(tmp_path):
+        src = tmp_path / "src"
+        (src / "sub").mkdir(parents=True)
+        # jpg -> png is a real conversion: genuine "compressed" result
+        Image.new("RGB", (64, 64), (200, 30, 30)).save(src / "conv.jpg", format="JPEG")
+        # png -> png through the pass-through fake encoders never shrinks, so
+        # the growth guard hands back the stripped original: "kept_original"
+        Image.new("RGB", (64, 64), (30, 200, 30)).save(src / "sub" / "same.png")
+        (src / "bad.png").write_bytes(b"not actually a png")
+        Image.new("RGB", (16, 16)).save(src / "skip.png")
+        return src
+
+    def _run(self, app_module, optimizer, src, out, **kw):
+        return asyncio.run(app_module._run_cli(
+            cli_args(source=str(src), output=str(out), json=True, **kw),
+            optimizer_instance=optimizer,
+        ))
+
+    def test_stdout_is_exactly_one_json_object_and_logs_go_to_stderr(
+        self, app_module, optimizer, tmp_path, capsys
+    ):
+        src = self._mixed_src(tmp_path)
+        self._run(app_module, optimizer, src, tmp_path / "out", exclude=["skip.png"])
+        cap = capsys.readouterr()
+        report = json.loads(cap.out)  # raises if anything else is on stdout
+        assert set(report) == {"files", "summary"}
+        assert "Done:" in cap.err and "[1/" in cap.err
+        assert "Done:" not in cap.out
+
+    def test_per_file_statuses_and_fields(self, app_module, optimizer, tmp_path, capsys):
+        src = self._mixed_src(tmp_path)
+        code = self._run(app_module, optimizer, src, tmp_path / "out", exclude=["skip.png"])
+        assert code == 1  # bad.png failed; excluded must not count
+        files = {f["rel"]: f for f in json.loads(capsys.readouterr().out)["files"]}
+        assert set(files) == {"conv.jpg", "sub/same.png", "bad.png", "skip.png"}
+        assert all(set(f) == {"rel", "output_name", "original_size", "compressed_size", "status", "error"}
+                   for f in files.values())
+
+        assert files["conv.jpg"]["status"] == "compressed"
+        assert files["conv.jpg"]["output_name"] == "conv.png"
+        assert files["sub/same.png"]["status"] == "kept_original"  # wins over "compressed"
+        assert files["sub/same.png"]["compressed_size"] == (tmp_path / "out" / "sub" / "same.png").stat().st_size
+        assert files["bad.png"]["status"] == "failed" and files["bad.png"]["error"]
+        assert files["bad.png"]["compressed_size"] is None
+        assert files["skip.png"]["status"] == "excluded"
+        assert files["skip.png"]["output_name"] is None and files["skip.png"]["error"] is None
+
+    def test_summary_counts_and_sizes(self, app_module, optimizer, tmp_path, capsys):
+        src = self._mixed_src(tmp_path)
+        self._run(app_module, optimizer, src, tmp_path / "out", exclude=["skip.png"])
+        report = json.loads(capsys.readouterr().out)
+        s = report["summary"]
+        assert s["total"] == 4
+        assert (s["compressed"], s["kept_original"], s["failed"], s["excluded"], s["cached"]) == (1, 1, 1, 1, 0)
+        ok = [f for f in report["files"] if f["status"] in ("compressed", "kept_original")]
+        assert s["original_size"] == sum(f["original_size"] for f in ok)
+        assert s["compressed_size"] == sum(f["compressed_size"] for f in ok)
+        assert s["saved_percent"] == round((1 - s["compressed_size"] / s["original_size"]) * 100, 1)
+
+    def test_cached_status_on_second_run(self, app_module, optimizer, tmp_path, capsys):
+        src = self._mixed_src(tmp_path)
+        kw = dict(exclude=["skip.png"], cache_dir=str(tmp_path / "cache"))
+        self._run(app_module, optimizer, src, tmp_path / "o1", **kw)
+        capsys.readouterr()
+        self._run(app_module, optimizer, src, tmp_path / "o2", **kw)
+        report = json.loads(capsys.readouterr().out)
+        st = {f["rel"]: f["status"] for f in report["files"]}
+        assert st["conv.jpg"] == "cached" and st["sub/same.png"] == "cached"
+        assert st["bad.png"] == "failed"  # failures are never served from cache
+        assert report["summary"]["cached"] == 2
+
+    def test_exit_code_ignores_excluded_and_cached(self, app_module, optimizer, tmp_path, capsys):
+        src = tmp_path / "src"
+        src.mkdir()
+        Image.new("RGB", (16, 16)).save(src / "a.png")
+        Image.new("RGB", (16, 16)).save(src / "b.png")
+        kw = dict(exclude=["b.png"], cache_dir=str(tmp_path / "c"))
+        assert self._run(app_module, optimizer, src, tmp_path / "o1", **kw) == 0
+        assert self._run(app_module, optimizer, src, tmp_path / "o2", **kw) == 0
+
+    def test_empty_source_still_emits_valid_report(self, app_module, optimizer, tmp_path, capsys):
+        src = tmp_path / "src"
+        src.mkdir()
+        assert self._run(app_module, optimizer, src, tmp_path / "out") == 0
+        cap = capsys.readouterr()
+        assert json.loads(cap.out)["summary"]["total"] == 0
+        assert "No supported images found" in cap.err
+
+    def test_everything_excluded_reports_excluded(self, app_module, optimizer, tmp_path, capsys):
+        src = self._mixed_src(tmp_path)
+        assert self._run(app_module, optimizer, src, tmp_path / "out", exclude=["*"]) == 0
+        s = json.loads(capsys.readouterr().out)["summary"]
+        assert s["excluded"] == 4 and s["total"] == 4 and s["compressed"] == 0
+
+    def test_non_ascii_names_keep_stdout_parseable(self, app_module, optimizer, tmp_path, capsys):
+        src = tmp_path / "src"
+        src.mkdir()
+        Image.new("RGB", (16, 16)).save(src / "截图 1.png")
+        self._run(app_module, optimizer, src, tmp_path / "out")
+        files = json.loads(capsys.readouterr().out)["files"]
+        assert files[0]["rel"] == "截图 1.png"
+
+    def test_without_json_stdout_has_no_json(self, app_module, optimizer, tmp_path, capsys):
+        src = self._mixed_src(tmp_path)
+        asyncio.run(app_module._run_cli(
+            cli_args(source=str(src), output=str(tmp_path / "out")), optimizer_instance=optimizer,
+        ))
+        cap = capsys.readouterr()
+        assert "Done:" in cap.out
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(cap.out)
+        assert '"summary"' not in cap.out
+
+    def test_setup_errors_stay_on_stderr_without_a_report(self, app_module, tmp_path, capsys):
+        code = asyncio.run(app_module._run_cli(
+            cli_args(source=str(tmp_path / "nope"), output=str(tmp_path / "o"), json=True),
+        ))
+        cap = capsys.readouterr()
+        assert code == 1 and cap.out == "" and "not a directory" in cap.err

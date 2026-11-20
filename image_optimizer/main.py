@@ -3284,6 +3284,38 @@ def _matches_globs(rel_path: str, patterns: List[str]) -> bool:
     return False
 
 
+_CLI_SUCCESS_STATUSES = ("compressed", "cached", "kept_original")
+
+
+def _build_cli_report(files: list) -> dict:
+    """Machine-readable result of a CLI run (--json). `files` holds one record
+    per scanned file; statuses are mutually exclusive: compressed, cached,
+    kept_original (growth-guard fallback), excluded, failed. Size totals and
+    saved_percent cover the successful statuses only. `total` counts every
+    scanned file, excluded ones included."""
+    counts = {"compressed": 0, "cached": 0, "excluded": 0, "failed": 0, "kept_original": 0}
+    orig = comp = 0
+    for f in files:
+        counts[f["status"]] += 1
+        if f["status"] in _CLI_SUCCESS_STATUSES:
+            orig += f["original_size"]
+            comp += f["compressed_size"]
+    return {
+        "files": files,
+        "summary": {
+            "total": len(files),
+            "compressed": counts["compressed"],
+            "cached": counts["cached"],
+            "excluded": counts["excluded"],
+            "failed": counts["failed"],
+            "kept_original": counts["kept_original"],
+            "original_size": orig,
+            "compressed_size": comp,
+            "saved_percent": round((1 - comp / orig) * 100, 1) if orig > 0 else 0,
+        },
+    }
+
+
 async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> int:
     """Headless batch run: no web server, no browser. Scans --source, runs
     every image through the exact same optimizer.optimize_png pipeline the
@@ -3299,7 +3331,25 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
     --cache-dir enables a content-hash cache that does not depend on the
     output directory at all (see image_optimizer/cache.py); without it,
     every CLI run recompresses everything in --source.
+
+    With --json the final report is one JSON object on stdout and every
+    human-readable line (progress, summary, warnings) goes to stderr, so
+    stdout can be piped straight into a parser. Argument/setup errors
+    (exit 1 before any file is looked at) print only to stderr.
     """
+    as_json = bool(getattr(args, "json", False))
+    log_stream = sys.stderr if as_json else sys.stdout
+
+    def log(*parts) -> None:
+        print(*parts, file=log_stream)
+
+    def emit_report(files: list) -> None:
+        if as_json:
+            # ensure_ascii (the default) keeps stdout valid on any console
+            # encoding even when file names are not ASCII.
+            print(json.dumps(_build_cli_report(files), indent=2))
+            sys.stdout.flush()
+
     source = Path(args.source).resolve()
     if not source.exists() or not source.is_dir():
         print(f"[Error] --source is not a directory: {source}", file=sys.stderr)
@@ -3327,7 +3377,8 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
 
     scanned = _scan_images(source, recursive=args.recursive)
     if not scanned:
-        print(f"[CLI] No supported images found in {source}")
+        log(f"[CLI] No supported images found in {source}")
+        emit_report([])
         return 0
 
     # --include is a whitelist; --exclude is applied after it and always
@@ -3336,14 +3387,26 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
     include = getattr(args, "include", None) or []
     exclude = getattr(args, "exclude", None) or []
     images = []
+    # One record per scanned file, filled in as results arrive; reported in
+    # scan order.
+    records: dict = {}
     for p in scanned:
         rel_posix = p.relative_to(source).as_posix()
         if (include and not _matches_globs(rel_posix, include)) or _matches_globs(rel_posix, exclude):
+            try:
+                excluded_size = p.stat().st_size
+            except OSError:
+                excluded_size = None
+            records[p] = {
+                "rel": rel_posix, "output_name": None, "original_size": excluded_size,
+                "compressed_size": None, "status": "excluded", "error": None,
+            }
             continue
         images.append(p)
     n_excluded = len(scanned) - len(images)
     if not images:
-        print(f"[CLI] No images left after --include/--exclude filtering ({n_excluded} excluded)")
+        log(f"[CLI] No images left after --include/--exclude filtering ({n_excluded} excluded)")
+        emit_report([records[p] for p in scanned])
         return 0
 
     cache: Optional[ContentCache] = None
@@ -3354,7 +3417,7 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
             print("[Error] --cache-dir must not be inside --source", file=sys.stderr)
             return 1
         if args.format not in CACHEABLE_FORMATS:
-            print(f"[Warning] --cache-dir ignored: {args.format} output is not cacheable")
+            log(f"[Warning] --cache-dir ignored: {args.format} output is not cacheable")
         else:
             try:
                 cache_dir.mkdir(parents=True, exist_ok=True)
@@ -3369,7 +3432,7 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
     global optimizer
     optimizer = optimizer_instance or Optimizer(max_concurrency=CONCURRENT_WORKERS)
     if not optimizer.pngquant_path and not optimizer.oxipng_path and args.format == "png":
-        print(
+        log(
             "[Warning] Neither pngquant nor oxipng found in bin/ — PNG results will be much "
             "weaker than normal (falls back toward Pillow-only handling). Compression will "
             "still run and nothing will be corrupted, but expect far smaller size savings."
@@ -3403,7 +3466,12 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
                 counters["done"] += 1
                 counters["failed"] += 1
                 d = counters["done"]
-            print(f"[{d}/{total}] FAIL {rel}: resolved output path escapes --output directory")
+                records[img_path] = {
+                    "rel": img_path.relative_to(source).as_posix(), "output_name": None,
+                    "original_size": None, "compressed_size": None, "status": "failed",
+                    "error": "resolved output path escapes --output directory",
+                }
+            log(f"[{d}/{total}] FAIL {rel}: resolved output path escapes --output directory")
             return
         out_path.parent.mkdir(parents=True, exist_ok=True)
         cache_key = None
@@ -3449,14 +3517,29 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
                     round((1 - result["compressed_size"] / result["original_size"]) * 100, 1)
                     if result["original_size"] > 0 else 0
                 )
-                print(
+                records[img_path] = {
+                    "rel": img_path.relative_to(source).as_posix(), "output_name": out_path.name,
+                    "original_size": result["original_size"],
+                    "compressed_size": result["compressed_size"],
+                    "status": (
+                        "kept_original" if result.get("kept_original")
+                        else "cached" if cached_hit else "compressed"
+                    ),
+                    "error": None,
+                }
+                log(
                     f"[{d}/{total}] {'HIT ' if cached_hit else 'OK  '} {rel} -> {out_path.name}  "
                     f"{_fmt_size(result['original_size'])} -> {_fmt_size(result['compressed_size'])} "
                     f"({pct}% saved)"
                 )
             else:
                 counters["failed"] += 1
-                print(f"[{d}/{total}] FAIL {rel}: {result.get('error') or 'unknown error'}")
+                records[img_path] = {
+                    "rel": img_path.relative_to(source).as_posix(), "output_name": out_path.name,
+                    "original_size": result.get("original_size"), "compressed_size": None,
+                    "status": "failed", "error": result.get("error") or "unknown error",
+                }
+                log(f"[{d}/{total}] FAIL {rel}: {result.get('error') or 'unknown error'}")
 
     await asyncio.gather(*(process(i, p) for i, p in enumerate(images)))
 
@@ -3469,18 +3552,19 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
     else:
         evicted = 0
 
-    print()
-    print(f"Done: {counters['ok']} succeeded, {counters['failed']} failed, {total} total")
+    log()
+    log(f"Done: {counters['ok']} succeeded, {counters['failed']} failed, {total} total")
     if n_excluded:
-        print(f"Excluded: {n_excluded} file(s) by --include/--exclude")
+        log(f"Excluded: {n_excluded} file(s) by --include/--exclude")
     if cache is not None:
-        print(
+        log(
             f"Cache: {counters['cached']} hit, {counters['ok'] - counters['cached']} compressed"
             + (f", {evicted} evicted" if evicted else "")
         )
     if counters["orig"] > 0:
         saved_pct = round((1 - counters["comp"] / counters["orig"]) * 100, 1)
-        print(f"Total: {_fmt_size(counters['orig'])} -> {_fmt_size(counters['comp'])} ({saved_pct}% saved)")
+        log(f"Total: {_fmt_size(counters['orig'])} -> {_fmt_size(counters['comp'])} ({saved_pct}% saved)")
+    emit_report([records[p] for p in scanned])
     return 1 if counters["failed"] > 0 else 0
 
 
@@ -3627,6 +3711,12 @@ def main():
         "--include", action="append", default=[], metavar="GLOB",
         help="Only process files matching at least one of these globs; repeatable. Same "
              "matching rules as --exclude, which is applied afterwards and takes priority.",
+    )
+    cli_group.add_argument(
+        "--json", action="store_true",
+        help="Print the final report as a single JSON object on stdout (per-file status "
+             "compressed/cached/kept_original/excluded/failed, plus a summary). All "
+             "human-readable output moves to stderr so stdout can be piped to a parser.",
     )
     cli_group.add_argument(
         "--cache-dir", metavar="PATH",
