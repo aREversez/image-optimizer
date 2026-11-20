@@ -10,9 +10,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
+import time
+import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, NamedTuple, Optional
 
+import PIL
 from PIL import Image
 
 
@@ -71,3 +76,172 @@ def is_valid_reusable_output(path: Path, expected_format: str) -> bool:
         "avif": "AVIF",
     }.get(expected_format, "PNG")
     return fmt == expected
+
+
+# Bump when pipeline logic changes in a way that alters output bytes for the
+# same input + settings + encoders. Folded into every cache key, so a bump
+# orphans (and LRU eventually reclaims) all older entries.
+CACHE_SCHEMA_VERSION = 1
+
+# Output formats the CLI cache may serve. tests/test_determinism.py is the
+# gate: a format whose real encoder is found non-deterministic there must be
+# removed from this set (and noted in the README).
+CACHEABLE_FORMATS = frozenset({"png", "jpg", "webp", "avif"})
+
+# Which external encoder binaries (Optimizer attribute names) feed each
+# output format. WebP is Pillow-only, so it is covered by the Pillow version
+# in the encoder fingerprint instead.
+_FORMAT_ENCODERS = {
+    "png": ("pngquant_path", "oxipng_path"),
+    "jpg": ("cjpeg_path",),
+    "webp": (),
+    "avif": ("avifenc_path",),
+}
+
+# Stale temp files from a crashed writer are swept by evict() after this long.
+_STALE_TMP_SECONDS = 3600
+
+
+def file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def encoder_fingerprint(optimizer, output_format: str) -> str:
+    """Identifies the encoders that will produce this run's output: the
+    content hash of each external binary the format uses, plus the Pillow
+    version (it does the WebP encode and every resize/convert step). Swapping
+    a bundled or PATH binary for another build therefore invalidates the cache
+    on its own. Computed once per run by the caller."""
+    parts = [f"pillow={PIL.__version__}"]
+    for attr in _FORMAT_ENCODERS.get(output_format, ()):
+        path = getattr(optimizer, attr, None)
+        if path is None:
+            parts.append(f"{attr}=none")
+            continue
+        try:
+            parts.append(f"{attr}={file_sha256(Path(path))}")
+        except OSError:
+            # Unreadable binary: a unique value per run means nothing is
+            # ever served from or trusted against a fingerprint we could
+            # not compute.
+            parts.append(f"{attr}=unreadable-{uuid.uuid4().hex}")
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+
+
+class CacheProbe(NamedTuple):
+    key: str
+    original_size: int
+    # Size of the file copied to the output path, or None on a miss.
+    hit_size: Optional[int]
+
+
+class ContentCache:
+    """Content-addressed store for finished compression results, independent
+    of any output directory (so a caller that uses a fresh temp output dir on
+    every run still gets hits).
+
+    Layout: <cache_dir>/<key[:2]>/<key>.<ext>
+    Key:    sha256(input bytes sha256 + settings fingerprint + encoder
+            fingerprint + CACHE_SCHEMA_VERSION)
+
+    All methods are blocking file I/O; call them via asyncio.to_thread.
+    Concurrent writers to the same key are fine: entries are written to a
+    temp file and moved into place with os.replace, so last write wins and a
+    reader never observes a partial file.
+    """
+
+    def __init__(self, cache_dir: Path, output_format: str, settings_fp: str, encoder_fp: str):
+        self.root = Path(cache_dir)
+        self.output_format = output_format
+        self._ext = "." + output_format
+        self._settings_fp = settings_fp
+        self._encoder_fp = encoder_fp
+
+    def key_for_digest(self, input_sha256: str) -> str:
+        payload = "|".join(
+            [input_sha256, self._settings_fp, self._encoder_fp, str(CACHE_SCHEMA_VERSION)]
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def entry_path(self, key: str) -> Path:
+        return self.root / key[:2] / (key + self._ext)
+
+    def probe(self, input_path: Path, out_path: Path) -> CacheProbe:
+        """Hash the input, and on a valid cache entry copy it to out_path.
+        An entry that fails structural validation (truncated, wrong format)
+        counts as a miss; the caller recompresses and store() overwrites it."""
+        original_size = os.path.getsize(input_path)
+        key = self.key_for_digest(file_sha256(input_path))
+        entry = self.entry_path(key)
+        if not entry.is_file() or not is_valid_reusable_output(entry, self.output_format):
+            return CacheProbe(key, original_size, None)
+        shutil.copy2(entry, out_path)
+        try:
+            # Recency for LRU eviction.
+            os.utime(entry, None)
+        except OSError:
+            pass
+        return CacheProbe(key, original_size, os.path.getsize(out_path))
+
+    def store(self, key: str, produced: Path) -> None:
+        """Atomically publish a successful result under `key`. Never call
+        for a failed result."""
+        entry = self.entry_path(key)
+        entry.parent.mkdir(parents=True, exist_ok=True)
+        tmp = entry.with_name(f"{entry.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
+        try:
+            shutil.copyfile(produced, tmp)
+            os.replace(tmp, entry)
+        finally:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+
+    def evict(self, max_bytes: int) -> int:
+        """Delete least-recently-used entries (oldest mtime first) until the
+        total is at or under max_bytes. max_bytes <= 0 means unlimited.
+        Returns the number of entries removed. Entries whose source image is
+        gone are never touched by hits, so they age out here naturally."""
+        if max_bytes <= 0 or not self.root.is_dir():
+            return 0
+        now = time.time()
+        entries: list[tuple[float, int, Path]] = []
+        total = 0
+        for shard in self._shards():
+            for f in shard.iterdir():
+                try:
+                    st = f.stat()
+                except OSError:
+                    continue
+                if not f.is_file():
+                    continue
+                if ".tmp-" in f.name:
+                    if now - st.st_mtime > _STALE_TMP_SECONDS:
+                        try:
+                            f.unlink()
+                        except OSError:
+                            pass
+                    continue
+                entries.append((st.st_mtime, st.st_size, f))
+                total += st.st_size
+        removed = 0
+        for _mtime, size, f in sorted(entries, key=lambda e: e[0]):
+            if total <= max_bytes:
+                break
+            try:
+                f.unlink()
+            except OSError:
+                continue
+            total -= size
+            removed += 1
+        return removed
+
+    def _shards(self) -> Iterable[Path]:
+        for d in self.root.iterdir():
+            if d.is_dir() and len(d.name) == 2:
+                yield d

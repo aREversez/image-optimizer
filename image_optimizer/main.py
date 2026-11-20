@@ -25,6 +25,9 @@ if __package__ is None:
 
 from image_optimizer import binaries
 from image_optimizer.cache import (
+    CACHEABLE_FORMATS,
+    ContentCache,
+    encoder_fingerprint,
     is_valid_reusable_output as _is_valid_reusable_output,
     settings_fingerprint as _settings_fingerprint,
 )
@@ -3270,10 +3273,10 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
 
     Deliberately does not implement --skip-existing: that feature depends
     on the per-output-dir settings-fingerprint file the web/watch paths
-    already maintain (see skip_existing in _process_files), and wiring a
-    CLI run into that same fingerprint store is future work, not something
-    silently half-supported here. Every CLI run recompresses everything
-    in --source.
+    already maintain (see skip_existing in _process_files). Instead,
+    --cache-dir enables a content-hash cache that does not depend on the
+    output directory at all (see image_optimizer/cache.py); without it,
+    every CLI run recompresses everything in --source.
     """
     source = Path(args.source).resolve()
     if not source.exists() or not source.is_dir():
@@ -3283,6 +3286,11 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
         print("[Error] --output is required when using --source", file=sys.stderr)
         return 1
     output_dir = Path(args.output).resolve()
+    cache_dir_arg = getattr(args, "cache_dir", None)
+    cache_max_mb = getattr(args, "cache_max_size_mb", 1024)
+    if cache_dir_arg and cache_max_mb < 0:
+        print("[Error] --cache-max-size-mb must be >= 0 (0 = unlimited)", file=sys.stderr)
+        return 1
 
     protected_colors = (
         [c.strip() for c in args.protect_colors.split(",") if c.strip()]
@@ -3300,6 +3308,22 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
         print(f"[CLI] No supported images found in {source}")
         return 0
 
+    cache: Optional[ContentCache] = None
+    if cache_dir_arg:
+        cache_dir = Path(cache_dir_arg).resolve()
+        if cache_dir == source or source in cache_dir.parents:
+            # The scan would pick the cached images up as new sources.
+            print("[Error] --cache-dir must not be inside --source", file=sys.stderr)
+            return 1
+        if args.format not in CACHEABLE_FORMATS:
+            print(f"[Warning] --cache-dir ignored: {args.format} output is not cacheable")
+        else:
+            try:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                print(f"[Error] cannot create --cache-dir {cache_dir}: {e}", file=sys.stderr)
+                return 1
+
     output_dir.mkdir(parents=True, exist_ok=True)
     items = [(str(i), str(p.relative_to(source)), args.format) for i, p in enumerate(images)]
     out_paths = _resolve_collision_free_output_paths(items, output_dir)
@@ -3313,8 +3337,20 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
             "still run and nothing will be corrupted, but expect far smaller size savings."
         )
 
+    if cache_dir_arg and args.format in CACHEABLE_FORMATS:
+        # Hashing the encoder binaries reads a few MB; do it once per run.
+        enc_fp = await asyncio.to_thread(encoder_fingerprint, optimizer, args.format)
+        cache = ContentCache(
+            Path(cache_dir_arg).resolve(), args.format,
+            _settings_fingerprint(
+                args.quality, args.mode, args.max_width, protected_colors,
+                args.dithering, args.keep_exif, args.format,
+            ),
+            enc_fp,
+        )
+
     total = len(images)
-    counters = {"done": 0, "ok": 0, "failed": 0, "orig": 0, "comp": 0}
+    counters = {"done": 0, "ok": 0, "failed": 0, "orig": 0, "comp": 0, "cached": 0}
     lock = asyncio.Lock()
     # No manual semaphore here — Optimizer already bounds concurrent work
     # internally via its own max_concurrency, so every image is dispatched
@@ -3332,17 +3368,43 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
             print(f"[{d}/{total}] FAIL {rel}: resolved output path escapes --output directory")
             return
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        result = await optimizer.optimize_png(
-            img_path, out_path,
-            quality=args.quality, max_width=args.max_width, compression_mode=args.mode,
-            protected_colors=protected_colors, dithering=args.dithering,
-            output_format=args.format, keep_exif=args.keep_exif,
-        )
+        cache_key = None
+        cached_hit = False
+        result = None
+        if cache is not None:
+            try:
+                probe = await asyncio.to_thread(cache.probe, img_path, out_path)
+            except OSError:
+                # Unreadable input or cache I/O trouble: fall through to the
+                # normal pipeline, which reports a real input error itself.
+                probe = None
+            if probe is not None:
+                cache_key = probe.key
+                if probe.hit_size is not None:
+                    cached_hit = True
+                    result = {
+                        "success": True, "original_size": probe.original_size,
+                        "compressed_size": probe.hit_size, "error": None,
+                    }
+        if result is None:
+            result = await optimizer.optimize_png(
+                img_path, out_path,
+                quality=args.quality, max_width=args.max_width, compression_mode=args.mode,
+                protected_colors=protected_colors, dithering=args.dithering,
+                output_format=args.format, keep_exif=args.keep_exif,
+            )
+            if cache is not None and cache_key is not None and result["success"]:
+                try:
+                    await asyncio.to_thread(cache.store, cache_key, out_path)
+                except OSError as e:
+                    print(f"[Warning] cache write failed for {rel}: {e}", file=sys.stderr)
         async with lock:
             counters["done"] += 1
             d = counters["done"]
             if result["success"]:
                 counters["ok"] += 1
+                if cached_hit:
+                    counters["cached"] += 1
                 counters["orig"] += result["original_size"]
                 counters["comp"] += result["compressed_size"]
                 pct = (
@@ -3350,7 +3412,7 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
                     if result["original_size"] > 0 else 0
                 )
                 print(
-                    f"[{d}/{total}] OK   {rel} -> {out_path.name}  "
+                    f"[{d}/{total}] {'HIT ' if cached_hit else 'OK  '} {rel} -> {out_path.name}  "
                     f"{_fmt_size(result['original_size'])} -> {_fmt_size(result['compressed_size'])} "
                     f"({pct}% saved)"
                 )
@@ -3360,8 +3422,22 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
 
     await asyncio.gather(*(process(i, p) for i, p in enumerate(images)))
 
+    if cache is not None and cache_max_mb > 0:
+        try:
+            evicted = await asyncio.to_thread(cache.evict, cache_max_mb * 1024 * 1024)
+        except OSError as e:
+            evicted = 0
+            print(f"[Warning] cache eviction failed: {e}", file=sys.stderr)
+    else:
+        evicted = 0
+
     print()
     print(f"Done: {counters['ok']} succeeded, {counters['failed']} failed, {total} total")
+    if cache is not None:
+        print(
+            f"Cache: {counters['cached']} hit, {counters['ok'] - counters['cached']} compressed"
+            + (f", {evicted} evicted" if evicted else "")
+        )
     if counters["orig"] > 0:
         saved_pct = round((1 - counters["comp"] / counters["orig"]) * 100, 1)
         print(f"Total: {_fmt_size(counters['orig'])} -> {_fmt_size(counters['comp'])} ({saved_pct}% saved)")
@@ -3500,6 +3576,18 @@ def main():
         "--keep-exif", action="store_true",
         help="Keep a curated subset of EXIF (camera make/model, date, exposure). GPS and "
              "Orientation are always stripped regardless. Default: strip all EXIF.",
+    )
+    cli_group.add_argument(
+        "--cache-dir", metavar="PATH",
+        help="Enable a content-hash result cache stored in PATH. Unchanged inputs with the "
+             "same settings are copied from the cache instead of recompressed, even when "
+             "--output is a fresh directory every run. Must not be inside --source. "
+             "Default: no cache.",
+    )
+    cli_group.add_argument(
+        "--cache-max-size-mb", type=int, default=1024, metavar="N",
+        help="Cache size cap in MB, enforced after each run by evicting least-recently-used "
+             "entries (default 1024; 0 = unlimited). Only used with --cache-dir.",
     )
 
     # The wheel ships no third-party executables (pngquant is GPL-3.0-or-later;

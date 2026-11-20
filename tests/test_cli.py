@@ -13,7 +13,7 @@ def cli_args(**overrides) -> argparse.Namespace:
     defaults = dict(
         source=None, output=None, quality="medium", format="png", mode="standard",
         max_width=0, dithering=True, protect_colors="", keep_exif=False, recursive=True,
-        workers=4,
+        workers=4, cache_dir=None, cache_max_size_mb=1024,
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
