@@ -3642,7 +3642,7 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
                 print(
                     "[Warning] cache is still over --cache-max-size-mb after eviction "
                     "(entries written this run are protected until the next run, and "
-                    "single entries larger than the cap always get evicted)",
+                    "a single entry larger than the cap can never stay under it)",
                     file=sys.stderr,
                 )
     else:

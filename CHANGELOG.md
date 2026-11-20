@@ -59,7 +59,39 @@ All notable changes to this project will be documented in this file.
   wheel from outside the checkout, and only then uploads through PyPI's OIDC
   trusted publisher (`environment: pypi`). No API token is stored anywhere.
 
+### Fixed
+- **CLI `--json` stdout purity.** The binary bootstrap ("[Binaries] ... already
+  installed", download progress, the `--no-download` notice) and config.json
+  diagnostics printed to stdout before the report; `json.loads(stdout)` failed
+  on every `--json` run. They now go to stderr, so stdout is exactly one JSON
+  object.
+- **CLI result cache robustness.** Stale `.tmp-*` files from crashed writers
+  are now swept on every run, including with `--cache-max-size-mb 0`
+  (previously they accumulated forever); entries written during a run are
+  protected from that run's eviction (with a cap smaller than one entry the
+  cache could never serve a hit), and the run warns on stderr when the cache
+  is still over the cap after eviction.
+- **AVIF cache hits need an AVIF-capable Pillow.** Cached AVIF entries are
+  validated by opening them with Pillow; on builds without AVIF support the
+  cache silently never hit for AVIF. `Pillow>=11.3` is now required and a
+  missing AVIF codec triggers a one-time stderr warning instead of silent
+  cache misses.
+- **CLI output I/O failures.** A failure creating a per-file output
+  subdirectory is now a per-file `failed` record (the rest of the batch and
+  the `--json` report still complete) instead of an unhandled crash; a
+  failure creating `--output` itself is a clean setup error.
+- **CLI cache placement guards.** `--cache-dir` inside (or equal to)
+  `--output` is now rejected like inside `--source`, and both containment
+  checks are Windows-case-insensitive (`os.path.normcase`).
+
 ### Changed
+- CLI `--json` setup errors (bad arguments, missing `--source`, output
+  directory cannot be created) exit 1 with a message on stderr and no report;
+  documented in the README alongside the schema.
+- README CLI flag list separators normalized to plain hyphens; documented the
+  cache eviction grace, the AVIF/Pillow precondition, the temp-file sweep and
+  glob edge cases (`drafts/*` for directories, `./`-prefixed and absolute
+  patterns never match).
 - `build_exe.py` now builds on macOS and Linux as well as Windows (path
   separator, binary names and icon handling are per platform). A missing
   encoder is reported up front instead of failing inside PyInstaller; pass

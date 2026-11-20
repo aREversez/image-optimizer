@@ -120,17 +120,17 @@ settings validation as the web UI and Watch Mode — no separate "CLI
 version" of the logic to drift out of sync, so the same `--quality`/
 `--mode`/etc. combination produces the same result either way.
 
-- `--source` — directory to compress (required to trigger CLI mode)
-- `--output` — output directory (required with `--source`)
-- `--quality {high,medium,low}` — Standard/Screenshot mode color-quality floor (default `medium`)
-- `--format {png,jpg,webp,avif}` — output format (default `png`)
-- `--mode {standard,lossless,resize_only,screenshot}` — compression mode (default `standard`; `screenshot` is PNG-only)
-- `--max-width <int>` — resize so the longest side is at most this many pixels (default `0` = no resize; required `> 0` with `--mode resize_only`)
-- `--dithering` / `--no-dithering` — dithering for Standard-mode PNG quantization (default enabled)
-- `--protect-colors "#2ecc71,#ff0000"` — hex colors to prioritize keeping exact in Standard mode's palette
-- `--keep-exif` — keep a curated subset of EXIF (camera make/model, date, exposure); GPS and orientation are always stripped regardless (default: strip all EXIF)
-- `--recursive` / `--no-recursive` — scan subfolders too (default `--recursive`; shared with `--dir`, see Configuration below)
-- `--workers` — concurrent compression workers (shared with the web server's `--workers`, see Configuration below)
+- `--source` - directory to compress (required to trigger CLI mode)
+- `--output` - output directory (required with `--source`)
+- `--quality {high,medium,low}` - Standard/Screenshot mode color-quality floor (default `medium`)
+- `--format {png,jpg,webp,avif}` - output format (default `png`)
+- `--mode {standard,lossless,resize_only,screenshot}` - compression mode (default `standard`; `screenshot` is PNG-only)
+- `--max-width <int>` - resize so the longest side is at most this many pixels (default `0` = no resize; required `> 0` with `--mode resize_only`)
+- `--dithering` / `--no-dithering` - dithering for Standard-mode PNG quantization (default enabled)
+- `--protect-colors "#2ecc71,#ff0000"` - hex colors to prioritize keeping exact in Standard mode's palette
+- `--keep-exif` - keep a curated subset of EXIF (camera make/model, date, exposure); GPS and orientation are always stripped regardless (default: strip all EXIF)
+- `--recursive` / `--no-recursive` - scan subfolders too (default `--recursive`; shared with `--dir`, see Configuration below)
+- `--workers` - concurrent compression workers (shared with the web server's `--workers`, see Configuration below)
 - `--cache-dir PATH` - enable the content-hash result cache (see below); default: no cache
 - `--cache-max-size-mb N` - cache size cap, enforced after each run by evicting least-recently-used entries (default `1024`, `0` = unlimited)
 - `--exclude GLOB` / `--include GLOB` - filter which files are processed; repeatable (see below)
@@ -161,6 +161,9 @@ image-optimizer --source ./raw --output "$(mktemp -d)" --cache-dir ~/.cache/imag
 - The cache directory must not be inside `--source`.
 - After each run the cache is trimmed to `--cache-max-size-mb` (default 1024 MB, `0` = unlimited) by deleting the least recently used entries first. Entries whose source image no longer exists are never hit again, so they age out on their own.
 - The compression pipeline is covered by byte-determinism tests (`tests/test_determinism.py`); the cache is only valid because the same input and settings always produce the same bytes.
+- AVIF cache hits need a Pillow build that can read AVIF (Pillow >= 11.3 with libavif, or `pillow-avif-plugin`; the installed requirement is pinned accordingly). Without AVIF read support the run warns on stderr and AVIF entries are never served.
+- Entries written during a run are protected from that same run's eviction, so a run never deletes the results it just wrote (the cache may transiently sit above the cap; those entries are evicted first on a later run). A single entry larger than `--cache-max-size-mb` can never fit under the cap and is evicted once it is no longer protected; the run warns on stderr whenever it cannot get the cache back under the cap.
+- Stale temporary files from crashed writers are swept at the end of every run, independent of the size cap.
 
 ### Filtering with --exclude / --include
 
@@ -172,6 +175,7 @@ image-optimizer --source ./raw --output ./out --include "icons/*" --exclude "*_o
 - A pattern without `/` is matched against the file name at any depth (`*.bak` also hits `sub/dir/a.bak`). A pattern with `/` is matched against the path relative to `--source`, written with forward slashes (`drafts/*`, `icons/*.png`).
 - Matching is case-insensitive on every platform, and `*` also matches `/` (`drafts/*` covers `drafts/old/a.png`).
 - With `--include`, a file must match at least one include pattern. `--exclude` is applied afterwards and always wins when both match.
+- Patterns match paths relative to `--source`: to filter a whole directory use `drafts/*` (a bare `drafts/` matches nothing), and `./`-prefixed or absolute patterns never match.
 - Excluded files are not compressed, produce no output and never count as failures.
 
 ### Machine-readable report (--json)
