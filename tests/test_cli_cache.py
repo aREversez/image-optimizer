@@ -89,7 +89,9 @@ class TestHitAndMiss:
         _run(app_module, optimizer, src, tmp_path / "o2", cache, **change)
         assert counting["n"] == 2
 
-    @pytest.mark.parametrize("change", [dict(workers=1), dict(recursive=False)])
+    @pytest.mark.parametrize("change", [
+        dict(workers=1), dict(recursive=False), dict(exclude=["img1.png"]), dict(include=["img0.png"]),
+    ])
     def test_non_pixel_setting_change_still_hits(
         self, app_module, optimizer, counting, tmp_path, change
     ):

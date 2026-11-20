@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import hashlib
 import json
 import os
@@ -3262,6 +3263,27 @@ async def watch_events(request: Request, state: AppState = Depends(get_session))
     )
 
 
+def _matches_globs(rel_path: str, patterns: List[str]) -> bool:
+    """True if rel_path (POSIX-style, relative to --source) matches any glob.
+
+    A pattern without "/" is matched against the file name only, so it
+    applies at any depth ("*.bak" hits sub/dir/a.bak). A pattern containing
+    "/" is matched against the whole relative path ("drafts/*" or
+    "icons/*.png"). Matching is case-insensitive on every platform, and "*"
+    crosses "/" (plain fnmatch semantics), so "drafts/*" also covers
+    "drafts/old/a.png". Backslashes in a pattern are read as "/" so a
+    Windows-style "sub\\*.png" works too. Empty patterns are ignored."""
+    rel = rel_path.lower()
+    name = rel.rsplit("/", 1)[-1]
+    for raw in patterns:
+        pat = raw.strip().replace("\\", "/").lower()
+        if not pat:
+            continue
+        if fnmatch.fnmatchcase(rel if "/" in pat else name, pat):
+            return True
+    return False
+
+
 async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> int:
     """Headless batch run: no web server, no browser. Scans --source, runs
     every image through the exact same optimizer.optimize_png pipeline the
@@ -3303,9 +3325,25 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
         print(f"[Error] {err}", file=sys.stderr)
         return 1
 
-    images = _scan_images(source, recursive=args.recursive)
-    if not images:
+    scanned = _scan_images(source, recursive=args.recursive)
+    if not scanned:
         print(f"[CLI] No supported images found in {source}")
+        return 0
+
+    # --include is a whitelist; --exclude is applied after it and always
+    # wins when both match. Excluded files are neither compressed nor
+    # counted as failures.
+    include = getattr(args, "include", None) or []
+    exclude = getattr(args, "exclude", None) or []
+    images = []
+    for p in scanned:
+        rel_posix = p.relative_to(source).as_posix()
+        if (include and not _matches_globs(rel_posix, include)) or _matches_globs(rel_posix, exclude):
+            continue
+        images.append(p)
+    n_excluded = len(scanned) - len(images)
+    if not images:
+        print(f"[CLI] No images left after --include/--exclude filtering ({n_excluded} excluded)")
         return 0
 
     cache: Optional[ContentCache] = None
@@ -3433,6 +3471,8 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
 
     print()
     print(f"Done: {counters['ok']} succeeded, {counters['failed']} failed, {total} total")
+    if n_excluded:
+        print(f"Excluded: {n_excluded} file(s) by --include/--exclude")
     if cache is not None:
         print(
             f"Cache: {counters['cached']} hit, {counters['ok'] - counters['cached']} compressed"
@@ -3576,6 +3616,17 @@ def main():
         "--keep-exif", action="store_true",
         help="Keep a curated subset of EXIF (camera make/model, date, exposure). GPS and "
              "Orientation are always stripped regardless. Default: strip all EXIF.",
+    )
+    cli_group.add_argument(
+        "--exclude", action="append", default=[], metavar="GLOB",
+        help="Skip files matching this glob; repeatable. A pattern without '/' matches the "
+             "file name at any depth ('*.bak'); a pattern with '/' matches the path relative "
+             "to --source ('drafts/*'). Case-insensitive on every platform. Wins over --include.",
+    )
+    cli_group.add_argument(
+        "--include", action="append", default=[], metavar="GLOB",
+        help="Only process files matching at least one of these globs; repeatable. Same "
+             "matching rules as --exclude, which is applied afterwards and takes priority.",
     )
     cli_group.add_argument(
         "--cache-dir", metavar="PATH",
