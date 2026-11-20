@@ -29,7 +29,7 @@ def settings_fingerprint(
     produced (or would produce) a given output. Used by skip_existing to
     tell "the source hasn't changed AND these are the same settings that
     made this file last time" apart from "the source happens to be
-    unchanged but the user asked for something different this run" — the
+    unchanged but the user asked for something different this run" - the
     two look identical if you only check the source's mtime, which is all
     the reuse check used to do.
 
@@ -59,7 +59,7 @@ def is_valid_reusable_output(path: Path, expected_format: str) -> bool:
     hand the user a corrupt "optimized" image instead of recompressing it.
 
     Uses Pillow's verify() (structural/header check, doesn't decode full
-    pixel data — cheap) and confirms the format actually matches what
+    pixel data - cheap) and confirms the format actually matches what
     this run expects, so e.g. a stray same-named file from a different
     output_format never gets reused by mistake."""
     try:

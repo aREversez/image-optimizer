@@ -3415,6 +3415,10 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
         return 0
 
     cache: Optional[ContentCache] = None
+    if cache_dir_arg is None and cache_max_mb != 1024:
+        # Same default as the argparse flag; close enough to catch "user
+        # passed --cache-max-size-mb alone" without a sentinel.
+        print("[Hint] --cache-max-size-mb has no effect without --cache-dir", file=sys.stderr)
     if cache_dir_arg:
         cache_dir = Path(cache_dir_arg).resolve()
 
@@ -3440,6 +3444,9 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
             print("[Error] --cache-dir must not be inside --output", file=sys.stderr)
             return 1
         if args.format not in CACHEABLE_FORMATS:
+            # Defensive: argparse's --format choices currently equal
+            # CACHEABLE_FORMATS, so this is unreachable today; it keeps a
+            # widened choices list from silently caching an unverified format.
             log(f"[Warning] --cache-dir ignored: {args.format} output is not cacheable")
         else:
             try:

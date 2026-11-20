@@ -21,7 +21,7 @@ def cli_args(**overrides) -> argparse.Namespace:
         source=None, output=None, quality="medium", format="png", mode="standard",
         max_width=0, dithering=True, protect_colors="", keep_exif=False, recursive=True,
         workers=4, cache_dir=None, cache_max_size_mb=1024,
-        exclude=[], include=[], json=False,
+        exclude=None, include=None, json=False,
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -385,3 +385,29 @@ class TestCliOutputIoErrors:
         assert "cannot create output directory" in files["sub/deep.png"]["error"]
         assert files["top.png"]["status"] in ("compressed", "kept_original")
         assert report["summary"]["failed"] == 1
+
+
+class TestCliCacheFlagHints:
+    def test_cache_max_size_mb_without_cache_dir_hints_on_stderr(
+        self, app_module, optimizer, tmp_path, capsys
+    ):
+        src = tmp_path / "src"
+        src.mkdir()
+        Image.new("RGB", (16, 16)).save(src / "a.png")
+        code = asyncio.run(app_module._run_cli(
+            cli_args(source=str(src), output=str(tmp_path / "o"), cache_max_size_mb=0),
+            optimizer_instance=optimizer,
+        ))
+        cap = capsys.readouterr()
+        assert code == 0
+        assert "--cache-max-size-mb has no effect without --cache-dir" in cap.err
+
+    def test_default_cache_max_size_mb_stays_quiet(self, app_module, optimizer, tmp_path, capsys):
+        src = tmp_path / "src"
+        src.mkdir()
+        Image.new("RGB", (16, 16)).save(src / "a.png")
+        asyncio.run(app_module._run_cli(
+            cli_args(source=str(src), output=str(tmp_path / "o")),
+            optimizer_instance=optimizer,
+        ))
+        assert "--cache-max-size-mb" not in capsys.readouterr().err
