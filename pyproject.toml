@@ -77,5 +77,6 @@ version = {attr = "image_optimizer.__version__"}
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 markers = [
+    "real_encoders: byte-determinism checks against the real pngquant/oxipng/cjpeg/avifenc binaries (skipped when a binary is not installed)",
     "real_binary_bootstrap: exercises the real first-run downloader against a loopback server (exempt from conftest's download stub)",
 ]
