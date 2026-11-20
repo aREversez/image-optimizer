@@ -83,6 +83,20 @@ All notable changes to this project will be documented in this file.
 - **CLI cache placement guards.** `--cache-dir` inside (or equal to)
   `--output` is now rejected like inside `--source`, and both containment
   checks are Windows-case-insensitive (`os.path.normcase`).
+- **Cache concurrent writes on Windows.** Replacing an entry with
+  `os.replace` fails with `PermissionError` while another reader or writer
+  has it open; `store()` now retries briefly and treats "another writer
+  already published a complete entry" as success, so duplicate images in one
+  batch no longer produce `cache write failed` warnings or skipped writes.
+- **The cache never deletes files it did not write.** Eviction and the temp
+  sweep now accept only the module's own names (`<64 hex>.<format>` and its
+  `.tmp-<pid>-<8 hex>` form inside a two-hex-digit shard), so pointing
+  `--cache-dir` at an existing directory can no longer make LRU eviction
+  remove unrelated files there.
+- **Pillow floor consistency.** `requirements.txt` now pins `Pillow>=11.3.0`
+  like `pyproject.toml`, so the AVIF cache precondition actually holds for
+  requirements-based installs (including CI) instead of relying on pip
+  happening to pick a new enough version.
 
 ### Changed
 - CLI `--json` setup errors (bad arguments, missing `--source`, output

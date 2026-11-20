@@ -27,6 +27,7 @@ if __package__ is None:
 from image_optimizer import binaries
 from image_optimizer.cache import (
     CACHEABLE_FORMATS,
+    DEFAULT_CACHE_MAX_MB,
     ContentCache,
     encoder_fingerprint,
     is_valid_reusable_output as _is_valid_reusable_output,
@@ -3364,10 +3365,15 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
         return 1
     output_dir = Path(args.output).resolve()
     cache_dir_arg = getattr(args, "cache_dir", None)
-    cache_max_mb = getattr(args, "cache_max_size_mb", 1024)
+    cache_max_mb = getattr(args, "cache_max_size_mb", DEFAULT_CACHE_MAX_MB)
     if cache_dir_arg and cache_max_mb < 0:
         print("[Error] --cache-max-size-mb must be >= 0 (0 = unlimited)", file=sys.stderr)
         return 1
+    if cache_dir_arg is None and cache_max_mb != DEFAULT_CACHE_MAX_MB:
+        # Same default as the argparse flag, so passing the flag on its own is
+        # detectable without a sentinel; an explicit value equal to the
+        # default stays silent, which is the only ambiguous case.
+        print("[Hint] --cache-max-size-mb has no effect without --cache-dir", file=sys.stderr)
 
     protected_colors = (
         [c.strip() for c in args.protect_colors.split(",") if c.strip()]
@@ -3415,10 +3421,6 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
         return 0
 
     cache: Optional[ContentCache] = None
-    if cache_dir_arg is None and cache_max_mb != 1024:
-        # Same default as the argparse flag; close enough to catch "user
-        # passed --cache-max-size-mb alone" without a sentinel.
-        print("[Hint] --cache-max-size-mb has no effect without --cache-dir", file=sys.stderr)
     if cache_dir_arg:
         cache_dir = Path(cache_dir_arg).resolve()
 
@@ -3462,7 +3464,8 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
                 # burning space). Newer entries are still stored and evicted.
                 print(
                     "[Warning] --cache-dir will never hit for AVIF: this Pillow build "
-                    "cannot read AVIF (needs Pillow >= 11.3 with libavif or pillow-avif-plugin)",
+                    "cannot read AVIF (needs Pillow >= 11.3 with libavif, e.g. the "
+                    "official wheels)",
                     file=sys.stderr,
                 )
 
@@ -3508,6 +3511,18 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
     # internally via its own max_concurrency, so every image is dispatched
     # via asyncio.gather() and the Optimizer instance does the throttling.
 
+    def fail_record(img_path: Path, error: str, output_name=None, original_size=None) -> dict:
+        """One per-file failure record; every failure path builds it here so
+        the report fields cannot drift between them."""
+        return {
+            "rel": img_path.relative_to(source).as_posix(),
+            "output_name": output_name,
+            "original_size": original_size,
+            "compressed_size": None,
+            "status": "failed",
+            "error": error,
+        }
+
     async def process(idx: int, img_path: Path):
         item_id = str(idx)
         rel = str(img_path.relative_to(source))
@@ -3517,11 +3532,9 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
                 counters["done"] += 1
                 counters["failed"] += 1
                 d = counters["done"]
-                records[img_path] = {
-                    "rel": img_path.relative_to(source).as_posix(), "output_name": None,
-                    "original_size": None, "compressed_size": None, "status": "failed",
-                    "error": "resolved output path escapes --output directory",
-                }
+                records[img_path] = fail_record(
+                    img_path, "resolved output path escapes --output directory"
+                )
             log(f"[{d}/{total}] FAIL {rel}: resolved output path escapes --output directory")
             return
         try:
@@ -3531,16 +3544,13 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
             # per-file record and a clean exit 1, never an unhandled crash
             # that would abort asyncio.gather() and (with --json) skip the
             # report entirely.
+            error = f"cannot create output directory {out_path.parent}: {e}"
             async with lock:
                 counters["done"] += 1
                 counters["failed"] += 1
                 d = counters["done"]
-                records[img_path] = {
-                    "rel": img_path.relative_to(source).as_posix(), "output_name": None,
-                    "original_size": None, "compressed_size": None, "status": "failed",
-                    "error": f"cannot create output directory {out_path.parent}: {e}",
-                }
-            log(f"[{d}/{total}] FAIL {rel}: cannot create output directory {out_path.parent}: {e}")
+                records[img_path] = fail_record(img_path, error)
+            log(f"[{d}/{total}] FAIL {rel}: {error}")
             return
         cache_key = None
         cached_hit = False
@@ -3569,9 +3579,9 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
             )
             if cache is not None and cache_key is not None and result["success"]:
                 try:
-                    stored = await asyncio.to_thread(cache.store, cache_key, out_path)
-                    if stored is not None:
-                        protected_entries.add(stored)
+                    protected_entries.add(
+                        await asyncio.to_thread(cache.store, cache_key, out_path)
+                    )
                 except OSError as e:
                     print(f"[Warning] cache write failed for {rel}: {e}", file=sys.stderr)
         async with lock:
@@ -3604,11 +3614,12 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
                 )
             else:
                 counters["failed"] += 1
-                records[img_path] = {
-                    "rel": img_path.relative_to(source).as_posix(), "output_name": out_path.name,
-                    "original_size": result.get("original_size"), "compressed_size": None,
-                    "status": "failed", "error": result.get("error") or "unknown error",
-                }
+                records[img_path] = fail_record(
+                    img_path,
+                    result.get("error") or "unknown error",
+                    output_name=out_path.name,
+                    original_size=result.get("original_size"),
+                )
                 log(f"[{d}/{total}] FAIL {rel}: {result.get('error') or 'unknown error'}")
 
     await asyncio.gather(*(process(i, p) for i, p in enumerate(images)))
@@ -3623,11 +3634,12 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
             print(f"[Warning] cache tmp sweep failed: {e}", file=sys.stderr)
 
     if cache is not None and cache_max_mb > 0:
+        cache_cap_bytes = cache_max_mb * 1024 * 1024
         try:
             evict_stats: dict = {}
             evicted = await asyncio.to_thread(
                 cache.evict,
-                cache_max_mb * 1024 * 1024,
+                cache_cap_bytes,
                 protected_entries,
                 evict_stats,
             )
@@ -3635,7 +3647,7 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
             evicted = 0
             print(f"[Warning] cache eviction failed: {e}", file=sys.stderr)
         else:
-            if evict_stats.get("total_after", 0) > cache_max_mb * 1024 * 1024:
+            if evict_stats.get("total_after", 0) > cache_cap_bytes:
                 # Only reachable when the cache cannot get under the cap by
                 # evicting unprotected entries: a single entry larger than
                 # the cap, or everything left is this run's fresh writes.
@@ -3818,13 +3830,13 @@ def main():
         "--cache-dir", metavar="PATH",
         help="Enable a content-hash result cache stored in PATH. Unchanged inputs with the "
              "same settings are copied from the cache instead of recompressed, even when "
-             "--output is a fresh directory every run. Must not be inside --source. "
-             "Default: no cache.",
+             "--output is a fresh directory every run. Must not be inside (or equal to) "
+             "--source or --output. Default: no cache.",
     )
     cli_group.add_argument(
-        "--cache-max-size-mb", type=int, default=1024, metavar="N",
+        "--cache-max-size-mb", type=int, default=DEFAULT_CACHE_MAX_MB, metavar="N",
         help="Cache size cap in MB, enforced after each run by evicting least-recently-used "
-             "entries (default 1024; 0 = unlimited). Only used with --cache-dir.",
+             f"entries (default {DEFAULT_CACHE_MAX_MB}; 0 = unlimited). Only used with --cache-dir.",
     )
 
     # The wheel ships no third-party executables (pngquant is GPL-3.0-or-later;

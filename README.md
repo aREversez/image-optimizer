@@ -158,11 +158,11 @@ image-optimizer --source ./raw --output "$(mktemp -d)" --cache-dir ~/.cache/imag
 
 - The key covers the input file's bytes, the pixel-affecting settings (`--quality`, `--mode`, `--max-width`, `--protect-colors`, `--dithering`/`--no-dithering`, `--keep-exif`, `--format`) and the encoders in use (the content of the pngquant/oxipng/cjpeg/avifenc binaries, plus the Pillow version). Changing `--workers`, `--recursive`, `--include` or `--exclude` does not invalidate anything, and renaming or moving a file still hits.
 - Only successful results are stored, never failures. A corrupt or truncated entry is treated as a miss and overwritten.
-- The cache directory must not be inside `--source`.
+- The cache directory must not be inside `--source` or `--output` (equal to either is rejected too; a cache dir that merely *contains* `--output` is allowed). Only files the cache itself wrote are counted or evicted, so pointing `--cache-dir` at a directory that already holds other files never touches them.
 - After each run the cache is trimmed to `--cache-max-size-mb` (default 1024 MB, `0` = unlimited) by deleting the least recently used entries first. Entries whose source image no longer exists are never hit again, so they age out on their own.
 - The compression pipeline is covered by byte-determinism tests (`tests/test_determinism.py`); the cache is only valid because the same input and settings always produce the same bytes.
-- AVIF cache hits need a Pillow build that can read AVIF (Pillow >= 11.3 with libavif, or `pillow-avif-plugin`; the installed requirement is pinned accordingly). Without AVIF read support the run warns on stderr and AVIF entries are never served.
-- Entries written during a run are protected from that same run's eviction, so a run never deletes the results it just wrote (the cache may transiently sit above the cap; those entries are evicted first on a later run). A single entry larger than `--cache-max-size-mb` can never fit under the cap and is evicted once it is no longer protected; the run warns on stderr whenever it cannot get the cache back under the cap.
+- AVIF cache hits need a Pillow build that can read AVIF (Pillow >= 11.3 with libavif; the official wheels bundle it and both `pyproject.toml` and `requirements.txt` pin that floor). Without AVIF read support the run warns on stderr and AVIF entries are never served.
+- Entries written during a run are protected from that same run's eviction, so a run never deletes the results it just wrote (the cache may transiently sit above the cap; on the next run they are ordinary LRU candidates and, being the newest, are evicted last). A single entry larger than `--cache-max-size-mb` can never fit under the cap and is evicted once it is no longer protected; the run warns on stderr whenever it cannot get the cache back under the cap.
 - Stale temporary files from crashed writers are swept at the end of every run, independent of the size cap.
 
 ### Filtering with --exclude / --include
@@ -198,7 +198,7 @@ image-optimizer --source ./raw --output ./out --json | jq .summary
 }
 ```
 
-`status` is one of `compressed`, `cached` (served from `--cache-dir`), `kept_original` (the result was not smaller, so the original's pixels were kept with metadata stripped), `excluded` or `failed`. Size totals and `saved_percent` cover the successful statuses; `total` counts every scanned file, excluded ones included. The exit code is unchanged: `1` only if a file failed. Setup errors (bad arguments, missing `--source`) exit `1` with a message on stderr and no JSON.
+`status` is one of `compressed`, `cached` (served from `--cache-dir`), `kept_original` (the result was not smaller, so the original's pixels were kept with metadata stripped), `excluded` or `failed`. Size totals and `saved_percent` cover the successful statuses; `total` counts every scanned file, excluded ones included. The exit code is unchanged: `1` only if a file failed. Setup errors (bad arguments, missing `--source`, an `--output` directory that cannot be created) exit `1` with a message on stderr and no JSON.
 
 ## Configuration
 
