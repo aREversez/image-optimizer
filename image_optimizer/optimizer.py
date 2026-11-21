@@ -479,6 +479,17 @@ class Optimizer:
         - MakerNote: vendor-specific bulk, no display value.
         """
         exif.pop(EXIF_TAG_ORIENTATION, None)
+        # get_ifd() caches the GPS sub-IFD on the Exif object. On Pillow 11.x,
+        # popping the GPSInfo pointer alone leaves that cached IFD behind, and
+        # tobytes() writes it back out if anything read it first. Empty it
+        # before dropping the pointer so this holds whatever touched the
+        # object earlier. Only when the tag is present: asking for a missing
+        # IFD would create an empty one that Pillow could serialize.
+        if EXIF_TAG_GPS_INFO in exif:
+            try:
+                exif.get_ifd(EXIF_TAG_GPS_INFO).clear()
+            except Exception:
+                pass
         exif.pop(EXIF_TAG_GPS_INFO, None)
         try:
             exif.get_ifd(EXIF_TAG_EXIF_IFD).pop(EXIF_TAG_MAKER_NOTE, None)

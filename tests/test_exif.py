@@ -102,6 +102,28 @@ class TestCleanExifUnit:
         assert not exif.get_ifd(TAG_GPS_INFO), "GPS IFD must be cleared"
         assert TAG_GPS_INFO not in exif, "GPSInfo pointer must be removed"
 
+    def test_gps_data_never_reaches_serialized_bytes_after_ifd_was_read(self, tmp_path):
+        """The check that matters is the bytes that get written out, not the
+        in-memory object. get_ifd() caches the GPS sub-IFD on the Exif object,
+        and on Pillow 11.x popping the pointer alone left that cache to be
+        serialized, so GPS coordinates survived into the output whenever
+        anything had read the IFD before cleaning."""
+        from image_optimizer.optimizer import Optimizer
+
+        src = tmp_path / "gps.jpg"
+        _make_jpeg_with_gps(src)
+        exif = _read_exif(src)
+        assert exif.get_ifd(TAG_GPS_INFO), "sanity: source has GPS data (also caches the IFD)"
+
+        Optimizer._clean_exif(exif)
+        raw = exif.tobytes()
+        if raw.startswith(b"Exif\x00\x00"):
+            raw = raw[6:]
+
+        reloaded = Image.Exif()
+        reloaded.load(raw)
+        assert not reloaded.get_ifd(TAG_GPS_INFO), "GPS data must not survive serialization"
+
     def test_drops_maker_note(self, tmp_path):
         from image_optimizer.optimizer import Optimizer
 
