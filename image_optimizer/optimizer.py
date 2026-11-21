@@ -200,37 +200,56 @@ class Optimizer:
             return stdout, stderr, False
         except asyncio.TimeoutError:
             await Optimizer._kill_and_reap(proc)
-            return b"", f"timed out after {timeout:.0f}s (process killed)".encode(), True
+            return b"", f"timed out after {timeout:g}s (process killed)".encode(), True
         except asyncio.CancelledError:
             await Optimizer._kill_and_reap(proc)
             raise
 
     @staticmethod
     async def _kill_and_reap(proc: "asyncio.subprocess.Process") -> None:
-        """Force-terminate a subprocess and wait for it to actually exit,
+        """Force-terminate a subprocess and wait (briefly) for it to exit,
         so it's neither left running as an orphan nor left as a zombie.
+        The wait is bounded by REAP_TIMEOUT: this is best effort, not a
+        guarantee, and it says so on stderr when it gives up.
 
-        The wait is bounded by REAP_TIMEOUT. kill() reaches only the process
-        we started. If that process had spawned a descendant (a .bat/.cmd
-        or shim wrapper on Windows, a shell wrapper without `exec`), the
-        descendant survives and keeps the stdout/stderr pipes open. On
-        Python <= 3.12 proc.wait() does not resolve until those pipes close,
-        so an unbounded wait here blocked the worker (and its semaphore
-        slot) for as long as the descendant lived, which defeated the point
-        of the timeout. Python 3.13 no longer waits on the pipes.
+        kill() reaches only the process we started. If that process had
+        spawned a descendant (a .bat/.cmd or shim wrapper on Windows, a
+        shell wrapper without `exec`), the descendant survives and keeps
+        the stdout/stderr pipes open. On Python < 3.15 proc.wait() does
+        not resolve until those pipes close -- asyncio wakes the waiters
+        from _call_connection_lost, which needs every pipe disconnected;
+        gh-119710 (3.15) also wakes them from _process_exited -- so an
+        unbounded wait here blocked the worker (and its semaphore slot)
+        for as long as the descendant lived, which defeated the point of
+        the timeout. Verified on 3.12 and 3.13, both of which block.
 
-        When the wait times out the process is already dead, so stop waiting
-        and close our end of the pipes; otherwise the abandoned transport is
-        finalized after the event loop is closed and logs "Event loop is
-        closed". Closing goes through the transport's private handle,
-        best effort, because asyncio has no public way to do it."""
+        Giving up on the wait is safe: asyncio records the exit status
+        (and reaps the child) before the pipes can block wait(), so what
+        survives the timeout is a bookkeeping orphan, not a running
+        process. We then close our end of the pipes, otherwise the
+        abandoned transport is finalized after the event loop is closed
+        and logs "Event loop is closed". Closing goes through the
+        transport's private handle, best effort, because asyncio has no
+        public way to do it."""
         try:
             proc.kill()
-        except ProcessLookupError:
+        except OSError:
+            # ProcessLookupError (already gone) is the common case, but
+            # Windows can also refuse with PermissionError, and letting
+            # that escape would replace the caller's "timed out" result
+            # with an exception, skipping the encoder fallback path.
             pass
         try:
             await asyncio.wait_for(proc.wait(), timeout=REAP_TIMEOUT)
         except asyncio.TimeoutError:
+            status = getattr(proc, "returncode", None)
+            print(
+                f"[Warning] killed encoder pid {getattr(proc, 'pid', '?')} was not "
+                f"reaped within {REAP_TIMEOUT:g}s "
+                f"(exit status {'unknown' if status is None else status}); "
+                f"abandoning the wait",
+                file=sys.stderr,
+            )
             transport = getattr(proc, "_transport", None)
             if transport is not None:
                 try:

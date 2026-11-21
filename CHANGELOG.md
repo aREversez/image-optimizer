@@ -64,13 +64,19 @@ All notable changes to this project will be documented in this file.
   After a timed-out encoder was killed, the worker waited for it to be reaped
   with no bound. If the process we started had spawned a descendant (a
   `.bat`/`.cmd` or shim wrapper on Windows, a shell wrapper without `exec`),
-  the descendant kept the stdout/stderr pipes open and, on Python 3.12 and
-  earlier, the wait lasted until it exited, so the timeout did not free the
-  worker slot. The wait is now bounded (2 s) and the abandoned pipes are
-  closed, which also removes the `Event loop is closed` noise those pipes
-  caused at shutdown. This was the cause of the Windows CI failures in
-  `TestSubprocessTimeout` (the pngquant test took 999 s). A surviving
-  descendant is still not killed.
+  the descendant kept the stdout/stderr pipes open and, on Python before 3.15,
+  the wait lasted until it exited, so the timeout did not free the worker slot
+  (`asyncio` wakes `wait()` only from `_call_connection_lost`; gh-119710, new
+  in 3.15, also wakes it when the process exits — so 3.13/3.14 hang just like
+  the 3.11/3.12 in the CI matrix, and only 3.15+ is unaffected). The wait is
+  now bounded (2 s) and the abandoned pipes are closed, which also removes the
+  `Event loop is closed` noise those pipes caused at shutdown; giving up is
+  reported on stderr with the pid and exit status instead of being silent.
+  This was the cause of the Windows CI failures in `TestSubprocessTimeout`
+  (the pngquant test took 999 s). A surviving descendant is still not killed,
+  and a `kill()` that raises anything but `ProcessLookupError` (e.g. Windows
+  `PermissionError`) no longer turns the caller's `timed out` result into an
+  exception that skips the encoder fallback.
 - **CLI `--json` stdout purity.** The binary bootstrap ("[Binaries] ... already
   installed", download progress, the `--no-download` notice) and config.json
   diagnostics printed to stdout before the report; `json.loads(stdout)` failed

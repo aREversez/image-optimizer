@@ -1065,10 +1065,10 @@ class TestSubprocessTimeout:
         proc = asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
         assert proc.returncode is not None, "child process must be reaped (not orphaned) after cancellation"
 
-    def test_kill_and_reap_gives_up_when_the_killed_process_is_never_reaped(self, monkeypatch):
+    def test_kill_and_reap_gives_up_when_the_killed_process_is_never_reaped(self, monkeypatch, capsys):
         """If wait() never resolves (a surviving descendant holds the pipes
-        open on Python <= 3.12), _kill_and_reap must stop waiting after
-        REAP_TIMEOUT, close the transport, and return."""
+        open on Python < 3.15), _kill_and_reap must stop waiting after
+        REAP_TIMEOUT, say so on stderr, close the transport, and return."""
         import image_optimizer.optimizer as optimizer_module
         from image_optimizer.optimizer import Optimizer
 
@@ -1081,6 +1081,8 @@ class TestSubprocessTimeout:
                 self.closed = True
 
         class FakeProc:
+            pid = 4321
+
             def __init__(self):
                 self.killed = False
                 self._transport = FakeTransport()
@@ -1101,11 +1103,36 @@ class TestSubprocessTimeout:
         assert proc.killed
         assert proc._transport.closed, "abandoned transport must be closed"
         assert elapsed < 2.0, f"took {elapsed:.2f}s -- reap wait was not bounded"
+        # Giving up silently would leave a stuck worker slot unexplained in
+        # the logs; the warning has to name the process it walked away from.
+        err = capsys.readouterr().err
+        assert "4321" in err and "abandon" in err, f"no diagnostic on stderr: {err!r}"
+
+    def test_kill_and_reap_survives_a_kill_that_is_refused(self, monkeypatch):
+        """Windows can refuse TerminateProcess (PermissionError) for a process
+        it will not let us touch. Letting that escape would turn the caller's
+        "timed out" result into an exception and skip the encoder fallback,
+        so _kill_and_reap must swallow it and carry on to the bounded wait."""
+        from image_optimizer.optimizer import Optimizer
+
+        class RefusingProc:
+            returncode = 0
+
+            def kill(self):
+                raise PermissionError("access denied")
+
+            async def wait(self):
+                return 0
+
+        async def scenario():
+            await Optimizer._kill_and_reap(RefusingProc())
+
+        asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))  # must not raise
 
     def test_communicate_with_timeout_returns_when_a_descendant_holds_the_pipes(self, monkeypatch):
         """Same shape as the Windows .bat wrapper (cmd.exe -> python): the
         process we started spawns a child that inherits stdout/stderr and
-        outlives it. kill() only reaches the parent. On Python <= 3.12 an
+        outlives it. kill() only reaches the parent. On Python < 3.15 an
         unbounded wait() then blocked until the child exited (999s in CI),
         and the abandoned transport logged "Event loop is closed" when it was
         finalized after the loop shut down."""
@@ -1114,10 +1141,15 @@ class TestSubprocessTimeout:
         from image_optimizer.optimizer import Optimizer
 
         monkeypatch.setattr(optimizer_module, "REAP_TIMEOUT", 0.5)
+        # The grandchild is the orphan nobody can kill, so its nap is the
+        # test's only lasting footprint: long enough that an unbounded wait()
+        # would blow the 5 s assertion below (otherwise the test would pass
+        # without the fix), short enough to stay well inside the 10 s guard
+        # even when that blocking path is the one being exercised.
         parent = (
             "import subprocess, sys, time\n"
-            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'])\n"
-            "time.sleep(30)\n"
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(8)'])\n"
+            "time.sleep(30)\n"  # safety bound only; the parent is killed first
         )
 
         async def scenario():
