@@ -1015,7 +1015,7 @@ class TestSubprocessTimeout:
 
         hang_script = tmp_path / "pngquant_hangs"
         hang_script.write_text(
-            f"#!/usr/bin/env python3\nimport time\ntime.sleep(999)\n"
+            f"#!/usr/bin/env python3\nimport time\ntime.sleep(30)\n"
         )
         hang_script.chmod(hang_script.stat().st_mode | stat.S_IEXEC)
         if sys.platform == "win32":
@@ -1117,7 +1117,7 @@ class TestSubprocessTimeout:
         parent = (
             "import subprocess, sys, time\n"
             "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'])\n"
-            "time.sleep(999)\n"
+            "time.sleep(30)\n"
         )
 
         async def scenario():
@@ -1163,7 +1163,14 @@ class TestSubprocessTimeout:
         isn't theoretical). `exec` replaces the shell process in place
         instead of forking, so there's only ever one real process to
         kill, exactly like a genuine hung pngquant/oxipng/cjpeg/avifenc
-        binary (none of which fork children of their own)."""
+        binary (none of which fork children of their own).
+
+        Windows has no `exec`: the .bat wrapper is cmd.exe plus a python
+        child, and killing the wrapper leaves that child running. The hang
+        scripts behind these wrappers therefore sleep 30 s, not 999 s: far
+        longer than any timeout the tests use (0.3 s, with 5 s guards), but
+        the leftover child is gone soon after the test instead of lingering
+        for ~16 minutes on a developer's machine."""
         bin_dir = tmp_path / f"{name}_bin"
         bin_dir.mkdir()
         impl = bin_dir / f"{name}_impl.py"
@@ -1187,7 +1194,7 @@ class TestSubprocessTimeout:
             "import sys, time\n"
             f"i = sys.argv.index({out_flag!r})\n"
             "open(sys.argv[i + 1], 'wb').write(b'GARBAGE-PARTIAL-WRITE' * 500)\n"
-            "time.sleep(999)\n"
+            "time.sleep(30)\n"
         )
         return self._make_real_bin(tmp_path, "partialhang", script)
 
