@@ -1067,8 +1067,9 @@ class TestSubprocessTimeout:
 
     def test_kill_and_reap_gives_up_when_the_killed_process_is_never_reaped(self, monkeypatch, capsys):
         """If wait() never resolves (a surviving descendant holds the pipes
-        open on Python < 3.15), _kill_and_reap must stop waiting after
-        REAP_TIMEOUT, say so on stderr, close the transport, and return."""
+        open on Python releases without gh-119710), _kill_and_reap must stop
+        waiting after REAP_TIMEOUT, say so on stderr, close the transport,
+        and return."""
         import image_optimizer.optimizer as optimizer_module
         from image_optimizer.optimizer import Optimizer
 
@@ -1132,10 +1133,13 @@ class TestSubprocessTimeout:
     def test_communicate_with_timeout_returns_when_a_descendant_holds_the_pipes(self, monkeypatch):
         """Same shape as the Windows .bat wrapper (cmd.exe -> python): the
         process we started spawns a child that inherits stdout/stderr and
-        outlives it. kill() only reaches the parent. On Python < 3.15 an
+        outlives it. kill() only reaches the parent. Without gh-119710 an
         unbounded wait() then blocked until the child exited (999s in CI),
         and the abandoned transport logged "Event loop is closed" when it was
-        finalized after the loop shut down."""
+        finalized after the loop shut down. On releases that already have
+        gh-119710 (e.g. 3.13.18) wait() returns at once, so there this only
+        guards the shutdown noise; the blocking path is exercised on 3.11
+        and 3.12."""
         import gc
         import image_optimizer.optimizer as optimizer_module
         from image_optimizer.optimizer import Optimizer

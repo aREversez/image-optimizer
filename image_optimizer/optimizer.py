@@ -215,13 +215,14 @@ class Optimizer:
         kill() reaches only the process we started. If that process had
         spawned a descendant (a .bat/.cmd or shim wrapper on Windows, a
         shell wrapper without `exec`), the descendant survives and keeps
-        the stdout/stderr pipes open. On Python < 3.15 proc.wait() does
-        not resolve until those pipes close -- asyncio wakes the waiters
-        from _call_connection_lost, which needs every pipe disconnected;
-        gh-119710 (3.15) also wakes them from _process_exited -- so an
-        unbounded wait here blocked the worker (and its semaphore slot)
-        for as long as the descendant lived, which defeated the point of
-        the timeout. Verified on 3.12 and 3.13, both of which block.
+        the stdout/stderr pipes open. On Python releases without the
+        gh-119710 fix proc.wait() does not resolve until those pipes close
+        -- asyncio wakes the waiters from _call_connection_lost, which needs
+        every pipe disconnected; gh-119710 also wakes them from
+        _process_exited -- so an unbounded wait here blocked the worker (and
+        its semaphore slot) for as long as the descendant lived, which
+        defeated the point of the timeout. Measured: 3.11.18 and 3.12.3
+        block, 3.13.18 does not (patch-release dependent).
 
         Giving up on the wait is safe: asyncio records the exit status
         (and reaps the child) before the pipes can block wait(), so what

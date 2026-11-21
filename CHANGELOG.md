@@ -64,11 +64,14 @@ All notable changes to this project will be documented in this file.
   After a timed-out encoder was killed, the worker waited for it to be reaped
   with no bound. If the process we started had spawned a descendant (a
   `.bat`/`.cmd` or shim wrapper on Windows, a shell wrapper without `exec`),
-  the descendant kept the stdout/stderr pipes open and, on Python before 3.15,
-  the wait lasted until it exited, so the timeout did not free the worker slot
-  (`asyncio` wakes `wait()` only from `_call_connection_lost`; gh-119710, new
-  in 3.15, also wakes it when the process exits — so 3.13/3.14 hang just like
-  the 3.11/3.12 in the CI matrix, and only 3.15+ is unaffected). The wait is
+  the descendant kept the stdout/stderr pipes open and, on Python releases
+  without the gh-119710 fix, the wait lasted until it exited, so the timeout
+  did not free the worker slot (`asyncio` wakes `wait()` only from
+  `_call_connection_lost`, which needs every pipe closed; gh-119710 also wakes
+  it when the process exits). Measured with a parent-plus-grandchild repro:
+  3.11.18 and 3.12.3 block until the grandchild exits, 3.13.18 returns at
+  once, so whether a given install hangs depends on its patch release. The
+  wait is
   now bounded (2 s) and the abandoned pipes are closed, which also removes the
   `Event loop is closed` noise those pipes caused at shutdown; giving up is
   reported on stderr with the pid and exit status instead of being silent.
