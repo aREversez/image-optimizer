@@ -28,6 +28,10 @@ HEX_COLOR_RE = re.compile(r"^#?[0-9A-Fa-f]{6}$")
 # in _find_binary.
 SUBPROCESS_TIMEOUT = 120
 
+# After a timed-out encoder is killed, how long to wait for it to be reaped
+# before giving up on it (see Optimizer._kill_and_reap).
+REAP_TIMEOUT = 2.0
+
 # EXIF tag ids used by the retention logic below. Orientation is stripped
 # because `exif_transpose` already bakes it into the pixel grid — re-writing
 # it would double-rotate in any reader that
@@ -204,13 +208,35 @@ class Optimizer:
     @staticmethod
     async def _kill_and_reap(proc: "asyncio.subprocess.Process") -> None:
         """Force-terminate a subprocess and wait for it to actually exit,
-        so it's neither left running as an orphan nor left as a zombie."""
+        so it's neither left running as an orphan nor left as a zombie.
+
+        The wait is bounded by REAP_TIMEOUT. kill() reaches only the process
+        we started. If that process had spawned a descendant (a .bat/.cmd
+        or shim wrapper on Windows, a shell wrapper without `exec`), the
+        descendant survives and keeps the stdout/stderr pipes open. On
+        Python <= 3.12 proc.wait() does not resolve until those pipes close,
+        so an unbounded wait here blocked the worker (and its semaphore
+        slot) for as long as the descendant lived, which defeated the point
+        of the timeout. Python 3.13 no longer waits on the pipes.
+
+        When the wait times out the process is already dead, so stop waiting
+        and close our end of the pipes; otherwise the abandoned transport is
+        finalized after the event loop is closed and logs "Event loop is
+        closed". Closing goes through the transport's private handle,
+        best effort, because asyncio has no public way to do it."""
         try:
             proc.kill()
         except ProcessLookupError:
             pass
         try:
-            await proc.wait()
+            await asyncio.wait_for(proc.wait(), timeout=REAP_TIMEOUT)
+        except asyncio.TimeoutError:
+            transport = getattr(proc, "_transport", None)
+            if transport is not None:
+                try:
+                    transport.close()
+                except Exception:
+                    pass
         except Exception:
             pass
 

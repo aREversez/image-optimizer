@@ -1065,6 +1065,89 @@ class TestSubprocessTimeout:
         proc = asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
         assert proc.returncode is not None, "child process must be reaped (not orphaned) after cancellation"
 
+    def test_kill_and_reap_gives_up_when_the_killed_process_is_never_reaped(self, monkeypatch):
+        """If wait() never resolves (a surviving descendant holds the pipes
+        open on Python <= 3.12), _kill_and_reap must stop waiting after
+        REAP_TIMEOUT, close the transport, and return."""
+        import image_optimizer.optimizer as optimizer_module
+        from image_optimizer.optimizer import Optimizer
+
+        monkeypatch.setattr(optimizer_module, "REAP_TIMEOUT", 0.2)
+
+        class FakeTransport:
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        class FakeProc:
+            def __init__(self):
+                self.killed = False
+                self._transport = FakeTransport()
+
+            def kill(self):
+                self.killed = True
+
+            async def wait(self):
+                await asyncio.Event().wait()  # never resolves
+
+        async def scenario():
+            proc = FakeProc()
+            t0 = time.perf_counter()
+            await Optimizer._kill_and_reap(proc)
+            return proc, time.perf_counter() - t0
+
+        proc, elapsed = asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+        assert proc.killed
+        assert proc._transport.closed, "abandoned transport must be closed"
+        assert elapsed < 2.0, f"took {elapsed:.2f}s -- reap wait was not bounded"
+
+    def test_communicate_with_timeout_returns_when_a_descendant_holds_the_pipes(self, monkeypatch):
+        """Same shape as the Windows .bat wrapper (cmd.exe -> python): the
+        process we started spawns a child that inherits stdout/stderr and
+        outlives it. kill() only reaches the parent. On Python <= 3.12 an
+        unbounded wait() then blocked until the child exited (999s in CI),
+        and the abandoned transport logged "Event loop is closed" when it was
+        finalized after the loop shut down."""
+        import gc
+        import image_optimizer.optimizer as optimizer_module
+        from image_optimizer.optimizer import Optimizer
+
+        monkeypatch.setattr(optimizer_module, "REAP_TIMEOUT", 0.5)
+        parent = (
+            "import subprocess, sys, time\n"
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'])\n"
+            "time.sleep(999)\n"
+        )
+
+        async def scenario():
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-c", parent,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.sleep(0.5)  # let the child start and inherit the pipes
+            t0 = time.perf_counter()
+            result = await Optimizer._communicate_with_timeout(proc, timeout=0.3)
+            return result, time.perf_counter() - t0, proc
+
+        unraisable = []
+        old_hook = sys.unraisablehook
+        sys.unraisablehook = lambda a: unraisable.append(str(a.exc_value))
+        try:
+            (stdout, stderr, timed_out), elapsed, proc = asyncio.run(
+                asyncio.wait_for(scenario(), timeout=10.0)
+            )
+            del proc
+            gc.collect()
+        finally:
+            sys.unraisablehook = old_hook
+
+        assert timed_out is True
+        assert b"timed out" in stderr
+        assert elapsed < 5.0, f"took {elapsed:.2f}s -- blocked on the pipe-holding descendant"
+        assert not [m for m in unraisable if "closed" in m], unraisable
+
     @staticmethod
     def _make_real_bin(tmp_path: Path, name: str, script: str) -> Path:
         """Wrap `script` (a Python source string) as a real, directly

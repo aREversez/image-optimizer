@@ -60,6 +60,17 @@ All notable changes to this project will be documented in this file.
   trusted publisher (`environment: pypi`). No API token is stored anywhere.
 
 ### Fixed
+- **Encoder timeout could still hang for as long as a child process lived.**
+  After a timed-out encoder was killed, the worker waited for it to be reaped
+  with no bound. If the process we started had spawned a descendant (a
+  `.bat`/`.cmd` or shim wrapper on Windows, a shell wrapper without `exec`),
+  the descendant kept the stdout/stderr pipes open and, on Python 3.12 and
+  earlier, the wait lasted until it exited, so the timeout did not free the
+  worker slot. The wait is now bounded (2 s) and the abandoned pipes are
+  closed, which also removes the `Event loop is closed` noise those pipes
+  caused at shutdown. This was the cause of the Windows CI failures in
+  `TestSubprocessTimeout` (the pngquant test took 999 s). A surviving
+  descendant is still not killed.
 - **CLI `--json` stdout purity.** The binary bootstrap ("[Binaries] ... already
   installed", download progress, the `--no-download` notice) and config.json
   diagnostics printed to stdout before the report; `json.loads(stdout)` failed
