@@ -1109,7 +1109,45 @@ class TestSubprocessTimeout:
         err = capsys.readouterr().err
         assert "4321" in err and "abandon" in err, f"no diagnostic on stderr: {err!r}"
 
-    def test_kill_and_reap_survives_a_kill_that_is_refused(self, monkeypatch):
+    def test_kill_and_reap_closes_the_pipes_when_the_wait_resolves(self):
+        """The gh-119710 case, which no longer blocks at all: wait() returns
+        while a survivor still holds the pipes open, so nothing in the
+        timeout branch runs. The pipes must be closed anyway -- otherwise the
+        abandoned transports are finalized after loop close and log "Event
+        loop is closed" / "I/O operation on closed pipe" exactly like the
+        blocking case did."""
+        from image_optimizer.optimizer import Optimizer
+
+        class FakeTransport:
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        class ReapedProc:
+            returncode = -9
+
+            def __init__(self):
+                self._transport = FakeTransport()
+
+            def kill(self):
+                pass
+
+            async def wait(self):
+                return -9  # resolves at once, pipes still open
+
+        async def scenario():
+            proc = ReapedProc()
+            await Optimizer._kill_and_reap(proc)
+            return proc
+
+        proc = asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+        assert proc._transport.closed, (
+            "pipes left open when wait() resolved -- the abandoned transport "
+            "would be finalized after the loop closes"
+        )
+
+    def test_kill_and_reap_survives_a_kill_that_is_refused(self):
         """Windows can refuse TerminateProcess (PermissionError) for a process
         it will not let us touch. Letting that escape would turn the caller's
         "timed out" result into an exception and skip the encoder fallback,
@@ -1137,9 +1175,9 @@ class TestSubprocessTimeout:
         unbounded wait() then blocked until the child exited (999s in CI),
         and the abandoned transport logged "Event loop is closed" when it was
         finalized after the loop shut down. On releases that already have
-        gh-119710 (e.g. 3.13.18) wait() returns at once, so there this only
-        guards the shutdown noise; the blocking path is exercised on 3.11
-        and 3.12."""
+        gh-119710 (e.g. 3.13.18) wait() returns at once, so the blocking path
+        is only exercised on 3.11/3.12; the no-noise assertion covers both,
+        because the pipes are closed after the kill either way."""
         import gc
         import image_optimizer.optimizer as optimizer_module
         from image_optimizer.optimizer import Optimizer

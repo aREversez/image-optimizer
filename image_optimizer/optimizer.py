@@ -227,11 +227,15 @@ class Optimizer:
         Giving up on the wait is safe: asyncio records the exit status
         (and reaps the child) before the pipes can block wait(), so what
         survives the timeout is a bookkeeping orphan, not a running
-        process. We then close our end of the pipes, otherwise the
-        abandoned transport is finalized after the event loop is closed
-        and logs "Event loop is closed". Closing goes through the
-        transport's private handle, best effort, because asyncio has no
-        public way to do it."""
+        process.
+
+        The pipes are closed on every path, not just the one that gave up.
+        A survivor keeps them open either way: when wait() resolves without
+        the pipes closing (gh-119710 wakes it from _process_exited) the
+        abandoned transport is still finalized after the event loop is
+        closed and logs "Event loop is closed" / "I/O operation on closed
+        pipe". Closing goes through the transport's private handle, best
+        effort, because asyncio has no public way to do it."""
         try:
             proc.kill()
         except OSError:
@@ -251,14 +255,14 @@ class Optimizer:
                 f"abandoning the wait",
                 file=sys.stderr,
             )
-            transport = getattr(proc, "_transport", None)
-            if transport is not None:
-                try:
-                    transport.close()
-                except Exception:
-                    pass
         except Exception:
             pass
+        transport = getattr(proc, "_transport", None)
+        if transport is not None:
+            try:
+                transport.close()
+            except Exception:
+                pass
 
     def _detect_binaries(self):
         # See the comment on self._detect_lock in __init__: two concurrent

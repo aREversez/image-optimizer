@@ -69,17 +69,20 @@ All notable changes to this project will be documented in this file.
   did not free the worker slot (`asyncio` wakes `wait()` only from
   `_call_connection_lost`, which needs every pipe closed; gh-119710 also wakes
   it when the process exits). Measured with a parent-plus-grandchild repro:
-  3.11.18 and 3.12.3 block until the grandchild exits, 3.13.18 returns at
-  once, so whether a given install hangs depends on its patch release. The
-  wait is
-  now bounded (2 s) and the abandoned pipes are closed, which also removes the
-  `Event loop is closed` noise those pipes caused at shutdown; giving up is
-  reported on stderr with the pid and exit status instead of being silent.
-  This was the cause of the Windows CI failures in `TestSubprocessTimeout`
-  (the pngquant test took 999 s). A surviving descendant is still not killed,
-  and a `kill()` that raises anything but `ProcessLookupError` (e.g. Windows
-  `PermissionError`) no longer turns the caller's `timed out` result into an
-  exception that skips the encoder fallback.
+  3.11.18, 3.12.3 and 3.12.10 block until the grandchild exits, 3.13.18
+  returns at once, so whether a given install hangs depends on its patch
+  release. The wait is now bounded (2 s), and the pipes are closed after the
+  kill on every path (not only when the wait gave up) because `wait()` can
+  resolve while a survivor still holds them open, and such abandoned
+  transports can be finalized after loop close (`Event loop is closed`,
+  `I/O operation on closed pipe`), so we no longer depend on the patch release.
+  Giving up is reported on stderr with the pid and exit status instead of
+  being silent. This was the cause of the Windows CI failures in
+  `TestSubprocessTimeout` (the pngquant test took 999 s). A surviving
+  descendant is still not killed, and a `kill()` that raises anything but
+  `ProcessLookupError` (e.g. Windows `PermissionError`) no longer turns the
+  caller's `timed out` result into an exception that skips the encoder
+  fallback.
 - **CLI `--json` stdout purity.** The binary bootstrap ("[Binaries] ... already
   installed", download progress, the `--no-download` notice) and config.json
   diagnostics printed to stdout before the report; `json.loads(stdout)` failed
