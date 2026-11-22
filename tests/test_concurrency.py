@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 def _make_state(tmp_path, n_files):
-    from app.main import AppState
+    from image_optimizer.main import AppState
     state = AppState()
     state.workspace = tmp_path / "ws"
     state.workspace.mkdir()
@@ -35,8 +35,8 @@ def _make_state(tmp_path, n_files):
 
 class TestConcurrency:
     def test_files_are_processed_concurrently_not_sequentially(self, tmp_path, fake_bin_dir):
-        import app.main as m
-        from app.optimizer import Optimizer
+        import image_optimizer.main as m
+        from image_optimizer.optimizer import Optimizer
 
         async def slow_optimize(input_path, output_path, **kwargs):
             await asyncio.sleep(0.3)
@@ -63,8 +63,8 @@ class TestConcurrency:
         assert elapsed < 1.8, f"took {elapsed:.2f}s — looks sequential, not concurrent"
 
     def test_one_file_raising_does_not_orphan_the_others(self, tmp_path, fake_bin_dir):
-        import app.main as m
-        from app.optimizer import Optimizer
+        import image_optimizer.main as m
+        from image_optimizer.optimizer import Optimizer
 
         call_count = {"n": 0}
 
@@ -97,8 +97,8 @@ class TestConcurrency:
         assert state.is_running is False
 
     def test_cancel_stops_new_work_but_finishes_in_flight(self, tmp_path, fake_bin_dir):
-        import app.main as m
-        from app.optimizer import Optimizer
+        import image_optimizer.main as m
+        from image_optimizer.optimizer import Optimizer
 
         async def slow_optimize(input_path, output_path, **kwargs):
             await asyncio.sleep(0.2)

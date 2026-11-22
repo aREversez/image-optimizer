@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import hashlib
 import json
 import os
@@ -18,17 +19,26 @@ from zipfile import ZipFile
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
-from PIL import Image
+from PIL import Image, features as pil_features
 
 if __package__ is None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.models import OptimizeRequest, PreviewRequest, RecentClearRequest, RecentRemoveRequest, RevealRequest, ScanRequest, WatchRequest
-from app.optimizer import HEX_COLOR_RE, Optimizer
-from app.watcher import FolderWatcher
+from image_optimizer import binaries
+from image_optimizer.cache import (
+    CACHEABLE_FORMATS,
+    DEFAULT_CACHE_MAX_MB,
+    ContentCache,
+    encoder_fingerprint,
+    is_valid_reusable_output as _is_valid_reusable_output,
+    settings_fingerprint as _settings_fingerprint,
+)
+from image_optimizer.models import OptimizeRequest, PreviewRequest, RecentClearRequest, RecentRemoveRequest, RevealRequest, ScanRequest, WatchRequest
+from image_optimizer.optimizer import HEX_COLOR_RE, Optimizer
+from image_optimizer.watcher import FolderWatcher
 
 if getattr(sys, "frozen", False):
-    BASE_DIR = Path(sys._MEIPASS) / "app"
+    BASE_DIR = Path(sys._MEIPASS) / "image_optimizer"
 else:
     BASE_DIR = Path(__file__).resolve().parent
 
@@ -199,20 +209,40 @@ def get_session(request: Request) -> AppState:
     return st
 
 
+async def _sweep_stale_sessions_once() -> None:
+    """One sweep pass: drop sessions idle past SESSION_IDLE_TIMEOUT. Split
+    out from _sweep_stale_sessions so tests can trigger a single pass
+    directly instead of waiting on the real interval."""
+    now = time.time()
+    stale = [sid for sid, st in SESSIONS.items() if now - st.last_seen > SESSION_IDLE_TIMEOUT]
+    for sid in stale:
+        st = SESSIONS.pop(sid, None)
+        if st is None:
+            continue
+        # A session can go stale while Watch Mode is still running — that's
+        # the normal "fire and forget" use case, not an edge case — so it
+        # must be cancelled here, not just dropped from SESSIONS. Without
+        # this, watch_task (created in watch_start) keeps polling forever:
+        # its closure holds a live reference to `st`, keeping the whole
+        # AppState — including the ever-growing watch_logs list — alive
+        # and running with no way for the user to reach it again (a
+        # reconnect gets a brand-new AppState, unaware the old task still
+        # exists). No-op if watch wasn't running.
+        # See test_stale_sweep_cancels_orphaned_watch_task.
+        await _stop_watch(st)
+        if st.workspace:
+            # Each stale workspace gets deleted off the event loop — a
+            # sweep that grabs several oversized sessions in one pass
+            # could otherwise freeze the server for the combined delete
+            # duration, right when a still-active session's progress poll
+            # is exactly the request we'd want not to stall.
+            await _async_rmtree(st.workspace)
+
+
 async def _sweep_stale_sessions():
     while True:
         await asyncio.sleep(SESSION_SWEEP_INTERVAL)
-        now = time.time()
-        stale = [sid for sid, st in SESSIONS.items() if now - st.last_seen > SESSION_IDLE_TIMEOUT]
-        for sid in stale:
-            st = SESSIONS.pop(sid, None)
-            if st and st.workspace:
-                # Each stale workspace gets deleted off the event loop — a
-                # sweep that grabs several oversized sessions in one pass
-                # could otherwise freeze the server for the combined delete
-                # duration, right when a still-active session's progress poll
-                # is exactly the request we'd want not to stall.
-                await _async_rmtree(st.workspace)
+        await _sweep_stale_sessions_once()
 
 
 optimizer: Optional[Optimizer] = None
@@ -349,34 +379,6 @@ def _skip_fingerprints_file(output_dir: str) -> Path:
     return _skip_fingerprints_dir() / f"{_batch_id_for_output_dir(output_dir)}.json"
 
 
-def _settings_fingerprint(
-    quality: str, compression_mode: str, max_width: int,
-    protected_colors: Optional[list], dithering: bool, keep_exif: bool, output_format: str,
-) -> str:
-    """Fingerprints the effective per-file compression settings that
-    produced (or would produce) a given output. Used by skip_existing to
-    tell "the source hasn't changed AND these are the same settings that
-    made this file last time" apart from "the source happens to be
-    unchanged but the user asked for something different this run" — the
-    two look identical if you only check the source's mtime, which is all
-    the reuse check used to do.
-
-    Order-independent on protected_colors (case/whitespace-normalized) so
-    ["#FF0000", "#00ff00"] and ["#00FF00", "#ff0000"] fingerprint the same,
-    matching how the color-map step itself treats them."""
-    colors = sorted((c or "").strip().lower() for c in (protected_colors or []))
-    payload = json.dumps({
-        "quality": quality,
-        "compression_mode": compression_mode,
-        "max_width": max_width,
-        "protected_colors": colors,
-        "dithering": bool(dithering),
-        "keep_exif": bool(keep_exif),
-        "output_format": output_format,
-    }, sort_keys=True)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
-
-
 def _load_skip_fingerprints(output_dir: str) -> dict:
     """rel_path -> fingerprint of the settings that produced the current
     file at that path, for one output_dir. Missing/corrupt file -> {} (an
@@ -420,12 +422,15 @@ def _load_app_config() -> dict:
     except FileNotFoundError:
         return cfg
     except Exception as e:
-        print(f"[Warning] Ignoring unreadable config.json ({_config_file()}): {e}")
+        # Startup diagnostics always go to stderr: with --source --json the
+        # stdout contract is "exactly one JSON object" (see _run_cli), and the
+        # config load runs before that report is produced.
+        print(f"[Warning] Ignoring unreadable config.json ({_config_file()}): {e}", file=sys.stderr)
         return cfg
 
     for key, value in raw.items():
         if key not in cfg:
-            print(f"[Warning] Ignoring unknown config.json key: {key!r}")
+            print(f"[Warning] Ignoring unknown config.json key: {key!r}", file=sys.stderr)
             continue
         cfg[key] = value
 
@@ -442,7 +447,7 @@ def _load_app_config() -> dict:
         if not (1 <= cfg["port"] <= 65535):
             raise ValueError("port out of range 1-65535")
     except Exception:
-        print(f"[Warning] Invalid config.json 'port' ({cfg['port']!r}), using default {DEFAULT_CONFIG['port']}")
+        print(f"[Warning] Invalid config.json 'port' ({cfg['port']!r}), using default {DEFAULT_CONFIG['port']}", file=sys.stderr)
         cfg["port"] = DEFAULT_CONFIG["port"]
     try:
         cfg["concurrent_workers"] = int(cfg["concurrent_workers"])
@@ -451,7 +456,8 @@ def _load_app_config() -> dict:
     except Exception:
         print(
             f"[Warning] Invalid config.json 'concurrent_workers' ({cfg['concurrent_workers']!r}), "
-            f"using default {DEFAULT_CONFIG['concurrent_workers']}"
+            f"using default {DEFAULT_CONFIG['concurrent_workers']}",
+            file=sys.stderr,
         )
         cfg["concurrent_workers"] = DEFAULT_CONFIG["concurrent_workers"]
     try:
@@ -461,7 +467,8 @@ def _load_app_config() -> dict:
     except Exception:
         print(
             f"[Warning] Invalid config.json 'thumbnail_workers' ({cfg['thumbnail_workers']!r}), "
-            f"using default {DEFAULT_CONFIG['thumbnail_workers']}"
+            f"using default {DEFAULT_CONFIG['thumbnail_workers']}",
+            file=sys.stderr,
         )
         cfg["thumbnail_workers"] = DEFAULT_CONFIG["thumbnail_workers"]
     try:
@@ -521,7 +528,10 @@ async def lifespan(app: FastAPI):
     if tools:
         print(f"[Startup] Detected: {', '.join(tools)}")
     else:
-        print("[Startup] pngquant/oxipng/cjpeg not found — place binaries in the bin/ directory")
+        print(
+            "[Startup] pngquant/oxipng/cjpeg/avifenc not found — WebP output still works. "
+            f"Run with automatic download (default) or place binaries in {binaries.binary_dir()}"
+        )
     sweep_task = asyncio.create_task(_sweep_stale_sessions())
     yield
     sweep_task.cancel()
@@ -569,6 +579,46 @@ def _gen_thumbnail(src: Path, dst: Path, max_size: int = 200):
             img.save(dst, "JPEG", quality=70)
     except Exception as e:
         print(f"[Warning] Thumbnail failed for {src.name}: {e}")
+
+
+# Display label for Pillow's `mode` string on the Compare page. Deliberately
+# a friendly bits-per-pixel summary of the *decoded* representation, not the
+# exact on-disk encoding (e.g. a low-bit-depth palette PNG still decodes to
+# mode "P" here) — precise enough for "did this change color depth" at a
+# glance without parsing each container format's own bit-depth field.
+_MODE_LABELS = {
+    "1": "1-bit",
+    "L": "8-bit grayscale",
+    "LA": "16-bit grayscale+alpha",
+    "P": "8-bit indexed",
+    "PA": "16-bit indexed+alpha",
+    "RGB": "24-bit RGB",
+    "RGBA": "32-bit RGBA",
+    "CMYK": "32-bit CMYK",
+    "YCbCr": "24-bit YCbCr",
+    "I": "32-bit integer",
+    "I;16": "16-bit grayscale",
+    "F": "32-bit float",
+}
+
+
+def _get_image_info(path: Path) -> Optional[dict]:
+    """Width/height/bit-depth for the Compare page. Returns None (not a
+    dict with placeholder values) on any failure to open/decode — e.g. an
+    AVIF file if the installed Pillow build lacks AVIF support — so the
+    caller can render an explicit "unavailable" state instead of a blank or
+    misleading number. Same try/except-and-report shape as _gen_thumbnail
+    above, applied here for the same reason: a read failure must be visible,
+    not silently swallowed into a default.
+    """
+    try:
+        with Image.open(path) as img:
+            w, h = img.size
+            depth = _MODE_LABELS.get(img.mode, img.mode)
+            return {"width": w, "height": h, "depth": depth}
+    except Exception as e:
+        print(f"[Warning] Reading image info failed for {path.name}: {e}")
+        return None
 
 
 # Starlette's FileResponse falls back to Python's `mimetypes` module when
@@ -626,7 +676,10 @@ PREVIEW_I18N = {
         "toggle_suffix": " \u2014 click image to toggle (or press space)",
         "footer_overlay": "Click the image (or press space) to flip between original and compressed",
         "footer_side": "Original (left) vs Compressed (right)",
+        "footer_slider": "Drag the handle to compare, original on the left and compressed on the right",
         "zoom_hint": " (scroll to pan around at actual size)",
+        "info_unavailable": "info unavailable",
+        "slider": "Slider",
     },
     "zh": {
         "not_found": "未找到",
@@ -645,38 +698,12 @@ PREVIEW_I18N = {
         "toggle_suffix": "\u2014点击图片切换（或按空格键）",
         "footer_overlay": "点击图片（或按空格键）切换原图与压缩后效果",
         "footer_side": "原图（左）对比压缩后（右）",
+        "footer_slider": "拖动把手对比，左侧原图，右侧压缩后",
         "zoom_hint": "（可滚动查看实际尺寸下的细节）",
+        "info_unavailable": "信息不可用",
+        "slider": "滑动对比",
     },
 }
-
-
-def _is_valid_reusable_output(path: Path, expected_format: str) -> bool:
-    """Best-effort corruption check for a skip_existing reuse candidate.
-
-    A non-empty file isn't strong enough evidence that it's safe to reuse:
-    if pngquant/oxipng was killed mid-write on a previous run (crash, OOM
-    kill, power loss), it can leave behind a file that's non-empty but
-    truncated or structurally broken. Reusing that file would silently
-    hand the user a corrupt "optimized" image instead of recompressing it.
-
-    Uses Pillow's verify() (structural/header check, doesn't decode full
-    pixel data — cheap) and confirms the format actually matches what
-    this run expects, so e.g. a stray same-named file from a different
-    output_format never gets reused by mistake."""
-    try:
-        with Image.open(path) as img:
-            img.verify()
-            fmt = (img.format or "").upper()
-    except Exception:
-        return False
-    expected = {
-        "png": "PNG",
-        "webp": "WEBP",
-        "jpg": "JPEG",
-        "jpeg": "JPEG",
-        "avif": "AVIF",
-    }.get(expected_format, "PNG")
-    return fmt == expected
 
 
 async def _run_worker_pool(
@@ -785,6 +812,15 @@ async def _run_worker_pool(
                 if on_item_done is not None:
                     on_item_done(item)
                 queue.task_done()
+            # Yield to the event loop after every item, not just ones whose
+            # process_item happens to await something. process_one's
+            # skip_existing reuse branch is pure sync I/O (stat/exists/
+            # copy2, no await at all) — without this, one worker can drain
+            # an entire skip-heavy queue in a single uninterrupted
+            # synchronous burst, starving any concurrently connecting SSE/
+            # poll client of a chance to ever observe state.current move.
+            # See test_yields_after_every_item_even_when_process_item_never_awaits.
+            await asyncio.sleep(0)
 
     workers = [asyncio.create_task(worker()) for _ in range(max(1, n_workers))]
     await asyncio.gather(*workers)
@@ -924,6 +960,53 @@ async def _scan_and_thumbnail(state: AppState, directory: Path, recursive: bool)
     _push_recent("scan_dirs", str(directory.resolve()))
 
 
+async def _backfill_resume_thumbnails(state: "AppState", files: list):
+    """Generate thumbnails for files reconstructed on resume, concurrently
+    with the compression task the resume branch of start_optimization
+    already kicked off.
+
+    Deliberately NOT a call into _scan_and_thumbnail: that walks the whole
+    directory fresh and overwrites state.files/state.total at the end,
+    which would race with the compression task mutating state.total/
+    state.current/state.results at the same time — same class of bug as
+    the worker-pool/session-leak issues this project has already been bit
+    by. This only ever writes each file dict's own "thumbnail" key, on a
+    *fixed* list (the one resume already rebuilt) — it never touches
+    state.total or the list's membership/order, so there's nothing here
+    for the compression task (which writes "status"/state.results, not
+    "thumbnail") to race against.
+    """
+    ws = state.workspace
+    if ws is None or not files:
+        return
+
+    async def process_item(item):
+        idx, f = item
+        img_path = Path(f["path"])
+        if not img_path.exists():
+            return
+        thumb_rel = f"thumb/resume_{idx}_{img_path.stem}.jpg"
+        thumb_path = ws / thumb_rel
+        if not thumb_path.exists():
+            await asyncio.to_thread(_gen_thumbnail, img_path, thumb_path)
+        f["thumbnail"] = f"/api/thumb/{ws.name}/{thumb_rel}"
+
+    def on_item_error(item, e):
+        # Leave thumbnail as "" — same graceful degradation as a normal
+        # scan's on_item_error. Don't fail the whole backfill over one
+        # unreadable file; compression will report its own error for it
+        # independently if it's still pending.
+        pass
+
+    await _run_worker_pool(
+        list(enumerate(files)),
+        process_item,
+        n_workers=THUMBNAIL_WORKERS,
+        cancel_check=lambda: state.cancelled,
+        on_item_error=on_item_error,
+    )
+
+
 @app.post("/api/scan")
 async def scan_directory(data: ScanRequest, state: AppState = Depends(get_session), _auth: None = Depends(require_token)):
     if state.is_running:
@@ -1035,39 +1118,11 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
     if state.is_running:
         return JSONResponse({"error": "Optimization in progress, please wait"}, status_code=400)
 
-    if data.compression_mode not in ("standard", "lossless", "resize_only", "screenshot"):
-        return JSONResponse({"error": "Invalid compression_mode"}, status_code=400)
-    if data.compression_mode == "screenshot" and data.output_format != "png":
-        return JSONResponse(
-            {"error": "Screenshot mode is PNG-only (it's a tuned pngquant pass, not a general codec setting)"},
-            status_code=400,
-        )
-    if data.quality not in ("high", "medium", "low"):
-        # Previously an unknown quality silently fell back to "medium" deep
-        # inside the optimizer — reject it here like the other enum fields
-        # so a typo'd client request fails loudly instead.
-        return JSONResponse(
-            {"error": f"Invalid quality: {data.quality!r}. Supported: 'high', 'medium', 'low'."},
-            status_code=400,
-        )
-    if data.output_format not in ("png", "webp", "jpg", "avif"):
-        # The pipeline only ever produces real PNG, WebP, JPEG, or AVIF bytes —
-        # accepting anything else here would silently produce a file whose
-        # extension lies about its actual content.
-        return JSONResponse(
-            {"error": f"Unsupported output_format: {data.output_format!r}. Supported: 'png', 'webp', 'jpg', 'avif'."},
-            status_code=400,
-        )
-    if data.compression_mode == "resize_only" and data.max_width <= 0:
-        return JSONResponse(
-            {"error": "Resize Only mode requires Max Width to be set"}, status_code=400
-        )
-    bad_colors = [c for c in data.protected_colors if not HEX_COLOR_RE.match(c.strip())]
-    if bad_colors:
-        return JSONResponse(
-            {"error": f"Invalid color(s) in Protect Colors: {', '.join(bad_colors)}. Use hex format like #2ecc71."},
-            status_code=400,
-        )
+    err = _validate_optimize_settings(
+        data.quality, data.output_format, data.compression_mode, data.max_width, data.protected_colors,
+    )
+    if err:
+        return JSONResponse({"error": err}, status_code=400)
 
     if state.watch_running:
         return JSONResponse({"error": "Watch mode is running, stop it first"}, status_code=400)
@@ -1130,6 +1185,11 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
             )
         # Restore previous results for the UI (compare, progress display)
         previous_results = bs.get("results", [])
+        # input_dir was persisted at batch-creation time (see below) but
+        # never read back out here — state.input_dir stayed None through
+        # every resume, so /api/state kept reporting no source folder even
+        # though the batch clearly has one. Restore it alongside results.
+        state.input_dir = bs.get("input_dir", "")
         batch_state = bs
         # Create a workspace for this session (the old one is gone if the
         # server restarted — _process_files needs one for its output dir).
@@ -1168,6 +1228,12 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
         # Restore previous results from the batch so the UI shows the full
         # picture (earlier successes + new ones as they complete).
         state.results = list(previous_results)
+        # Thumbnails were never regenerated for the rebuilt file list (see
+        # the resume branch above) — backfill them concurrently with the
+        # compression task about to be kicked off below, rather than
+        # blocking this response on it or leaving the grid empty for the
+        # whole run.
+        asyncio.create_task(_backfill_resume_thumbnails(state, state.files))
     elif data.retry:
         # Retry re-runs only the previously-failed files. Keep every result
         # that isn't being retried (the earlier successes and their outputs
@@ -1251,17 +1317,49 @@ CONCURRENT_WORKERS = 4  # default; overridden by main() from config.json / --wor
 # THUMBNAIL_WORKERS is the independent scan-thumbnail concurrency knob —
 # splitting the two lets a scan that's I/O-bound on thumbnail generation not
 # starve (or be starved by) a concurrent compression run in another session,
-# and lets each be tuned to the machine. See OPTIMIZATION_PLAN.md §6.
+# and lets each be tuned to the machine.
 THUMBNAIL_WORKERS = 4  # default; overridden by main() from config.json / --thumbnail-workers
 
 # Fields a per-file override may set. Fixed list so the request shape can't
-# drift between frontend and backend (see OPTIMIZATION_PLAN.md §3). Unknown
-# fields in an override are rejected with 400 rather than silently ignored —
-# a typo'd "qualitiy" must fail loudly, not silently do nothing.
+# drift between frontend and backend. Unknown fields in an override are
+# rejected with 400 rather than silently ignored — a typo'd "qualitiy" must
+# fail loudly, not silently do nothing.
 OVERRIDEABLE_FIELDS = (
     "quality", "compression_mode", "max_width", "dithering",
     "protected_colors", "keep_exif", "output_format",
 )
+
+
+def _validate_optimize_settings(
+    quality: str, output_format: str, compression_mode: str, max_width: int,
+    protected_colors: list,
+) -> Optional[str]:
+    """The top-level (non-per-file-override) compression settings shared by
+    every entry point that can start a run: /api/optimize, /api/preview-optimize,
+    and watch mode start. Returns an error string on the first problem, or
+    None if everything is valid.
+
+    This used to be ~15 lines duplicated near-verbatim at each of those 3
+    call sites (each with its own copy of the same 5 checks) — one already
+    drifted to a slightly different wording for the same resize_only/
+    max_width rule. Consolidated here so a 4th entry point (CLI mode) gets
+    the same validation for free instead of a 4th slightly-different copy,
+    and so the next new check only needs to be added once.
+    """
+    if compression_mode not in ("standard", "lossless", "resize_only", "screenshot"):
+        return "Invalid compression_mode"
+    if compression_mode == "screenshot" and output_format != "png":
+        return "Screenshot mode is PNG-only (it's a tuned pngquant pass, not a general codec setting)"
+    if quality not in ("high", "medium", "low"):
+        return f"Invalid quality: {quality!r}. Supported: 'high', 'medium', 'low'."
+    if output_format not in ("png", "webp", "jpg", "avif"):
+        return f"Unsupported output_format: {output_format!r}. Supported: 'png', 'webp', 'jpg', 'avif'."
+    if compression_mode == "resize_only" and max_width <= 0:
+        return "Resize Only mode requires Max Width (max_width must be > 0)"
+    bad_colors = [c for c in protected_colors if not HEX_COLOR_RE.match(c.strip())]
+    if bad_colors:
+        return f"Invalid color(s) in Protect Colors: {', '.join(bad_colors)}. Use hex format like #2ecc71."
+    return None
 
 
 def _validate_overrides(
@@ -1311,6 +1409,61 @@ def _validate_overrides(
             if eff_mode == "screenshot" and eff_format != "png":
                 return f"Screenshot mode is PNG-only (override for file {fid!r})"
     return None
+
+
+def _resolve_collision_free_output_paths(
+    items: list[tuple[str, str, str]], output_dir: Path,
+    reserved_names: Optional[set[str]] = None,
+) -> dict[str, Optional[Path]]:
+    """Pre-assign an output path per item so name collisions are resolved
+    deterministically: "photo.png" and "photo.jpg" both map to "photo.png"
+    after the suffix swap and would silently overwrite each other if
+    processed concurrently (last one to finish wins, both reported as
+    successes). First occurrence keeps the plain name; later collisions get
+    a numbered stem ("photo_2.png"). Keys are case-folded because Windows/
+    macOS filesystems collide case-insensitively.
+
+    `items` is a list of (id, relative_name, effective_output_format)
+    tuples — deliberately a plain tuple, not the web batch handler's
+    file_info/overrides dict shape, so this same function is usable by any
+    caller (web batch, CLI) without adapting to that shape first.
+
+    `reserved_names` seeds used_names with output names a *previous* call
+    already claimed against this same output_dir (already-completed results
+    kept in state.results across a resume or retry — see _process_files).
+    Without this, each call starts with an empty used_names and only sees
+    the items in front of it, so a name that's already spoken for by a
+    result restored from before a server restart (resume) or a completed
+    result being kept around (retry) doesn't block a *new* item from being
+    assigned that same name. On resume specifically that produced two
+    state.results entries with the same output_name — one pointing at the
+    stale pre-restart file (via final_output_path), one at the freshly
+    written workspace file — and _resolve_result_file's workspace-first
+    check then silently served the new file's bytes for the old result's
+    compare/preview link. Expected pre-lowercased (matching the
+    case-folded strings used_names already stores) so this function can
+    stay a simple string-set union without extra casing logic.
+
+    A None value in the returned dict marks a name whose resolved path
+    escapes output_dir (should be impossible after the caller's own
+    sanitization — this is defense in depth, not the primary check) and
+    must be turned into a per-item failure by the caller.
+    """
+    base_resolved = str(output_dir.resolve())
+    out_paths: dict[str, Optional[Path]] = {}
+    used_names: set[str] = set(reserved_names or ())
+    for item_id, name, eff_fmt in items:
+        base = (output_dir / name).with_suffix(f".{eff_fmt}")
+        candidate = base
+        n = 2
+        while str(candidate).lower() in used_names:
+            candidate = base.with_name(f"{base.stem}_{n}{base.suffix}")
+            n += 1
+        used_names.add(str(candidate).lower())
+        resolved = str(candidate.resolve())
+        inside = resolved == base_resolved or resolved.startswith(base_resolved + os.sep)
+        out_paths[item_id] = candidate if inside else None
+    return out_paths
 
 
 async def _process_files(
@@ -1393,34 +1546,28 @@ async def _process_files(
         await _async_rmtree(opt_output_dir)
     opt_output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Pre-assign every file's output path so name collisions are resolved
-    # deterministically: "photo.png" and "photo.jpg" both map to
-    # "photo.png" after the suffix swap and would silently overwrite each
-    # other mid-batch (last worker to finish wins, both reported as
-    # successes). First occurrence keeps the plain name; later collisions
-    # get a numbered stem ("photo_2.png"). Keys are case-folded because
-    # Windows/macOS filesystems collide case-insensitively. A None entry
-    # marks a name whose resolved path escapes the output dir (should be
-    # impossible after upload-side sanitization — defense in depth) and is
-    # turned into a per-file failure inside process_one.
-    base_resolved = str(opt_output_dir.resolve())
-    out_paths: dict[str, Optional[Path]] = {}
-    used_names: set[str] = set()
-    for file_info in files:
-        # A per-file output_format override changes this file's suffix (and
-        # thus its output path / collision slot). Different suffixes don't
-        # collide ("photo.png" vs "photo.webp"), which is correct.
-        eff_fmt = overrides.get(file_info["id"], {}).get("output_format", output_format)
-        base = (opt_output_dir / file_info["name"]).with_suffix(f".{eff_fmt}")
-        candidate = base
-        n = 2
-        while str(candidate).lower() in used_names:
-            candidate = base.with_name(f"{base.stem}_{n}{base.suffix}")
-            n += 1
-        used_names.add(str(candidate).lower())
-        resolved = str(candidate.resolve())
-        inside = resolved == base_resolved or resolved.startswith(base_resolved + os.sep)
-        out_paths[file_info["id"]] = candidate if inside else None
+    # A per-file output_format override changes that file's suffix (and thus
+    # its collision slot) — see _resolve_collision_free_output_paths for the
+    # actual algorithm this now shares with CLI mode.
+    #
+    # Seed used_names with output_name values state.results already holds
+    # (previous_results on resume; the kept, non-retried results on retry)
+    # — otherwise a name already claimed by one of those doesn't block a
+    # *new* item in this call from being assigned it too, since each call
+    # to _resolve_collision_free_output_paths only sees the items passed to
+    # it. See that function's docstring for the resume scenario this fixes.
+    _reserved_output_names = {
+        str(opt_output_dir / r["output_name"]).lower()
+        for r in state.results if r.get("output_name")
+    }
+    out_paths = _resolve_collision_free_output_paths(
+        [
+            (f["id"], f["name"], overrides.get(f["id"], {}).get("output_format", output_format))
+            for f in files
+        ],
+        opt_output_dir,
+        reserved_names=_reserved_output_names,
+    )
 
     async def log(msg):
         state.logs.append(f"  {msg}")
@@ -1884,42 +2031,20 @@ async def preview_optimize(data: PreviewRequest, state: AppState = Depends(get_s
     the size, then deletes the temp. Must NOT mutate state.results /
     state.current / state.total / state.output_version / state.logs /
     state.is_running, and must NOT copy anything into a persistent
-    output_dir. See OPTIMIZATION_PLAN.md §2.
+    output_dir.
 
     Allowed while a batch is running — it only contends for the optimizer
     semaphore, never for batch state. The progress_callback is a no-op so
     preview progress doesn't leak into the batch's live log."""
     if optimizer is None:
         return JSONResponse({"error": "Optimizer not initialized"}, status_code=503)
-    # Same enum validation as /api/optimize, so a preview reflects what the
-    # real run would actually accept (a typo'd mode fails here, not silently).
-    if data.compression_mode not in ("standard", "lossless", "resize_only", "screenshot"):
-        return JSONResponse({"error": "Invalid compression_mode"}, status_code=400)
-    if data.compression_mode == "screenshot" and data.output_format != "png":
-        return JSONResponse(
-            {"error": "Screenshot mode is PNG-only (it's a tuned pngquant pass, not a general codec setting)"},
-            status_code=400,
-        )
-    if data.quality not in ("high", "medium", "low"):
-        return JSONResponse(
-            {"error": f"Invalid quality: {data.quality!r}. Supported: 'high', 'medium', 'low'."},
-            status_code=400,
-        )
-    if data.output_format not in ("png", "webp", "jpg", "avif"):
-        return JSONResponse(
-            {"error": f"Unsupported output_format: {data.output_format!r}. Supported: 'png', 'webp', 'jpg', 'avif'."},
-            status_code=400,
-        )
-    if data.compression_mode == "resize_only" and data.max_width <= 0:
-        return JSONResponse(
-            {"error": "Resize Only mode requires Max Width to be set"}, status_code=400
-        )
-    bad_colors = [c for c in data.protected_colors if not HEX_COLOR_RE.match(c.strip())]
-    if bad_colors:
-        return JSONResponse(
-            {"error": f"Invalid color(s) in Protect Colors: {', '.join(bad_colors)}. Use hex format like #2ecc71."},
-            status_code=400,
-        )
+    # Same validation as /api/optimize (now literally the same function), so
+    # a preview reflects what the real run would actually accept.
+    err = _validate_optimize_settings(
+        data.quality, data.output_format, data.compression_mode, data.max_width, data.protected_colors,
+    )
+    if err:
+        return JSONResponse({"error": err}, status_code=400)
 
     file_info = next((f for f in state.files if f.get("id") == data.file_id), None)
     if file_info is None:
@@ -1994,12 +2119,35 @@ async def get_source_file(ws_name: str, file_id: str, state: AppState = Depends(
     return Response(status_code=404)
 
 
-@app.get("/api/result/{ws_name}/{result_path:path}")
-async def get_result(ws_name: str, result_path: str, state: AppState = Depends(get_session)):
-    if state.workspace and state.workspace.name == ws_name:
+def _resolve_result_file(state: "AppState", result_path: str) -> Optional[Path]:
+    """Locate a completed result's output image on disk.
+
+    Prefers the live workspace copy. Falls back to the copy already placed
+    in the user's chosen output folder (result["final_output_path"], written
+    immediately as each file finishes — see _process_files) for results
+    that were restored on resume: state.workspace is a fresh temp dir every
+    process start (new_workspace), so a result completed before a server
+    restart never has a file at the workspace path even though it's a
+    legitimate result of this session.
+    """
+    if state.workspace:
         p = (state.workspace / "output" / result_path).resolve()
         base = str((state.workspace / "output").resolve())
         if p.exists() and (str(p) == base or str(p).startswith(base + os.sep)):
+            return p
+    for r in state.results:
+        if r.get("output_name") == result_path and r.get("final_output_path"):
+            fp = Path(r["final_output_path"])
+            if fp.exists():
+                return fp
+    return None
+
+
+@app.get("/api/result/{ws_name}/{result_path:path}")
+async def get_result(ws_name: str, result_path: str, state: AppState = Depends(get_session)):
+    if state.workspace and state.workspace.name == ws_name:
+        p = _resolve_result_file(state, result_path)
+        if p:
             return FileResponse(str(p), media_type=_media_type_for(p))
     return Response(status_code=404)
 
@@ -2038,6 +2186,7 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 .panel{flex:1;display:flex;flex-direction:column;overflow:hidden}
 .panel:first-child{border-right:1px solid #ddd}
 .label{padding:8px 16px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#888;background:#fafaf5}
+.label .info{display:block;text-transform:none;letter-spacing:normal;color:#aaa;margin-top:2px;font-size:11px}
 .image-wrap{flex:1;display:flex;align-items:center;justify-content:center;overflow:auto;padding:16px;background:#f0f0eb}
 .image-wrap img{max-width:100%;max-height:100%;object-fit:contain}
 .image-wrap.zoom-100{align-items:flex-start;justify-content:flex-start}
@@ -2045,11 +2194,23 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 .footer{padding:10px 20px;text-align:center;font-size:13px;border-top:1px solid #ddd;color:#999}
 .overlay-view{flex:1;display:flex;flex-direction:column}
 .overlay-label{padding:8px 16px;font-size:12px;text-align:center;color:#888;background:#fafaf5;user-select:none}
-.overlay-wrap{flex:1;display:flex;align-items:center;justify-content:center;overflow:auto;padding:16px;background:#f0f0eb;cursor:pointer}
-.overlay-img{width:100%;height:100%;object-fit:contain}
-.overlay-wrap.zoom-100{align-items:flex-start;justify-content:flex-start}
-.overlay-img.zoom-100{width:auto;height:auto;max-width:none;max-height:none}
+.overlay-wrap{flex:1;position:relative;overflow:auto;background:#f0f0eb;cursor:pointer}
+.overlay-img{position:absolute;top:16px;left:16px;width:calc(100% - 32px);height:calc(100% - 32px);object-fit:contain}
+.overlay-img.zoom-100{position:static;width:auto;height:auto;max-width:none;max-height:none;margin:16px}
 .zoom-toggle{display:flex;gap:4px}
+.slider-view{flex:1;display:flex;flex-direction:column}
+.slider-label{padding:8px 16px;font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#888;background:#fafaf5;user-select:none;display:flex;justify-content:space-between;gap:16px}
+.slider-label .side{min-width:0}
+.slider-label .side.right{text-align:right}
+.slider-label .info{display:block;text-transform:none;letter-spacing:normal;color:#aaa;margin-top:2px;font-size:11px}
+.slider-wrap{flex:1;position:relative;overflow:hidden;background:#f0f0eb;touch-action:none;--pos:50%}
+.slider-wrap.zoom-100{overflow:auto}
+.slider-img{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain;pointer-events:none;user-select:none}
+.slider-wrap.zoom-100 .slider-img{top:0;left:0;width:auto;height:auto;object-fit:none}
+.slider-top{clip-path:inset(0 calc(100% - var(--pos)) 0 0)}
+.slider-handle{position:absolute;top:0;bottom:0;left:var(--pos);width:32px;margin-left:-16px;cursor:ew-resize;display:flex;align-items:center;justify-content:center;touch-action:none}
+.slider-handle::before{content:"";position:absolute;top:0;bottom:0;left:50%;width:2px;background:#fff;box-shadow:0 0 0 1px rgba(0,0,0,.25);transform:translateX(-50%)}
+.slider-handle-grip{position:relative;width:28px;height:28px;border-radius:50%;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center;color:#666;font-size:13px}
 </style>
 </head><body>"""
     result = None
@@ -2073,6 +2234,24 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 
     comp_url = _html.escape(f"/api/result/{ws_name}/{comp_rel}", quote=True) if comp_rel else ""
 
+    # Same resolution _resolve_result_file uses for /api/result, applied
+    # here too — this is the size/dimensions label shown next to the image,
+    # and used to silently show "unavailable" for pre-restart results
+    # before /api/result grew a fallback for them, even though the image
+    # itself was reachable.
+    orig_path = Path(result["original_path"]) if result.get("original_path") else None
+    orig_info = _get_image_info(orig_path) if orig_path and orig_path.exists() else None
+    comp_path = _resolve_result_file(state, comp_rel) if comp_rel else None
+    comp_info = _get_image_info(comp_path) if comp_path else None
+
+    def _fmt_info(info: Optional[dict]) -> str:
+        if not info:
+            return T["info_unavailable"]
+        return f"{info['width']}\u00d7{info['height']} \u00b7 {info['depth']}"
+
+    orig_info_text = _html.escape(_fmt_info(orig_info))
+    comp_info_text = _html.escape(_fmt_info(comp_info))
+
     safe_name = _html.escape(str(result['name']))
     safe_basename = _html.escape(Path(result['name']).name)
     title_prefix = _html.escape(T["title_prefix"])
@@ -2084,16 +2263,23 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
     orig_size = _fmt_size(result['original_size'])
     comp_size = _fmt_size(result['compressed_size'])
     saved_text = _html.escape(T["saved"].format(pct=result.get('savings_percent', 0)))
-    # Static, hardcoded-in-Python strings only (never user/result data) —
-    # safe to embed directly as a JS object literal for the toggle script
-    # below, same trust boundary as the rest of this f-string page.
+    # Everything else here is a static, hardcoded-in-Python string (never
+    # user/result data) safe to embed directly as a JS object literal. The
+    # two info fields are the exception — orig_info_text/comp_info_text are
+    # derived from the actual files (width/height ints plus a label from the
+    # fixed _MODE_LABELS lookup) rather than hardcoded, but json.dumps
+    # escapes them like everything else here, so the trust boundary for
+    # this f-string page is unchanged.
     js_i18n = json.dumps({
         "original": T["original"],
         "compressed": T["compressed"],
         "toggle_suffix": T["toggle_suffix"],
         "footer_overlay": T["footer_overlay"],
         "footer_side": T["footer_side"],
+        "footer_slider": T["footer_slider"],
         "zoom_hint": T["zoom_hint"],
+        "orig_info": orig_info_text,
+        "comp_info": comp_info_text,
     })
     html += f"""
 <div class="bar">
@@ -2102,6 +2288,7 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
   <div class="view-toggle">
     <button class="view-btn" id="btn-side">{_html.escape(T['side_by_side'])}</button>
     <button class="view-btn active" id="btn-overlay">{_html.escape(T['overlay'])}</button>
+    <button class="view-btn" id="btn-slider">{_html.escape(T['slider'])}</button>
   </div>
   <div class="zoom-toggle">
     <button class="view-btn active" id="btn-fit" title="{_html.escape(T['fit_title'])}">{_html.escape(T['fit'])}</button>
@@ -2110,19 +2297,32 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
 </div>
 <div class="container" id="side-view" style="display:none">
   <div class="panel">
-    <div class="label">{_html.escape(T['original_label'].format(size=orig_size))}</div>
+    <div class="label">{_html.escape(T['original_label'].format(size=orig_size))}<span class="info">{orig_info_text}</span></div>
     <div class="image-wrap" id="orig-wrap"><img src="{orig_url}" id="orig-img" alt="original"/></div>
   </div>
   <div class="panel">
-    <div class="label">{_html.escape(T['compressed_label'].format(size=comp_size))}</div>
+    <div class="label">{_html.escape(T['compressed_label'].format(size=comp_size))}<span class="info">{comp_info_text}</span></div>
     <div class="image-wrap" id="comp-wrap"><img src="{comp_url}" id="comp-img" alt="compressed"/></div>
   </div>
 </div>
 <div class="overlay-view" id="overlay-view">
-  <div class="overlay-label" id="overlay-label">{_html.escape(T['compressed'] + T['toggle_suffix'])}</div>
+  <div class="overlay-label" id="overlay-label">{_html.escape(T['compressed'] + T['toggle_suffix'])} \u00b7 {comp_info_text}</div>
   <div class="overlay-wrap" id="overlay-wrap">
     <img src="{orig_url}" class="overlay-img" id="overlay-orig" alt="original" style="display:none"/>
     <img src="{comp_url}" class="overlay-img" id="overlay-comp" alt="compressed"/>
+  </div>
+</div>
+<div class="slider-view" id="slider-view" style="display:none">
+  <div class="slider-label">
+    <span class="side">{_html.escape(T['original_label'].format(size=orig_size))}<span class="info">{orig_info_text}</span></span>
+    <span class="side right">{_html.escape(T['compressed_label'].format(size=comp_size))}<span class="info">{comp_info_text}</span></span>
+  </div>
+  <div class="slider-wrap" id="slider-wrap">
+    <img src="{comp_url}" class="slider-img" id="slider-base" alt="compressed" draggable="false"/>
+    <img src="{orig_url}" class="slider-img slider-top" id="slider-top" alt="original" draggable="false"/>
+    <div class="slider-handle" id="slider-handle">
+      <div class="slider-handle-grip">\u2194</div>
+    </div>
   </div>
 </div>
 <div class="footer" id="footer-hint">{_html.escape(T['footer_overlay'])}</div>
@@ -2131,10 +2331,12 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
   var I18N = {js_i18n};
   var sideBtn = document.getElementById('btn-side');
   var overlayBtn = document.getElementById('btn-overlay');
+  var sliderBtn = document.getElementById('btn-slider');
   var fitBtn = document.getElementById('btn-fit');
   var zoomBtn = document.getElementById('btn-zoom100');
   var sideView = document.getElementById('side-view');
   var overlayView = document.getElementById('overlay-view');
+  var sliderView = document.getElementById('slider-view');
   var origWrap = document.getElementById('orig-wrap');
   var compWrap = document.getElementById('comp-wrap');
   var origImg = document.getElementById('orig-img');
@@ -2143,38 +2345,51 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
   var comp = document.getElementById('overlay-comp');
   var label = document.getElementById('overlay-label');
   var wrap = document.getElementById('overlay-wrap');
+  var sliderWrap = document.getElementById('slider-wrap');
+  var sliderHandle = document.getElementById('slider-handle');
+  var sliderTop = document.getElementById('slider-top');
   var footer = document.getElementById('footer-hint');
   var showingOriginal = false;
   var zoomedIn = false;
+  var currentMode = 'overlay';
 
-  function setMode(mode){{
-    var isOverlay = mode === 'overlay';
-    sideView.style.display = isOverlay ? 'none' : 'flex';
-    overlayView.style.display = isOverlay ? 'flex' : 'none';
-    sideBtn.classList.toggle('active', !isOverlay);
-    overlayBtn.classList.toggle('active', isOverlay);
+  function setMode(m){{
+    currentMode = m;
+    sideView.style.display = m === 'side' ? 'flex' : 'none';
+    overlayView.style.display = m === 'overlay' ? 'flex' : 'none';
+    sliderView.style.display = m === 'slider' ? 'flex' : 'none';
+    sideBtn.classList.toggle('active', m === 'side');
+    overlayBtn.classList.toggle('active', m === 'overlay');
+    sliderBtn.classList.toggle('active', m === 'slider');
     updateFooter();
   }}
   sideBtn.addEventListener('click', function(){{ setMode('side'); }});
   overlayBtn.addEventListener('click', function(){{ setMode('overlay'); }});
+  sliderBtn.addEventListener('click', function(){{ setMode('slider'); }});
 
   function setZoom(mode){{
     zoomedIn = mode === '100';
-    [origWrap, compWrap, wrap].forEach(function(w){{ w.classList.toggle('zoom-100', zoomedIn); }});
+    [origWrap, compWrap, wrap, sliderWrap].forEach(function(w){{ w.classList.toggle('zoom-100', zoomedIn); }});
     [origImg, compImg, orig, comp].forEach(function(img){{ img.classList.toggle('zoom-100', zoomedIn); }});
     fitBtn.classList.toggle('active', !zoomedIn);
     zoomBtn.classList.toggle('active', zoomedIn);
     updateFooter();
+    // Fit and 100% modes render the image differently within slider-wrap
+    // (see sliderRange below), so the handle's usable range changes too -
+    // re-clamp immediately rather than waiting for the next drag/keypress,
+    // or a stale --pos from the other mode can sit past the new edge
+    // until the user touches the slider again.
+    setSliderPos(sliderPos);
   }}
   fitBtn.addEventListener('click', function(){{ setZoom('fit'); }});
   zoomBtn.addEventListener('click', function(){{ setZoom('100'); }});
 
   function updateFooter(){{
-    var isOverlay = overlayView.style.display !== 'none';
     var zoomHint = zoomedIn ? I18N.zoom_hint : '';
-    footer.textContent = isOverlay
-      ? I18N.footer_overlay + zoomHint
-      : I18N.footer_side + zoomHint;
+    var text = I18N.footer_overlay;
+    if (currentMode === 'side') text = I18N.footer_side;
+    else if (currentMode === 'slider') text = I18N.footer_slider;
+    footer.textContent = text + zoomHint;
   }}
 
   function toggleImage(){{
@@ -2182,15 +2397,95 @@ body{background:#f5f5f0;color:#333;font-family:system-ui,sans-serif;display:flex
     showingOriginal = !showingOriginal;
     orig.style.display = showingOriginal ? 'block' : 'none';
     comp.style.display = showingOriginal ? 'none' : 'block';
-    label.textContent = (showingOriginal ? I18N.original : I18N.compressed) + I18N.toggle_suffix;
+    label.textContent = (showingOriginal ? I18N.original : I18N.compressed) + I18N.toggle_suffix
+      + ' \u00b7 ' + (showingOriginal ? I18N.orig_info : I18N.comp_info);
   }}
   wrap.addEventListener('click', toggleImage);
   document.addEventListener('keydown', function(e){{
-    if (overlayView.style.display !== 'none' && e.code === 'Space') {{
+    if (currentMode === 'overlay' && e.code === 'Space') {{
       e.preventDefault();
       toggleImage();
     }}
   }});
+
+  // Slider (drag-to-compare) view: slider-top (original) is clipped to its
+  // left `--pos` percent via CSS clip-path, revealing slider-base
+  // (compressed) underneath on the right. .slider-img spans the wrap at
+  // top:0;left:0;width:100%;height:100% with no inset - the handle's
+  // `left: var(--pos)` is a percent of the wrap's own width, and clip-path
+  // percentages are relative to the clipped element's own box, so both
+  // only land on the same on-screen position when that box IS the wrap
+  // (0 inset). Giving .slider-img any padding/inset here reintroduces a
+  // mismatch between where the handle line sits and where the image
+  // actually splits (off by a few px away from the exact center).
+  // Pointer Events unify mouse/touch/pen so one listener set drives every
+  // input type; dragging is bound to the whole wrap (not just the handle)
+  // for an easy-to-grab target, matching how these compare sliders usually
+  // work elsewhere. Known limitation: if Max Width resize changed the
+  // compressed image's pixel dimensions, 100%-zoom alignment can be
+  // slightly off at the edges since each layer then sizes to its own
+  // natural dimensions (the other two views make the same simplification
+  // in that mode) - Fit mode is unaffected since both layers always share
+  // one calculated box there.
+  var sliderPos = 50;
+  function clampPct(n){{ return Math.min(100, Math.max(0, n)); }}
+  function sliderRange(){{
+    // .slider-img always fills slider-wrap's own box (100%/100% in Fit
+    // mode, or the natural-size box in 100% mode - see the comment above
+    // on why --pos and clip-path stay percentages of the wrap itself).
+    // But object-fit only controls how pixels are drawn *inside* that
+    // box: a source image whose aspect ratio doesn't match the wrap's
+    // still leaves letterboxed empty margin the handle could otherwise
+    // reach into. Compute where the image is actually visible and clamp
+    // to that instead of the full 0-100 wrap range.
+    var rect = sliderWrap.getBoundingClientRect();
+    var nw = sliderTop.naturalWidth, nh = sliderTop.naturalHeight;
+    if (!rect.width || !rect.height || !nw || !nh) return {{min: 0, max: 100}};
+    var renderedWidth, offsetX;
+    if (sliderWrap.classList.contains('zoom-100')) {{
+      // object-fit:none, top:0;left:0 - drawn at natural size, anchored
+      // to the top-left corner (not centered); the wrap scrolls instead
+      // of centering when the image is larger than it.
+      renderedWidth = Math.min(nw, rect.width);
+      offsetX = 0;
+    }} else {{
+      // object-fit:contain - scaled to fit and centered on both axes.
+      var scale = Math.min(rect.width / nw, rect.height / nh);
+      renderedWidth = nw * scale;
+      offsetX = (rect.width - renderedWidth) / 2;
+    }}
+    return {{
+      min: clampPct(offsetX / rect.width * 100),
+      max: clampPct((offsetX + renderedWidth) / rect.width * 100)
+    }};
+  }}
+  function setSliderPos(pct){{
+    var range = sliderRange();
+    sliderPos = Math.min(range.max, Math.max(range.min, pct));
+    sliderWrap.style.setProperty('--pos', sliderPos + '%');
+  }}
+  function pctFromClientX(clientX){{
+    var rect = sliderWrap.getBoundingClientRect();
+    if (rect.width === 0) return sliderPos;
+    return (clientX - rect.left) / rect.width * 100;
+  }}
+  var dragging = false;
+  sliderWrap.addEventListener('pointerdown', function(e){{
+    dragging = true;
+    sliderWrap.setPointerCapture(e.pointerId);
+    setSliderPos(pctFromClientX(e.clientX));
+    e.preventDefault();
+  }});
+  sliderWrap.addEventListener('pointermove', function(e){{
+    if (!dragging) return;
+    setSliderPos(pctFromClientX(e.clientX));
+  }});
+  function endSliderDrag(e){{
+    dragging = false;
+    try {{ sliderWrap.releasePointerCapture(e.pointerId); }} catch (err) {{}}
+  }}
+  sliderWrap.addEventListener('pointerup', endSliderDrag);
+  sliderWrap.addEventListener('pointercancel', endSliderDrag);
 }})();
 </script>
 </body></html>"""
@@ -2468,6 +2763,15 @@ async def get_state(state: AppState = Depends(get_session)):
         "is_running": state.is_running,
         "current": state.current,
         "total": state.total,
+        "paused": state.paused,
+        # Explicit, so the frontend doesn't have to derive it by parsing
+        # files[0].thumbnail — that string starts "" for files rebuilt on
+        # resume and only fills in once _backfill_resume_thumbnails'
+        # background task gets to each one, which silently broke
+        # compare/preview URLs for the whole session (not just the still-
+        # blank files) until this field existed. See STATE.wsName in
+        # index.html.
+        "ws_name": state.workspace.name if state.workspace else "",
     })
 
 
@@ -2838,29 +3142,11 @@ async def watch_start(
                 ),
             }, status_code=400)
 
-    if data.compression_mode not in ("standard", "lossless", "resize_only", "screenshot"):
-        return JSONResponse({"error": "Invalid compression_mode"}, status_code=400)
-    if data.compression_mode == "screenshot" and data.output_format != "png":
-        return JSONResponse(
-            {"error": "Screenshot mode is PNG-only (it's a tuned pngquant pass, not a general codec setting)"},
-            status_code=400,
-        )
-    if data.quality not in ("high", "medium", "low"):
-        return JSONResponse({"error": f"Invalid quality: {data.quality!r}"}, status_code=400)
-    if data.compression_mode == "resize_only" and data.max_width <= 0:
-        # Same rule as /api/optimize and per-file overrides (see
-        # _validate_overrides) — Resize Only has nothing to do without a
-        # width, and every other entry point already rejects this
-        # combination. Watch mode lacked this check, so starting a watch
-        # with mode=resize_only and a forgotten/zero max_width would run
-        # indefinitely: every detected file gets "processed" with no
-        # resize applied at all — for AVIF this used to mean a pointless
-        # lossy re-encode for zero size benefit (fixed alongside this),
-        # and for every format it's just wasted CPU with no resize.
-        return JSONResponse(
-            {"error": "Resize Only mode requires Max Width (max_width must be > 0)"},
-            status_code=400,
-        )
+    err = _validate_optimize_settings(
+        data.quality, data.output_format, data.compression_mode, data.max_width, data.protected_colors,
+    )
+    if err:
+        return JSONResponse({"error": err}, status_code=400)
 
     warning = None
     if (data.output_format, data.compression_mode) not in optimizer.available_modes():
@@ -2885,16 +3171,12 @@ async def watch_start(
     })
 
 
-@app.post("/api/watch/stop")
-async def watch_stop(
-    state: AppState = Depends(get_session),
-    _auth: None = Depends(require_token),
-):
-    """Stop watch mode. Cooperative: the watcher finishes its current
-    poll sleep, then exits. Already-queued file events are lost (watch
-    is meant to be persistent, not transactional)."""
-    if not state.watch_running:
-        return JSONResponse({"error": "Watch mode is not running"}, status_code=400)
+async def _stop_watch(state: "AppState") -> None:
+    """Cancel Watch Mode for one session and clear its fields. Shared by
+    the explicit /api/watch/stop endpoint and the stale-session sweep
+    (_sweep_stale_sessions_once) so there is exactly one place that knows
+    how to tear a watch task down. Safe to call when watch isn't running —
+    every step below is a no-op in that case."""
     if state.watch_watcher:
         state.watch_watcher.stop()
     if state.watch_task:
@@ -2906,6 +3188,19 @@ async def watch_stop(
     state.watch_running = False
     state.watch_watcher = None
     state.watch_task = None
+
+
+@app.post("/api/watch/stop")
+async def watch_stop(
+    state: AppState = Depends(get_session),
+    _auth: None = Depends(require_token),
+):
+    """Stop watch mode. Cooperative: the watcher finishes its current
+    poll sleep, then exits. Already-queued file events are lost (watch
+    is meant to be persistent, not transactional)."""
+    if not state.watch_running:
+        return JSONResponse({"error": "Watch mode is not running"}, status_code=400)
+    await _stop_watch(state)
     return JSONResponse({"ok": True})
 
 
@@ -2974,12 +3269,452 @@ async def watch_events(request: Request, state: AppState = Depends(get_session))
     )
 
 
+def _matches_globs(rel_path: str, patterns: List[str]) -> bool:
+    """True if rel_path (POSIX-style, relative to --source) matches any glob.
+
+    A pattern without "/" is matched against the file name only, so it
+    applies at any depth ("*.bak" hits sub/dir/a.bak). A pattern containing
+    "/" is matched against the whole relative path ("drafts/*" or
+    "icons/*.png"). Matching is case-insensitive on every platform, and "*"
+    crosses "/" (plain fnmatch semantics), so "drafts/*" also covers
+    "drafts/old/a.png". Backslashes in a pattern are read as "/" so a
+    Windows-style "sub\\*.png" works too. Empty patterns are ignored."""
+    rel = rel_path.lower()
+    name = rel.rsplit("/", 1)[-1]
+    for raw in patterns:
+        pat = raw.strip().replace("\\", "/").lower()
+        if not pat:
+            continue
+        if fnmatch.fnmatchcase(rel if "/" in pat else name, pat):
+            return True
+    return False
+
+
+_CLI_SUCCESS_STATUSES = ("compressed", "cached", "kept_original")
+
+
+def _build_cli_report(files: list) -> dict:
+    """Machine-readable result of a CLI run (--json). `files` holds one record
+    per scanned file; statuses are mutually exclusive: compressed, cached,
+    kept_original (growth-guard fallback), excluded, failed. Size totals and
+    saved_percent cover the successful statuses only. `total` counts every
+    scanned file, excluded ones included."""
+    counts = {"compressed": 0, "cached": 0, "excluded": 0, "failed": 0, "kept_original": 0}
+    orig = comp = 0
+    for f in files:
+        counts[f["status"]] += 1
+        if f["status"] in _CLI_SUCCESS_STATUSES:
+            orig += f["original_size"]
+            comp += f["compressed_size"]
+    return {
+        "files": files,
+        "summary": {
+            "total": len(files),
+            "compressed": counts["compressed"],
+            "cached": counts["cached"],
+            "excluded": counts["excluded"],
+            "failed": counts["failed"],
+            "kept_original": counts["kept_original"],
+            "original_size": orig,
+            "compressed_size": comp,
+            "saved_percent": round((1 - comp / orig) * 100, 1) if orig > 0 else 0,
+        },
+    }
+
+
+async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> int:
+    """Headless batch run: no web server, no browser. Scans --source, runs
+    every image through the exact same optimizer.optimize_png pipeline the
+    web UI and Watch Mode use (so a CLI run behaves identically to a batch
+    run started from the browser with the same settings — no separate
+    "CLI version" of the compression logic to drift out of sync), and exits
+    with a process exit code (0 if everything succeeded, 1 if anything
+    failed) so this composes into scripts/CI.
+
+    Deliberately does not implement --skip-existing: that feature depends
+    on the per-output-dir settings-fingerprint file the web/watch paths
+    already maintain (see skip_existing in _process_files). Instead,
+    --cache-dir enables a content-hash cache that does not depend on the
+    output directory at all (see image_optimizer/cache.py); without it,
+    every CLI run recompresses everything in --source.
+
+    With --json the final report is one JSON object on stdout and every
+    human-readable line (progress, summary, warnings) goes to stderr, so
+    stdout can be piped straight into a parser. Argument/setup errors
+    (exit 1 before any file is looked at) print only to stderr.
+    """
+    as_json = bool(getattr(args, "json", False))
+    log_stream = sys.stderr if as_json else sys.stdout
+
+    def log(*parts) -> None:
+        print(*parts, file=log_stream)
+
+    def emit_report(files: list) -> None:
+        if as_json:
+            # ensure_ascii (the default) keeps stdout valid on any console
+            # encoding even when file names are not ASCII.
+            print(json.dumps(_build_cli_report(files), indent=2))
+            sys.stdout.flush()
+
+    source = Path(args.source).resolve()
+    if not source.exists() or not source.is_dir():
+        print(f"[Error] --source is not a directory: {source}", file=sys.stderr)
+        return 1
+    if not args.output:
+        print("[Error] --output is required when using --source", file=sys.stderr)
+        return 1
+    output_dir = Path(args.output).resolve()
+    cache_dir_arg = getattr(args, "cache_dir", None)
+    cache_max_mb = getattr(args, "cache_max_size_mb", DEFAULT_CACHE_MAX_MB)
+    if cache_dir_arg and cache_max_mb < 0:
+        print("[Error] --cache-max-size-mb must be >= 0 (0 = unlimited)", file=sys.stderr)
+        return 1
+    if cache_dir_arg is None and cache_max_mb != DEFAULT_CACHE_MAX_MB:
+        # Same default as the argparse flag, so passing the flag on its own is
+        # detectable without a sentinel; an explicit value equal to the
+        # default stays silent, which is the only ambiguous case.
+        print("[Hint] --cache-max-size-mb has no effect without --cache-dir", file=sys.stderr)
+
+    protected_colors = (
+        [c.strip() for c in args.protect_colors.split(",") if c.strip()]
+        if args.protect_colors else []
+    )
+    err = _validate_optimize_settings(
+        args.quality, args.format, args.mode, args.max_width, protected_colors,
+    )
+    if err:
+        print(f"[Error] {err}", file=sys.stderr)
+        return 1
+
+    scanned = _scan_images(source, recursive=args.recursive)
+    if not scanned:
+        log(f"[CLI] No supported images found in {source}")
+        emit_report([])
+        return 0
+
+    # --include is a whitelist; --exclude is applied after it and always
+    # wins when both match. Excluded files are neither compressed nor
+    # counted as failures.
+    include = getattr(args, "include", None) or []
+    exclude = getattr(args, "exclude", None) or []
+    images = []
+    # One record per scanned file, filled in as results arrive; reported in
+    # scan order.
+    records: dict = {}
+    for p in scanned:
+        rel_posix = p.relative_to(source).as_posix()
+        if (include and not _matches_globs(rel_posix, include)) or _matches_globs(rel_posix, exclude):
+            try:
+                excluded_size = p.stat().st_size
+            except OSError:
+                excluded_size = None
+            records[p] = {
+                "rel": rel_posix, "output_name": None, "original_size": excluded_size,
+                "compressed_size": None, "status": "excluded", "error": None,
+            }
+            continue
+        images.append(p)
+    n_excluded = len(scanned) - len(images)
+    if not images:
+        log(f"[CLI] No images left after --include/--exclude filtering ({n_excluded} excluded)")
+        emit_report([records[p] for p in scanned])
+        return 0
+
+    cache: Optional[ContentCache] = None
+    if cache_dir_arg:
+        cache_dir = Path(cache_dir_arg).resolve()
+
+        # normcase: Windows paths are case-insensitive filesystem-wise but
+        # Path comparison is not before Python 3.12, so "C:\Src" and
+        # "C:\src" would otherwise slip through the containment checks and
+        # the scan would pick the cache up as input on the next run.
+        cache_dir_nc = os.path.normcase(str(cache_dir))
+        cache_parents_nc = {os.path.normcase(str(p)) for p in cache_dir.parents}
+
+        def _cache_dir_inside(root: Path) -> bool:
+            root_nc = os.path.normcase(str(root))
+            return cache_dir_nc == root_nc or root_nc in cache_parents_nc
+
+        if _cache_dir_inside(source):
+            # The scan would pick the cached images up as new sources.
+            print("[Error] --cache-dir must not be inside --source", file=sys.stderr)
+            return 1
+        if _cache_dir_inside(output_dir):
+            # Less fatal than --source, but the key-named cache entries would
+            # land in the deliverable output directory and vanish when LRU
+            # evicts them.
+            print("[Error] --cache-dir must not be inside --output", file=sys.stderr)
+            return 1
+        if args.format not in CACHEABLE_FORMATS:
+            # Defensive: argparse's --format choices currently equal
+            # CACHEABLE_FORMATS, so this is unreachable today; it keeps a
+            # widened choices list from silently caching an unverified format.
+            log(f"[Warning] --cache-dir ignored: {args.format} output is not cacheable")
+        else:
+            try:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                print(f"[Error] cannot create --cache-dir {cache_dir}: {e}", file=sys.stderr)
+                return 1
+            if args.format == "avif" and not pil_features.check("avif"):
+                # is_valid_reusable_output() validates an AVIF entry by opening
+                # it with Pillow; without AVIF read support every entry fails
+                # that check, so the cache silently never hits for this format
+                # (fail-closed, but worth telling the operator instead of just
+                # burning space). Newer entries are still stored and evicted.
+                print(
+                    "[Warning] --cache-dir will never hit for AVIF: this Pillow build "
+                    "cannot read AVIF (needs Pillow >= 11.3 with libavif, e.g. the "
+                    "official wheels)",
+                    file=sys.stderr,
+                )
+
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        # Setup error: nothing has been processed yet, so exit 1 with a
+        # message on stderr and no report (same contract as the argument
+        # checks above).
+        print(f"[Error] cannot create --output directory {output_dir}: {e}", file=sys.stderr)
+        return 1
+    items = [(str(i), str(p.relative_to(source)), args.format) for i, p in enumerate(images)]
+    out_paths = _resolve_collision_free_output_paths(items, output_dir)
+
+    global optimizer
+    optimizer = optimizer_instance or Optimizer(max_concurrency=CONCURRENT_WORKERS)
+    if not optimizer.pngquant_path and not optimizer.oxipng_path and args.format == "png":
+        log(
+            "[Warning] Neither pngquant nor oxipng found in bin/ — PNG results will be much "
+            "weaker than normal (falls back toward Pillow-only handling). Compression will "
+            "still run and nothing will be corrupted, but expect far smaller size savings."
+        )
+
+    if cache_dir_arg and args.format in CACHEABLE_FORMATS:
+        # Hashing the encoder binaries reads a few MB; do it once per run.
+        enc_fp = await asyncio.to_thread(encoder_fingerprint, optimizer, args.format)
+        cache = ContentCache(
+            Path(cache_dir_arg).resolve(), args.format,
+            _settings_fingerprint(
+                args.quality, args.mode, args.max_width, protected_colors,
+                args.dithering, args.keep_exif, args.format,
+            ),
+            enc_fp,
+        )
+
+    total = len(images)
+    counters = {"done": 0, "ok": 0, "failed": 0, "orig": 0, "comp": 0, "cached": 0}
+    # Entry paths stored during this run; handed to evict(protect=...) so a
+    # run never deletes the results it just wrote (see cache.ContentCache.evict).
+    protected_entries: set = set()
+    lock = asyncio.Lock()
+    # No manual semaphore here — Optimizer already bounds concurrent work
+    # internally via its own max_concurrency, so every image is dispatched
+    # via asyncio.gather() and the Optimizer instance does the throttling.
+
+    def fail_record(img_path: Path, error: str, output_name=None, original_size=None) -> dict:
+        """One per-file failure record; every failure path builds it here so
+        the report fields cannot drift between them."""
+        return {
+            "rel": img_path.relative_to(source).as_posix(),
+            "output_name": output_name,
+            "original_size": original_size,
+            "compressed_size": None,
+            "status": "failed",
+            "error": error,
+        }
+
+    async def process(idx: int, img_path: Path):
+        item_id = str(idx)
+        rel = str(img_path.relative_to(source))
+        out_path = out_paths[item_id]
+        if out_path is None:
+            async with lock:
+                counters["done"] += 1
+                counters["failed"] += 1
+                d = counters["done"]
+                records[img_path] = fail_record(
+                    img_path, "resolved output path escapes --output directory"
+                )
+            log(f"[{d}/{total}] FAIL {rel}: resolved output path escapes --output directory")
+            return
+        try:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            # Output I/O failure mid-run must look like any other failure: a
+            # per-file record and a clean exit 1, never an unhandled crash
+            # that would abort asyncio.gather() and (with --json) skip the
+            # report entirely.
+            error = f"cannot create output directory {out_path.parent}: {e}"
+            async with lock:
+                counters["done"] += 1
+                counters["failed"] += 1
+                d = counters["done"]
+                records[img_path] = fail_record(img_path, error)
+            log(f"[{d}/{total}] FAIL {rel}: {error}")
+            return
+        cache_key = None
+        cached_hit = False
+        result = None
+        if cache is not None:
+            try:
+                probe = await asyncio.to_thread(cache.probe, img_path, out_path)
+            except OSError:
+                # Unreadable input or cache I/O trouble: fall through to the
+                # normal pipeline, which reports a real input error itself.
+                probe = None
+            if probe is not None:
+                cache_key = probe.key
+                if probe.hit_size is not None:
+                    cached_hit = True
+                    result = {
+                        "success": True, "original_size": probe.original_size,
+                        "compressed_size": probe.hit_size, "error": None,
+                    }
+        if result is None:
+            result = await optimizer.optimize_png(
+                img_path, out_path,
+                quality=args.quality, max_width=args.max_width, compression_mode=args.mode,
+                protected_colors=protected_colors, dithering=args.dithering,
+                output_format=args.format, keep_exif=args.keep_exif,
+            )
+            if cache is not None and cache_key is not None and result["success"]:
+                try:
+                    protected_entries.add(
+                        await asyncio.to_thread(cache.store, cache_key, out_path)
+                    )
+                except OSError as e:
+                    print(f"[Warning] cache write failed for {rel}: {e}", file=sys.stderr)
+        async with lock:
+            counters["done"] += 1
+            d = counters["done"]
+            if result["success"]:
+                counters["ok"] += 1
+                if cached_hit:
+                    counters["cached"] += 1
+                counters["orig"] += result["original_size"]
+                counters["comp"] += result["compressed_size"]
+                pct = (
+                    round((1 - result["compressed_size"] / result["original_size"]) * 100, 1)
+                    if result["original_size"] > 0 else 0
+                )
+                records[img_path] = {
+                    "rel": img_path.relative_to(source).as_posix(), "output_name": out_path.name,
+                    "original_size": result["original_size"],
+                    "compressed_size": result["compressed_size"],
+                    "status": (
+                        "kept_original" if result.get("kept_original")
+                        else "cached" if cached_hit else "compressed"
+                    ),
+                    "error": None,
+                }
+                log(
+                    f"[{d}/{total}] {'HIT ' if cached_hit else 'OK  '} {rel} -> {out_path.name}  "
+                    f"{_fmt_size(result['original_size'])} -> {_fmt_size(result['compressed_size'])} "
+                    f"({pct}% saved)"
+                )
+            else:
+                counters["failed"] += 1
+                records[img_path] = fail_record(
+                    img_path,
+                    result.get("error") or "unknown error",
+                    output_name=out_path.name,
+                    original_size=result.get("original_size"),
+                )
+                log(f"[{d}/{total}] FAIL {rel}: {result.get('error') or 'unknown error'}")
+
+    await asyncio.gather(*(process(i, p) for i, p in enumerate(images)))
+
+    if cache is not None:
+        try:
+            # Crash leftovers are swept on every run, regardless of the size
+            # cap: with --cache-max-size-mb 0 evict() would never run, and
+            # stale .tmp-* files would accumulate forever.
+            await asyncio.to_thread(cache.sweep_stale_tmp)
+        except OSError as e:
+            print(f"[Warning] cache tmp sweep failed: {e}", file=sys.stderr)
+
+    if cache is not None and cache_max_mb > 0:
+        cache_cap_bytes = cache_max_mb * 1024 * 1024
+        try:
+            evict_stats: dict = {}
+            evicted = await asyncio.to_thread(
+                cache.evict,
+                cache_cap_bytes,
+                protected_entries,
+                evict_stats,
+            )
+        except OSError as e:
+            evicted = 0
+            print(f"[Warning] cache eviction failed: {e}", file=sys.stderr)
+        else:
+            if evict_stats.get("total_after", 0) > cache_cap_bytes:
+                # Only reachable when the cache cannot get under the cap by
+                # evicting unprotected entries: a single entry larger than
+                # the cap, or everything left is this run's fresh writes.
+                print(
+                    "[Warning] cache is still over --cache-max-size-mb after eviction "
+                    "(entries written this run are protected until the next run, and "
+                    "a single entry larger than the cap can never stay under it)",
+                    file=sys.stderr,
+                )
+    else:
+        evicted = 0
+
+    log()
+    log(f"Done: {counters['ok']} succeeded, {counters['failed']} failed, {total} total")
+    if n_excluded:
+        log(f"Excluded: {n_excluded} file(s) by --include/--exclude")
+    if cache is not None:
+        log(
+            f"Cache: {counters['cached']} hit, {counters['ok'] - counters['cached']} compressed"
+            + (f", {evicted} evicted" if evicted else "")
+        )
+    if counters["orig"] > 0:
+        saved_pct = round((1 - counters["comp"] / counters["orig"]) * 100, 1)
+        log(f"Total: {_fmt_size(counters['orig'])} -> {_fmt_size(counters['comp'])} ({saved_pct}% saved)")
+    emit_report([records[p] for p in scanned])
+    return 1 if counters["failed"] > 0 else 0
+
+
+def _download_enabled() -> bool:
+    """Default for --download, with an env opt-out for offline deployments.
+
+    A container image or an air-gapped machine must be able to start without
+    any outbound request, and setting one variable is friendlier than every
+    wrapper script having to remember --no-download.
+    """
+    raw = os.environ.get("IMAGE_OPTIMIZER_NO_DOWNLOAD", "").strip().lower()
+    return raw not in {"1", "true", "yes", "on"}
+
+
+def _strip_serve_subcommand(argv: list[str]) -> list[str]:
+    """Accept `image-optimizer serve ...` as an alias for `image-optimizer ...`.
+
+    A `serve` subcommand is what users of comparable web apps (open-webui,
+    jupyter) expect, and supporting it costs nothing here: the flags are flat,
+    so dropping the literal word is enough and every historical invocation
+    (`image-optimizer --source ...`) parses exactly as before. Only argv[1] is
+    considered, so a --dir path that happens to be named `serve` is never
+    eaten.
+    """
+    if len(argv) > 1 and argv[1] == "serve":
+        return [argv[0], *argv[2:]]
+    return argv
+
+
 def main():
     import argparse
 
+    sys.argv[:] = _strip_serve_subcommand(sys.argv)
+
+    global CONCURRENT_WORKERS, THUMBNAIL_WORKERS, WORKSPACE_CLEANUP_DELAY, SESSION_IDLE_TIMEOUT
     config = _load_app_config()
 
-    parser = argparse.ArgumentParser(description="Image Optimizer Web UI")
+    parser = argparse.ArgumentParser(
+        prog="image-optimizer",
+        description="Image Optimizer Web UI",
+        epilog="`image-optimizer serve` is accepted as a synonym for the bare command.",
+    )
     parser.add_argument(
         "--host", default=config["host"],
         help=f"Listen address (default {config['host']!r} / localhost-only, or set 'host' in "
@@ -3019,22 +3754,126 @@ def main():
              f"Independent from --workers so a scan's I/O-bound thumbnailing can be tuned "
              f"separately from CPU-bound compression.",
     )
-    parser.add_argument("--dir", help="Directory to auto-scan on startup")
+    parser.add_argument("--dir", help="Directory to auto-scan on startup (opens the web UI with results pre-loaded)")
     # Defaults to True to match the historical CLI behavior — the UI checkbox
     # defaults to False, but `--dir` has always scanned recursively since the
     # feature shipped. --no-recursive lets an operator override that (e.g. a
     # folder with thousands of files nested under deep subfolder trees where
     # only the top-level files are wanted) without breaking existing
-    # invocations that never passed this flag at all.
+    # invocations that never passed this flag at all. Also used by --source
+    # (CLI mode) below — same meaning, one flag either way.
     parser.add_argument(
         "--recursive", action=argparse.BooleanOptionalAction, default=True,
-        help="When used with --dir, scan subfolders too (default True, the "
-             "historical behavior; pass --no-recursive to scan only the top "
-             "level).",
+        help="When used with --dir or --source, scan subfolders too (default True, the "
+             "historical behavior; pass --no-recursive to scan only the top level).",
+    )
+
+    # --- CLI mode: presence of --source means "run headlessly and exit",
+    # skipping the web server entirely. Everything below is only read when
+    # --source is given; see _run_cli.
+    cli_group = parser.add_argument_group("CLI mode (no web server; runs a batch and exits)")
+    cli_group.add_argument(
+        "--source", help="Run headlessly instead of starting the web server: compress every "
+                          "supported image under this directory and exit. Requires --output.",
+    )
+    cli_group.add_argument("--output", help="Output directory for --source (required with --source).")
+    cli_group.add_argument(
+        "--quality", choices=["high", "medium", "low"], default="medium",
+        help="Standard/Screenshot mode color-quality floor (default medium).",
+    )
+    cli_group.add_argument(
+        "--format", choices=["png", "jpg", "webp", "avif"], default="png",
+        help="Output format (default png).",
+    )
+    cli_group.add_argument(
+        "--mode", choices=["standard", "lossless", "resize_only", "screenshot"], default="standard",
+        help="Compression mode (default standard). screenshot is PNG-only.",
+    )
+    cli_group.add_argument(
+        "--max-width", type=int, default=0,
+        help="Resize so the longest side is at most this many pixels (default 0 = no resize). "
+             "Required (> 0) when --mode resize_only.",
+    )
+    cli_group.add_argument(
+        "--dithering", action=argparse.BooleanOptionalAction, default=True,
+        help="Dithering for Standard-mode PNG quantization (default enabled; --no-dithering to "
+             "disable, e.g. for UI screenshots with flat colors and text).",
+    )
+    cli_group.add_argument(
+        "--protect-colors", default="",
+        help="Comma-separated hex colors (e.g. '#2ecc71,#ff0000') to prioritize keeping exact "
+             "in Standard mode's palette.",
+    )
+    cli_group.add_argument(
+        "--keep-exif", action="store_true",
+        help="Keep a curated subset of EXIF (camera make/model, date, exposure). GPS and "
+             "Orientation are always stripped regardless. Default: strip all EXIF.",
+    )
+    cli_group.add_argument(
+        "--exclude", action="append", default=[], metavar="GLOB",
+        help="Skip files matching this glob; repeatable. A pattern without '/' matches the "
+             "file name at any depth ('*.bak'); a pattern with '/' matches the path relative "
+             "to --source ('drafts/*'). Case-insensitive on every platform. Wins over --include.",
+    )
+    cli_group.add_argument(
+        "--include", action="append", default=[], metavar="GLOB",
+        help="Only process files matching at least one of these globs; repeatable. Same "
+             "matching rules as --exclude, which is applied afterwards and takes priority.",
+    )
+    cli_group.add_argument(
+        "--json", action="store_true",
+        help="Print the final report as a single JSON object on stdout (per-file status "
+             "compressed/cached/kept_original/excluded/failed, plus a summary). All "
+             "human-readable output moves to stderr so stdout can be piped to a parser.",
+    )
+    cli_group.add_argument(
+        "--cache-dir", metavar="PATH",
+        help="Enable a content-hash result cache stored in PATH. Unchanged inputs with the "
+             "same settings are copied from the cache instead of recompressed, even when "
+             "--output is a fresh directory every run. Must not be inside (or equal to) "
+             "--source or --output. Default: no cache.",
+    )
+    cli_group.add_argument(
+        "--cache-max-size-mb", type=int, default=DEFAULT_CACHE_MAX_MB, metavar="N",
+        help="Cache size cap in MB, enforced after each run by evicting least-recently-used "
+             f"entries (default {DEFAULT_CACHE_MAX_MB}; 0 = unlimited). Only used with --cache-dir.",
+    )
+
+    # The wheel ships no third-party executables (pngquant is GPL-3.0-or-later;
+    # see binaries.py). They are fetched once, verified, and cached per user.
+    bin_group = parser.add_argument_group("Encoder binaries (downloaded on first run)")
+    bin_group.add_argument(
+        "--download", action=argparse.BooleanOptionalAction, default=_download_enabled(),
+        help="Fetch the pinned pngquant/oxipng/cjpeg/avifenc releases on startup when they are "
+             "missing (default enabled). Every download is verified against a pinned SHA-256 "
+             f"and installed into {binaries.binary_dir()}. Use --no-download (or "
+             "IMAGE_OPTIMIZER_NO_DOWNLOAD=1) on an offline/air-gapped machine.",
+    )
+    bin_group.add_argument(
+        "--force-download", action="store_true",
+        help="Re-fetch the pinned binaries even when a matching copy is already installed.",
     )
     args = parser.parse_args()
 
-    global CONCURRENT_WORKERS, THUMBNAIL_WORKERS, WORKSPACE_CLEANUP_DELAY, SESSION_IDLE_TIMEOUT
+    # Done before the CLI branch so headless `--source` runs get the encoders
+    # too. A failure here only degrades output formats; it must never stop the
+    # app from starting (WebP still works with no external binary at all).
+    # In --json CLI mode every human-readable line must stay off stdout: the
+    # binary bootstrap talks before _run_cli even runs, and its messages would
+    # otherwise break the "exactly one JSON object on stdout" contract
+    # (ensure_binaries defaults to stdout). Web mode and plain CLI runs keep
+    # the historical stdout placement.
+    cli_json = bool(args.source and getattr(args, "json", False))
+    binaries.ensure_binaries(
+        download=args.download,
+        force=args.force_download,
+        out=sys.stderr if cli_json else None,
+    )
+
+    if args.source:
+        CONCURRENT_WORKERS = max(1, args.workers)
+        sys.exit(asyncio.run(_run_cli(args)))
+
     CONCURRENT_WORKERS = max(1, args.workers)
     THUMBNAIL_WORKERS = max(1, args.thumbnail_workers)
     WORKSPACE_CLEANUP_DELAY = config["workspace_cleanup_delay"]

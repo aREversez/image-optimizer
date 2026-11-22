@@ -128,8 +128,8 @@ class TestSseLiveStream:
         event when the run finishes (not hang)."""
         import asyncio
         import shutil
-        import app.main as m
-        from app.optimizer import Optimizer
+        import image_optimizer.main as m
+        from image_optimizer.optimizer import Optimizer
         from PIL import Image
 
         d = tmp_path / "imgs"

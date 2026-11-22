@@ -32,8 +32,8 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from PIL import Image
 
-from app.main import AppState, _process_files, _scan_and_thumbnail, _scan_images
-from app.optimizer import Optimizer
+from image_optimizer.main import AppState, _process_files, _scan_and_thumbnail, _scan_images
+from image_optimizer.optimizer import Optimizer
 
 
 def make_images(d: Path, n: int):
@@ -60,7 +60,7 @@ def bench(n: int):
 
     # Use the real Optimizer; fall back to stand-in binaries if pngquant/oxipng
     # aren't installed (keeps the benchmark runnable in any environment).
-    import app.main as m
+    import image_optimizer.main as m
     opt = Optimizer()
     if opt.pngquant_path is None or opt.oxipng_path is None:
         print("[bench] pngquant/oxipng not found — using copy-through stand-ins "

@@ -4,7 +4,7 @@ pngquant.exe/oxipng.exe are Windows binaries and won't run in CI on Linux/
 macOS runners, so every test uses small stand-in scripts that mimic just
 enough of their real behavior (reject non-PNG input with a non-zero exit
 and no output file; otherwise copy bytes through) to exercise the actual
-async subprocess-calling code in app/optimizer.py. This is the same
+async subprocess-calling code in image_optimizer/optimizer.py. This is the same
 technique used throughout manual testing during development — see
 git log for the reasoning captured in commit messages.
 """
@@ -148,7 +148,7 @@ def fake_bin_dir(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def optimizer(fake_bin_dir: Path):
-    from app.optimizer import Optimizer
+    from image_optimizer.optimizer import Optimizer
     opt = Optimizer(bin_dir=fake_bin_dir)
     # Bypass auto-detection's OS-specific naming assumptions entirely —
     # the fixture already knows exactly which file to point at for this
@@ -178,20 +178,20 @@ def test_images(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def app_module(optimizer):
-    """Points app.main's global `optimizer` at the fake binaries, so tests
-    never depend on real pngquant/oxipng being installed. app.main is only
+    """Points image_optimizer.main's global `optimizer` at the fake binaries, so tests
+    never depend on real pngquant/oxipng being installed. image_optimizer.main is only
     imported once per pytest process (module caching), which is fine —
     SESSIONS/APP_TOKEN staying shared across tests doesn't leak state
     between tests since every test gets its own TestClient (see `client`
     below) and therefore its own session cookie / AppState."""
-    import app.main as m
+    import image_optimizer.main as m
     m.optimizer = optimizer
     return m
 
 
 @pytest.fixture
 def client(app_module, optimizer):
-    import app.main as m
+    import image_optimizer.main as m
     from fastapi.testclient import TestClient
     with TestClient(app_module.app) as c:
         # TestClient.__enter__ runs the lifespan, and the lifespan re-creates
@@ -219,9 +219,33 @@ def auth_headers(token) -> dict:
 
 
 @pytest.fixture(autouse=True)
+def no_binary_downloads(monkeypatch, request):
+    """No test may hit the network through main()'s first-run fetch.
+
+    main() calls binaries.ensure_binaries() on every start, and at least one
+    test drives main() directly to check flag parsing (see
+    test_worker_split.py). Without this stub, running the suite on a machine
+    with internet access would download ~15 MB into the real per-user cache
+    and silently mutate the developer's machine -- exactly what
+    isolate_user_config_dir below prevents for ~/.image-optimizer.
+
+    test_binaries.py opts out with the real_binary_bootstrap marker: it has no
+    network access either (a loopback http.server), injects its own Artifact
+    table, and redirects binary_dir() to tmp_path.
+    """
+    if "real_binary_bootstrap" in request.node.keywords:
+        return
+    from image_optimizer import binaries
+
+    monkeypatch.setattr(
+        binaries, "ensure_binaries", lambda *args, **kwargs: binaries.EnsureReport()
+    )
+
+
+@pytest.fixture(autouse=True)
 def isolate_user_config_dir(monkeypatch, tmp_path_factory):
     """Every test gets its own fake home directory for
-    app.main._config_dir() (~/.image-optimizer — recent.json and
+    image_optimizer.main._config_dir() (~/.image-optimizer — recent.json and
     config.json both live there). Without this, running the test suite
     silently writes real recent.json entries (full of throwaway pytest
     tmp paths) into the actual developer's home directory on every run,

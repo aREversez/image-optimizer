@@ -1,0 +1,140 @@
+name: Release
+
+# Pushing a version tag (e.g. `git tag v1.0.5 && git push origin v1.0.5`) builds
+# the Windows exe, a macOS (Apple Silicon) dmg and a Linux tar.gz, then attaches
+# them to a GitHub Release for that tag.
+#
+# Run it by hand from the Actions tab for a dry run: everything is built and
+# smoke-tested, the files are kept as workflow artifacts, nothing is published.
+on:
+  push:
+    tags: ["v*", "V*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+          # macos-latest is Apple Silicon; libavif only publishes an arm64
+          # avifenc for macOS, so there is no Intel Mac build.
+          - name: macos-arm64
+            os: macos-latest
+          # libavif's prebuilt Linux avifenc is built on a current Ubuntu, so
+          # the Linux build needs a comparably recent glibc.
+          - name: linux-x64
+            os: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}   # for `gh release download` (avifenc)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.lock
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.lock pyinstaller
+
+      # nasm: mozjpeg's SIMD code on x86-64 (fetch_tools.py refuses to build without it)
+      - name: Install nasm (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y nasm
+      - name: Install nasm (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nasm -y --no-progress
+          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      # The encoders take a few minutes to build (oxipng, mozjpeg), so keep them
+      # between runs; the key changes whenever the pinned versions do.
+      - name: Cache encoder binaries
+        uses: actions/cache@v4
+        with:
+          path: |
+            bin/pngquant*
+            bin/oxipng*
+            bin/cjpeg*
+            bin/avifenc*
+          key: encoders-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch_tools.py') }}
+
+      - name: Fetch encoder binaries
+        run: python scripts/fetch_tools.py
+
+      # Apple Silicon refuses to run unsigned binaries; an ad-hoc signature is enough.
+      - name: Ad-hoc sign encoders (macOS)
+        if: runner.os == 'macOS'
+        run: codesign --force --sign - bin/pngquant bin/oxipng bin/cjpeg-static bin/avifenc
+
+      - name: Build executable
+        run: python build_exe.py
+
+      - name: Smoke test
+        run: python scripts/smoke_test.py dist/ImageOptimizer${{ runner.os == 'Windows' && '.exe' || '' }}
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir release
+          cp dist/ImageOptimizer.exe release/ImageOptimizer-windows-x64.exe
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p release dmg-root
+          cp dist/ImageOptimizer dmg-root/
+          cat > dmg-root/README.txt <<'EOF'
+          Image Optimizer (Apple Silicon)
+
+          1. Copy "ImageOptimizer" out of this disk image into a folder of your choice.
+          2. The app is unsigned, so macOS blocks it on first run. In Terminal, run once:
+               xattr -d com.apple.quarantine ./ImageOptimizer
+          3. Start it with ./ImageOptimizer, then open http://127.0.0.1:8090 in your
+             browser. Press Ctrl+C in Terminal to quit.
+          EOF
+          hdiutil create -volname ImageOptimizer -srcfolder dmg-root -ov -format UDZO \
+            release/ImageOptimizer-macos-arm64.dmg
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir release
+          tar -czf release/ImageOptimizer-linux-x64.tar.gz -C dist ImageOptimizer
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.name }}
+          path: release/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true

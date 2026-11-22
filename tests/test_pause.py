@@ -29,7 +29,7 @@ def scan_and_wait(client, headers, directory, recursive=True):
 
 
 def _session(client):
-    import app.main as m
+    import image_optimizer.main as m
     return m.SESSIONS[client.cookies.get("imgopt_session")]
 
 
@@ -51,8 +51,8 @@ class TestPauseResume:
         after the first file completes; the remaining queued files must be
         held (run stays running, paused True) until resume. After resume
         every file is processed exactly once."""
-        import app.main as m
-        from app.optimizer import Optimizer
+        import image_optimizer.main as m
+        from image_optimizer.optimizer import Optimizer
 
         monkeypatch.setattr(m, "CONCURRENT_WORKERS", 1)
 
@@ -129,8 +129,8 @@ class TestPauseResume:
     def test_cancel_during_pause_ends_run(self, client, auth_headers, tmp_path, fake_bin_dir, monkeypatch):
         """Cancel must win over pause: a paused run that's then cancelled
         drains the queue (no further processing) and completes."""
-        import app.main as m
-        from app.optimizer import Optimizer
+        import image_optimizer.main as m
+        from image_optimizer.optimizer import Optimizer
 
         monkeypatch.setattr(m, "CONCURRENT_WORKERS", 1)
         d = tmp_path / "imgs"
@@ -168,8 +168,8 @@ class TestPauseResume:
         assert any("Cancel" in line for line in prog["logs"])
 
     def test_progress_reports_paused_flag(self, client, auth_headers, tmp_path, fake_bin_dir, monkeypatch):
-        import app.main as m
-        from app.optimizer import Optimizer
+        import image_optimizer.main as m
+        from image_optimizer.optimizer import Optimizer
 
         monkeypatch.setattr(m, "CONCURRENT_WORKERS", 1)
         d = tmp_path / "imgs"
@@ -207,8 +207,8 @@ class TestPauseWithSkipExistingAndSubset:
     def test_pause_resume_with_skip_existing_and_narrowed_selection(
         self, client, auth_headers, tmp_path, fake_bin_dir, monkeypatch
     ):
-        import app.main as m
-        from app.optimizer import Optimizer
+        import image_optimizer.main as m
+        from image_optimizer.optimizer import Optimizer
 
         monkeypatch.setattr(m, "CONCURRENT_WORKERS", 1)
         d = tmp_path / "imgs"

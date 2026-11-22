@@ -1,7 +1,10 @@
-"""Unit tests for app/optimizer.py, independent of the FastAPI layer."""
+"""Unit tests for image_optimizer/optimizer.py, independent of the FastAPI layer."""
 from __future__ import annotations
 
 import asyncio
+import stat
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -284,7 +287,7 @@ class TestProtectedColorsAndDithering:
         assert "--nofs" in argv
 
     def test_color_map_file_contains_requested_colors(self, tmp_path):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         dst = tmp_path / "map.png"
         ok = Optimizer._make_color_map(["#2ecc71", "#ff0000"], dst)
         assert ok is True
@@ -294,7 +297,7 @@ class TestProtectedColorsAndDithering:
         assert (255, 0, 0) in pixels     # #ff0000
 
     def test_invalid_colors_are_skipped_not_crashed(self, tmp_path):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         dst = tmp_path / "map.png"
         ok = Optimizer._make_color_map(["not-a-color", "#zzzzzz"], dst)
         assert ok is False
@@ -343,7 +346,7 @@ class TestWebP:
         pngquant/oxipng are completely absent (deliberately does NOT use
         the `optimizer` fixture, since the whole point is testing with no
         binaries configured at all)."""
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         src = tmp_path / "src.png"
         Image.new("RGB", (40, 40)).save(src)
         out = tmp_path / "out.webp"
@@ -422,7 +425,7 @@ class TestJPEG:
             assert img.format == "JPEG"
 
     def test_jpeg_requires_cjpeg(self, tmp_path):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         opt = Optimizer(bin_dir=tmp_path / "nonexistent_bin_dir")
         assert opt.cjpeg_path is None
 
@@ -531,7 +534,7 @@ class TestMetadataStrippers:
     testing in isolation from the async pipelines that call them."""
 
     def test_strip_png_metadata_removes_exif_keeps_pixels(self, tmp_path):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         path = tmp_path / "x.png"
         TestGrowthGuard._png_with_exif_chunk(path, b"II*\x00some-exif-bytes")
         data = path.read_bytes()
@@ -545,7 +548,7 @@ class TestMetadataStrippers:
         assert list(Image.open(path).getdata()) == list(Image.open(out).getdata())
 
     def test_strip_png_metadata_leaves_color_chunks_alone(self):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         import io
         buf = io.BytesIO()
         Image.new("RGB", (10, 10), (1, 2, 3)).save(buf, format="PNG", pnginfo=None)
@@ -554,7 +557,7 @@ class TestMetadataStrippers:
         assert Optimizer._strip_png_metadata(data) == data
 
     def test_strip_jpeg_metadata_removes_exif_keeps_pixels(self, tmp_path):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         path = tmp_path / "x.jpg"
         img = Image.new("RGB", (40, 40), (9, 8, 7))
         exif = img.getexif()
@@ -569,7 +572,7 @@ class TestMetadataStrippers:
         assert Image.open(out).size == (40, 40)
 
     def test_strip_jpeg_metadata_noop_on_clean_jpeg(self, tmp_path):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         path = tmp_path / "x.jpg"
         Image.new("RGB", (20, 20), (1, 1, 1)).save(path, format="JPEG")
         data = path.read_bytes()
@@ -579,13 +582,13 @@ class TestMetadataStrippers:
         assert list(Image.open(path).getdata()) == list(Image.open(out).getdata())
 
     def test_strip_jpeg_metadata_handles_malformed_input_without_raising(self):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         assert Optimizer._strip_jpeg_metadata(b"") == b""
         assert Optimizer._strip_jpeg_metadata(b"not a jpeg") == b"not a jpeg"
         assert Optimizer._strip_jpeg_metadata(b"\xff\xd8\xff") == b"\xff\xd8\xff"
 
     def test_strip_webp_metadata_removes_exif_keeps_pixels(self, tmp_path):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         path = tmp_path / "x.webp"
         img = Image.new("RGB", (30, 30), (4, 5, 6))
         exif = img.getexif()
@@ -600,14 +603,14 @@ class TestMetadataStrippers:
         assert list(Image.open(path).convert("RGB").getdata()) == list(Image.open(out).convert("RGB").getdata())
 
     def test_strip_webp_metadata_noop_on_clean_webp(self, tmp_path):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         path = tmp_path / "x.webp"
         Image.new("RGB", (20, 20), (2, 2, 2)).save(path, format="WEBP", lossless=True)
         data = path.read_bytes()
         assert Optimizer._strip_webp_metadata(data) == data
 
     def test_strip_webp_metadata_handles_malformed_input_without_raising(self):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         assert Optimizer._strip_webp_metadata(b"") == b""
         assert Optimizer._strip_webp_metadata(b"not a webp") == b"not a webp"
 
@@ -638,7 +641,7 @@ class TestAvailableModes:
                 ("avif", "standard"), ("avif", "lossless"), ("avif", "resize_only")} == modes
 
     def test_no_binaries_drops_standard_png_and_all_jpeg(self, tmp_path):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         # No binaries found in bin_dir → all paths None.
         opt = Optimizer(bin_dir=tmp_path / "nonexistent_bin_dir")
         assert opt.pngquant_path is None
@@ -745,7 +748,7 @@ class TestAVIF:
         assert "-q" not in argv, f"resize_only should not use a lossy quality flag, got: {argv}"
 
     def test_avif_requires_avifenc(self, tmp_path):
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         opt = Optimizer(bin_dir=tmp_path / "nonexistent")
         src = tmp_path / "input.png"
         out = tmp_path / "output.avif"
@@ -878,7 +881,7 @@ class TestScreenshotModeRealBinaries:
         if not pq or not ox:
             pytest.skip("real pngquant/oxipng not on PATH — this validates against the actual binaries, not the CI test doubles")
 
-        from app.optimizer import Optimizer
+        from image_optimizer.optimizer import Optimizer
         opt = Optimizer(bin_dir=tmp_path)
         opt.pngquant_path = Path(pq)
         opt.oxipng_path = Path(ox)
@@ -906,3 +909,464 @@ class TestScreenshotModeRealBinaries:
             "near-lossless on this kind of content"
         )
 
+
+class TestConcurrentBinaryDetection:
+    """_detect_binaries() runs once at construction and again on every
+    /api/health request via asyncio.to_thread (see image_optimizer/main.py) — by
+    design, so a binary installed after the app started gets picked up
+    without a restart. Two overlapping /api/health calls therefore run
+    this on two different thread-pool threads at once; without a lock
+    around it, their writes to the four *_path attributes can interleave,
+    and a reader building a response from those same attributes could
+    observe a torn mix of the two calls' results."""
+
+    def test_concurrent_detect_binaries_does_not_interleave(self, optimizer):
+        import threading
+        import time as _time
+
+        calls = []
+        calls_lock = threading.Lock()
+        barrier = threading.Barrier(2)
+
+        def fake_find_binary(name):
+            start = _time.perf_counter()
+            # Widen the window: at 20ms per call and 5 calls per
+            # invocation (pngquant, oxipng, cjpeg, cjpeg-static,
+            # avifenc), an unlocked version reliably interleaves here.
+            _time.sleep(0.02)
+            end = _time.perf_counter()
+            with calls_lock:
+                calls.append((threading.current_thread().name, start, end))
+            return None
+
+        optimizer._find_binary = fake_find_binary
+
+        def run_detect(label):
+            threading.current_thread().name = label
+            barrier.wait()  # both threads enter _detect_binaries() together
+            optimizer._detect_binaries()
+
+        t1 = threading.Thread(target=run_detect, args=("A",))
+        t2 = threading.Thread(target=run_detect, args=("B",))
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+        assert not t1.is_alive() and not t2.is_alive()
+
+        a_spans = [(s, e) for label, s, e in calls if label == "A"]
+        b_spans = [(s, e) for label, s, e in calls if label == "B"]
+        assert a_spans and b_spans
+        a_start, a_end = min(s for s, _ in a_spans), max(e for _, e in a_spans)
+        b_start, b_end = min(s for s, _ in b_spans), max(e for _, e in b_spans)
+
+        # With the lock, one invocation's entire span must finish before
+        # the other's starts — no interleaving between A's five
+        # _find_binary calls and B's.
+        assert a_end <= b_start or b_end <= a_start, (
+            f"A span=({a_start:.4f}, {a_end:.4f}) B span=({b_start:.4f}, "
+            f"{b_end:.4f}) overlap — concurrent _detect_binaries() calls "
+            f"are not serialized"
+        )
+
+
+class TestSubprocessTimeout:
+    """pngquant/oxipng/cjpeg/avifenc calls used to await proc.communicate()
+    with no timeout at all -- a hung external binary (malformed input, a
+    bug in the tool, a stalled network drive) would block its worker, and
+    the concurrency-limiting semaphore slot it holds, forever. See
+    CHANGELOG."""
+
+    def test_communicate_with_timeout_kills_a_genuinely_hung_process(self):
+        """Unit-level check against a real subprocess (not a mock), so
+        this exercises the actual kill/reap mechanics, not just the
+        control flow around them."""
+        async def scenario():
+            import time as _time
+            from image_optimizer.optimizer import Optimizer
+
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-c", "import time; time.sleep(999)",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            t0 = _time.perf_counter()
+            stdout, stderr, timed_out = await Optimizer._communicate_with_timeout(proc, timeout=0.3)
+            elapsed = _time.perf_counter() - t0
+            return elapsed, stdout, stderr, timed_out, proc
+
+        elapsed, stdout, stderr, timed_out, proc = asyncio.run(scenario())
+        assert elapsed < 5.0, f"took {elapsed:.2f}s -- did not return promptly after the 0.3s timeout"
+        assert timed_out is True
+        assert b"timed out" in stderr
+        assert stdout == b""
+        # The process must actually be dead, not orphaned/left running.
+        assert proc.returncode is not None
+
+    def test_pngquant_timeout_produces_warning_and_still_succeeds_via_fallback(
+        self, optimizer, test_images, tmp_path, monkeypatch
+    ):
+        """Integration-level: pngquant hangs, main.py's existing
+        `elif proc.returncode != 0: result["warning"] = msg` path (nothing
+        new needed there) picks up the synthetic timeout message, and the
+        file still succeeds via the lossless/oxipng fallback rather than
+        the whole call hanging for the full production timeout."""
+        import image_optimizer.optimizer as optimizer_module
+
+        hang_script = tmp_path / "pngquant_hangs"
+        hang_script.write_text(
+            f"#!/usr/bin/env python3\nimport time\ntime.sleep(30)\n"
+        )
+        hang_script.chmod(hang_script.stat().st_mode | stat.S_IEXEC)
+        if sys.platform == "win32":
+            wrapper = tmp_path / "pngquant_hangs.bat"
+            wrapper.write_text(f'@echo off\r\n"{sys.executable}" "{hang_script}" %*\r\n')
+            optimizer.pngquant_path = wrapper
+        else:
+            wrapper = tmp_path / "pngquant_hangs.sh"
+            wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{hang_script}"\n')
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC)
+            optimizer.pngquant_path = wrapper
+
+        monkeypatch.setattr(optimizer_module, "SUBPROCESS_TIMEOUT", 0.3)
+
+        src = test_images / "2023" / "vacation" / "IMG_0001.png"
+        out = tmp_path / "out.png"
+
+        t0 = time.time()
+        result = asyncio.run(optimizer.optimize_png(src, out, max_width=0))
+        elapsed = time.time() - t0
+
+        assert elapsed < 10.0, f"took {elapsed:.2f}s -- pngquant hang was not bounded by SUBPROCESS_TIMEOUT"
+        assert result["success"] is True, "oxipng fallback should still produce a usable output"
+        assert "timed out" in (result.get("warning") or "")
+        assert out.exists()
+
+    def test_communicate_with_timeout_kills_child_on_cancellation(self):
+        """Cancelling the awaiting task must still raise CancelledError (as
+        a bare communicate() always did -- the worker unblocks the same
+        way) but must now also kill the child first, instead of leaving it
+        running as an orphan in the background."""
+        from image_optimizer.optimizer import Optimizer
+
+        async def scenario():
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-c", "import time; time.sleep(999)",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            task = asyncio.ensure_future(Optimizer._communicate_with_timeout(proc, timeout=300))
+            await asyncio.sleep(0.2)  # let the subprocess actually start
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            return proc
+
+        proc = asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+        assert proc.returncode is not None, "child process must be reaped (not orphaned) after cancellation"
+
+    def test_kill_and_reap_gives_up_when_the_killed_process_is_never_reaped(self, monkeypatch, capsys):
+        """If wait() never resolves (a surviving descendant holds the pipes
+        open on Python releases without gh-119710), _kill_and_reap must stop
+        waiting after REAP_TIMEOUT, say so on stderr, close the transport,
+        and return."""
+        import image_optimizer.optimizer as optimizer_module
+        from image_optimizer.optimizer import Optimizer
+
+        monkeypatch.setattr(optimizer_module, "REAP_TIMEOUT", 0.2)
+
+        class FakeTransport:
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        class FakeProc:
+            pid = 4321
+
+            def __init__(self):
+                self.killed = False
+                self._transport = FakeTransport()
+
+            def kill(self):
+                self.killed = True
+
+            async def wait(self):
+                await asyncio.Event().wait()  # never resolves
+
+        async def scenario():
+            proc = FakeProc()
+            t0 = time.perf_counter()
+            await Optimizer._kill_and_reap(proc)
+            return proc, time.perf_counter() - t0
+
+        proc, elapsed = asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+        assert proc.killed
+        assert proc._transport.closed, "abandoned transport must be closed"
+        assert elapsed < 2.0, f"took {elapsed:.2f}s -- reap wait was not bounded"
+        # Giving up silently would leave a stuck worker slot unexplained in
+        # the logs; the warning has to name the process it walked away from.
+        err = capsys.readouterr().err
+        assert "4321" in err and "abandon" in err, f"no diagnostic on stderr: {err!r}"
+
+    def test_kill_and_reap_closes_the_pipes_when_the_wait_resolves(self):
+        """The gh-119710 case, which no longer blocks at all: wait() returns
+        while a survivor still holds the pipes open, so nothing in the
+        timeout branch runs. The pipes must be closed anyway -- otherwise the
+        abandoned transports are finalized after loop close and log "Event
+        loop is closed" / "I/O operation on closed pipe" exactly like the
+        blocking case did."""
+        from image_optimizer.optimizer import Optimizer
+
+        class FakeTransport:
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        class ReapedProc:
+            returncode = -9
+
+            def __init__(self):
+                self._transport = FakeTransport()
+
+            def kill(self):
+                pass
+
+            async def wait(self):
+                return -9  # resolves at once, pipes still open
+
+        async def scenario():
+            proc = ReapedProc()
+            await Optimizer._kill_and_reap(proc)
+            return proc
+
+        proc = asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))
+        assert proc._transport.closed, (
+            "pipes left open when wait() resolved -- the abandoned transport "
+            "would be finalized after the loop closes"
+        )
+
+    def test_kill_and_reap_survives_a_kill_that_is_refused(self):
+        """Windows can refuse TerminateProcess (PermissionError) for a process
+        it will not let us touch. Letting that escape would turn the caller's
+        "timed out" result into an exception and skip the encoder fallback,
+        so _kill_and_reap must swallow it and carry on to the bounded wait."""
+        from image_optimizer.optimizer import Optimizer
+
+        class RefusingProc:
+            returncode = 0
+
+            def kill(self):
+                raise PermissionError("access denied")
+
+            async def wait(self):
+                return 0
+
+        async def scenario():
+            await Optimizer._kill_and_reap(RefusingProc())
+
+        asyncio.run(asyncio.wait_for(scenario(), timeout=5.0))  # must not raise
+
+    def test_communicate_with_timeout_returns_when_a_descendant_holds_the_pipes(self, monkeypatch):
+        """Same shape as the Windows .bat wrapper (cmd.exe -> python): the
+        process we started spawns a child that inherits stdout/stderr and
+        outlives it. kill() only reaches the parent. Without gh-119710 an
+        unbounded wait() then blocked until the child exited (999s in CI),
+        and the abandoned transport logged "Event loop is closed" when it was
+        finalized after the loop shut down. On releases that already have
+        gh-119710 (e.g. 3.13.18) wait() returns at once, so the blocking path
+        is only exercised on 3.11/3.12; the no-noise assertion covers both,
+        because the pipes are closed after the kill either way."""
+        import gc
+        import image_optimizer.optimizer as optimizer_module
+        from image_optimizer.optimizer import Optimizer
+
+        monkeypatch.setattr(optimizer_module, "REAP_TIMEOUT", 0.5)
+        # The grandchild is the orphan nobody can kill, so its nap is the
+        # test's only lasting footprint: long enough that an unbounded wait()
+        # would blow the 5 s assertion below (otherwise the test would pass
+        # without the fix), short enough to stay well inside the 10 s guard
+        # even when that blocking path is the one being exercised.
+        parent = (
+            "import subprocess, sys, time\n"
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(8)'])\n"
+            "time.sleep(30)\n"  # safety bound only; the parent is killed first
+        )
+
+        async def scenario():
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-c", parent,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.sleep(0.5)  # let the child start and inherit the pipes
+            t0 = time.perf_counter()
+            result = await Optimizer._communicate_with_timeout(proc, timeout=0.3)
+            return result, time.perf_counter() - t0, proc
+
+        unraisable = []
+        old_hook = sys.unraisablehook
+        sys.unraisablehook = lambda a: unraisable.append(str(a.exc_value))
+        try:
+            (stdout, stderr, timed_out), elapsed, proc = asyncio.run(
+                asyncio.wait_for(scenario(), timeout=10.0)
+            )
+            del proc
+            gc.collect()
+        finally:
+            sys.unraisablehook = old_hook
+
+        assert timed_out is True
+        assert b"timed out" in stderr
+        assert elapsed < 5.0, f"took {elapsed:.2f}s -- blocked on the pipe-holding descendant"
+        assert not [m for m in unraisable if "closed" in m], unraisable
+
+    @staticmethod
+    def _make_real_bin(tmp_path: Path, name: str, script: str) -> Path:
+        """Wrap `script` (a Python source string) as a real, directly
+        executable binary -- .bat on Windows, a shell shim on POSIX --
+        similar to fake_bin_dir's own technique in conftest.py, with one
+        deliberate difference: the POSIX wrapper uses `exec` rather than
+        subprocess.call(). subprocess.call() forks a *child* process that
+        inherits the wrapper's stdout/stderr pipe file descriptors; when
+        the wrapper itself is later killed (the whole point of the tests
+        below), that child is orphaned but keeps holding the pipe open,
+        and asyncio's proc.wait()/communicate() then hangs indefinitely
+        waiting for the pipe to close (confirmed empirically -- this
+        isn't theoretical). `exec` replaces the shell process in place
+        instead of forking, so there's only ever one real process to
+        kill, exactly like a genuine hung pngquant/oxipng/cjpeg/avifenc
+        binary (none of which fork children of their own).
+
+        Windows has no `exec`: the .bat wrapper is cmd.exe plus a python
+        child, and killing the wrapper leaves that child running. The hang
+        scripts behind these wrappers therefore sleep 30 s, not 999 s: far
+        longer than any timeout the tests use (0.3 s, with 5 s guards), but
+        the leftover child is gone soon after the test instead of lingering
+        for ~16 minutes on a developer's machine."""
+        bin_dir = tmp_path / f"{name}_bin"
+        bin_dir.mkdir()
+        impl = bin_dir / f"{name}_impl.py"
+        impl.write_text(script)
+        if sys.platform == "win32":
+            wrapper = bin_dir / f"{name}.bat"
+            wrapper.write_text(f'@echo off\r\n"{sys.executable}" "{impl}" %*\r\n')
+        else:
+            wrapper = bin_dir / name
+            wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{impl}" "$@"\n')
+            wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC)
+        return wrapper
+
+    def _partial_write_then_hang_bin(self, tmp_path: Path, out_flag: str) -> Path:
+        """Writes garbage to its own output path (mimicking a real binary
+        caught mid-write) and then hangs -- proves the timeout path
+        actually removes that partial file, rather than letting a later
+        exists()-only (or exists()-and-size>0) check mistake it for a
+        completed, valid result."""
+        script = (
+            "import sys, time\n"
+            f"i = sys.argv.index({out_flag!r})\n"
+            "open(sys.argv[i + 1], 'wb').write(b'GARBAGE-PARTIAL-WRITE' * 500)\n"
+            "time.sleep(30)\n"
+        )
+        return self._make_real_bin(tmp_path, "partialhang", script)
+
+    def test_oxipng_timeout_does_not_ship_a_truncated_file_as_output(
+        self, optimizer, tmp_path, monkeypatch
+    ):
+        """The highest-severity version of the partial-write hazard:
+        oxipng's own success check is just "--out path exists", and
+        oxipng_tmp is replace()'d directly onto output_path -- the file
+        the user actually receives. A killed process can leave a
+        non-empty but truncated/corrupt file at that exact path; without
+        explicit cleanup on timeout, this would get shipped as a
+        success=True result instead of falling back to the still-valid
+        pre-oxipng output."""
+        import image_optimizer.optimizer as optimizer_module
+
+        monkeypatch.setattr(optimizer_module, "SUBPROCESS_TIMEOUT", 0.3)
+        optimizer.oxipng_path = self._partial_write_then_hang_bin(tmp_path, "--out")
+
+        src = tmp_path / "src.png"
+        Image.new("RGB", (48, 48), (46, 204, 113)).save(src, format="PNG")
+        out = tmp_path / "out.png"
+
+        result = asyncio.run(
+            asyncio.wait_for(optimizer.optimize_png(src, out, compression_mode="standard"), timeout=5.0)
+        )
+
+        assert result["success"] is True, result
+        assert "timed out" in (result.get("warning") or ""), result
+        assert out.read_bytes()[:8] == PNG_MAGIC
+        assert b"GARBAGE-PARTIAL-WRITE" not in out.read_bytes()
+
+    def test_avifenc_timeout_does_not_ship_a_truncated_file_as_output(
+        self, optimizer, tmp_path, monkeypatch
+    ):
+        """avifenc's existing success check already requires size > 0, not
+        just exists() -- but a killed process can still leave a
+        non-empty, truncated bitstream that would pass that check on its
+        own. Confirms the timeout path's explicit cleanup is what
+        actually prevents this from being shipped, not the pre-existing
+        size check alone."""
+        import image_optimizer.optimizer as optimizer_module
+
+        monkeypatch.setattr(optimizer_module, "SUBPROCESS_TIMEOUT", 0.3)
+        optimizer.avifenc_path = self._partial_write_then_hang_bin(tmp_path, "-o")
+
+        src = tmp_path / "src.png"
+        Image.new("RGB", (48, 48), (10, 20, 30)).save(src, format="PNG")
+        out = tmp_path / "out.avif"
+
+        result = asyncio.run(
+            asyncio.wait_for(
+                optimizer.optimize_png(src, out, output_format="avif"), timeout=5.0
+            )
+        )
+
+        assert result["success"] is False, result
+        assert not out.exists(), "a truncated avifenc output must not be shipped as the final file"
+
+    def test_cjpeg_timeout_does_not_ship_a_truncated_file_as_output(
+        self, optimizer, tmp_path, monkeypatch
+    ):
+        import image_optimizer.optimizer as optimizer_module
+
+        monkeypatch.setattr(optimizer_module, "SUBPROCESS_TIMEOUT", 0.3)
+        optimizer.cjpeg_path = self._partial_write_then_hang_bin(tmp_path, "-outfile")
+
+        src = tmp_path / "src.png"
+        Image.new("RGB", (48, 48), (200, 50, 50)).save(src, format="PNG")
+        out = tmp_path / "out.jpg"
+
+        result = asyncio.run(
+            asyncio.wait_for(optimizer.optimize_png(src, out, output_format="jpg"), timeout=5.0)
+        )
+
+        assert result["success"] is False, result
+        assert not out.exists(), "a truncated cjpeg output must not be shipped as the final file"
+
+    def test_oxipng_non_timeout_failure_now_surfaces_a_warning(self, optimizer, tmp_path):
+        """Bug predating this fix, not introduced by it: unlike pngquant,
+        the oxipng branch never captured stdout/stderr at all, so *any*
+        failure (timeout or otherwise) fell through to the copy2 fallback
+        completely silently -- no warning, no indication oxipng's pass
+        was skipped. Fixed as part of adding timeout handling here, since
+        capturing stderr was needed for the timeout message anyway."""
+        optimizer.oxipng_path = self._make_real_bin(
+            tmp_path, "alwaysfail",
+            "import sys\nsys.stderr.write('oxipng: synthetic failure\\n')\nsys.exit(1)\n",
+        )
+
+        src = tmp_path / "src.png"
+        Image.new("RGB", (48, 48), (46, 204, 113)).save(src, format="PNG")
+        out = tmp_path / "out.png"
+
+        result = asyncio.run(
+            asyncio.wait_for(optimizer.optimize_png(src, out, compression_mode="standard"), timeout=5.0)
+        )
+
+        assert result["success"] is True, result
+        assert "synthetic failure" in (result.get("warning") or ""), result
+        assert out.exists() and out.read_bytes()[:8] == PNG_MAGIC

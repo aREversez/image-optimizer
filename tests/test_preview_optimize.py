@@ -28,7 +28,7 @@ def scan_and_wait(client, headers, directory, recursive=True):
 
 
 def _session(client):
-    import app.main as m
+    import image_optimizer.main as m
     return m.SESSIONS[client.cookies.get("imgopt_session")]
 
 

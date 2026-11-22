@@ -37,7 +37,7 @@ def optimize_and_wait(client, headers, **body):
 
 
 def _session(client):
-    import app.main as m
+    import image_optimizer.main as m
     return m.SESSIONS[client.cookies.get("imgopt_session")]
 
 
@@ -48,8 +48,8 @@ class TestOverridesApplied:
     API and dropped)."""
 
     def test_each_file_gets_its_effective_params(self, client, auth_headers, test_images, fake_bin_dir):
-        import app.main as m
-        from app.optimizer import Optimizer
+        import image_optimizer.main as m
+        from image_optimizer.optimizer import Optimizer
 
         scanned = scan_and_wait(client, auth_headers, test_images)
         path_to_id = {f["path"]: f["id"] for f in scanned["files"]}
@@ -96,8 +96,8 @@ class TestOverridesApplied:
             m.optimizer = opt  # fixtures re-bind per test anyway, but be safe
 
     def test_override_only_affects_listed_files(self, client, auth_headers, test_images, fake_bin_dir):
-        import app.main as m
-        from app.optimizer import Optimizer
+        import image_optimizer.main as m
+        from image_optimizer.optimizer import Optimizer
 
         scanned = scan_and_wait(client, auth_headers, test_images)
         path_to_id = {f["path"]: f["id"] for f in scanned["files"]}

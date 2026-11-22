@@ -63,7 +63,7 @@ class TestRetryPreservesEarlierResults:
     just the retried files."""
 
     def _output_dir(self, client):
-        import app.main as m
+        import image_optimizer.main as m
         return m.SESSIONS[client.cookies.get("imgopt_session")].workspace / "output"
 
     def test_retry_subset_keeps_full_result_set_and_outputs(self, client, auth_headers, test_images):
@@ -130,8 +130,8 @@ class TestOutputDirStructure:
         import shutil
         import sys
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-        from app.main import AppState, _process_files
-        from app.optimizer import Optimizer
+        from image_optimizer.main import AppState, _process_files
+        from image_optimizer.optimizer import Optimizer
 
         async def slow_optimize(input_path, output_path, **kwargs):
             await asyncio.sleep(0.25)
@@ -141,7 +141,7 @@ class TestOutputDirStructure:
         opt = Optimizer(bin_dir=fake_bin_dir)
         opt.optimize_png = slow_optimize
 
-        import app.main as m
+        import image_optimizer.main as m
         m.optimizer = opt
 
         src = tmp_path / "src.png"
@@ -223,7 +223,7 @@ class TestRevealInExplorer:
         target = next(res["final_output_path"] for res in d["results"] if res["success"])
 
         calls = []
-        import app.main as m
+        import image_optimizer.main as m
         monkeypatch.setattr(m.subprocess, "Popen", lambda *a, **k: calls.append((a, k)))
 
         r2 = client.post("/api/reveal", json={"path": target}, headers=auth_headers)
@@ -262,7 +262,7 @@ class TestRevealInExplorer:
         assert r.status_code == 200
 
         calls = []
-        import app.main as m
+        import image_optimizer.main as m
         monkeypatch.setattr(m.subprocess, "Popen", lambda *a, **k: calls.append((a, k)))
         # The win32 focus helper would otherwise poll for a real Explorer
         # window for up to 3s in CI (and never find one — Popen is mocked).
@@ -372,7 +372,7 @@ class TestValidation:
         jpg_result = next(res for res in d["results"] if res["name"].endswith(".jpg"))
         assert jpg_result["success"] is True
 
-        import app.main as m
+        import image_optimizer.main as m
         ws = m.SESSIONS[client.cookies.get("imgopt_session")].workspace
         out_file = ws / "output" / "photo.jpg"
         assert out_file.exists()
@@ -393,7 +393,7 @@ class TestNonPngInputNormalization:
         jpg_result = next(res for res in d["results"] if res["name"] == "photo.jpg")
         assert jpg_result["success"] is True
 
-        import app.main as m
+        import image_optimizer.main as m
         ws = m.SESSIONS[client.cookies.get("imgopt_session")].workspace
         out_file = ws / "output" / "photo.png"
         assert out_file.exists()
@@ -403,7 +403,7 @@ class TestNonPngInputNormalization:
 
 
 def _session(client):
-    import app.main as m
+    import image_optimizer.main as m
     return m.SESSIONS[client.cookies.get("imgopt_session")]
 
 

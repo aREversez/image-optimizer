@@ -2,7 +2,156 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [1.1.0] - 2026-11-21
+
+### Added
+- **CLI result cache** (`--cache-dir PATH`, `--cache-max-size-mb N`). Unchanged
+  inputs with the same settings are copied from a content-addressed cache
+  instead of recompressed, even when `--output` is a fresh directory every
+  run. Keyed on the input bytes, the pixel-affecting settings and the
+  encoder binaries; only successful results are stored; least-recently-used
+  entries are evicted to stay under the size cap (default 1024 MB).
+- **CLI `--exclude` / `--include` globs.** Repeatable; a pattern without `/`
+  matches the file name at any depth, one with `/` matches the path relative
+  to `--source`. Case-insensitive; `--exclude` always wins.
+- **CLI `--json` report.** One JSON object on stdout with a per-file status
+  (`compressed`, `cached`, `kept_original`, `excluded`, `failed`) and a
+  summary; human-readable output moves to stderr.
+- Byte-determinism regression tests for the compression pipeline
+  (`tests/test_determinism.py`), including a `real_encoders` marker that runs
+  against the real encoder binaries when they are installed.
+- **Automated releases.** Pushing a version tag now builds the Windows exe,
+  a macOS (Apple Silicon) dmg and a Linux x86-64 tar.gz on GitHub Actions
+  and attaches them to the release (`.github/workflows/release.yml`). Each
+  build is smoke-tested first: the packaged app must start and find all four
+  encoders inside the bundle. The workflow can also be run by hand as a dry
+  run that publishes nothing.
+- `scripts/fetch_tools.py` downloads or builds pngquant, oxipng, cjpeg
+  (mozjpeg) and avifenc into `bin/` on any platform, so the encoders no
+  longer have to be collected by hand for a build.
+- `scripts/smoke_test.py` starts a built executable and checks `/api/health`.
+- **PyPI distribution** (`pip install image-optimizer-webui` → `image-optimizer
+  serve`). The package is pure Python (`py3-none-any`); the import package is
+  `image_optimizer` (was `app`, a name that would collide with any other
+  distribution installing a top-level `app/`). Templates ship as package data,
+  and `tests/` is no longer swept into site-packages by auto-discovery.
+- **First-run encoder bootstrap** (`image_optimizer/binaries.py`). The app no
+  longer expects `bin/` to exist: missing tools are downloaded from their
+  publisher, verified against a pinned SHA-256, and cached per user
+  (`%LOCALAPPDATA%\ImageOptimizer\bin`, `~/Library/Application
+  Support/ImageOptimizer/bin`, `$XDG_DATA_HOME/image-optimizer/bin`). Only
+  files whose digest matches are ever executed; a mismatch is discarded.
+  Windows x64 fetches all four (pngquant 2.17.0, oxipng 10.1.1, mozjpeg 4.0.3,
+  libavif 1.4.2); macOS/Linux fetch oxipng only and print package-manager
+  commands for the rest, since the others have no official standalone binary.
+  The lookup order is PATH → user cache → repo `bin/`.
+- `serve` subcommand: `image-optimizer serve` is accepted as a synonym for the
+  bare command (all existing flat flags keep working).
+- `--download` / `--no-download` / `--force-download` flags, plus the
+  `IMAGE_OPTIMIZER_NO_DOWNLOAD=1` environment opt-out for offline and
+  air-gapped deployments. A failed fetch never blocks startup — WebP still
+  works with no external binary — and prints the URL, target path and expected
+  SHA-256 for manual installation.
+- **Trusted Publishing workflow** (`.github/workflows/publish.yml`). Pushing a
+  `v*` tag builds the sdist and wheel, refuses to publish when the tag and
+  `image_optimizer.__version__` disagree, asserts that both artifacts still
+  carry `templates/`, runs `twine check --strict`, smoke-tests the installed
+  wheel from outside the checkout, and only then uploads through PyPI's OIDC
+  trusted publisher (`environment: pypi`). No API token is stored anywhere.
+
+### Fixed
+- **Encoder timeout could still hang for as long as a child process lived.**
+  After a timed-out encoder was killed, the worker waited for it to be reaped
+  with no bound. If the process we started had spawned a descendant (a
+  `.bat`/`.cmd` or shim wrapper on Windows, a shell wrapper without `exec`),
+  the descendant kept the stdout/stderr pipes open and, on Python releases
+  without the gh-119710 fix, the wait lasted until it exited, so the timeout
+  did not free the worker slot (`asyncio` wakes `wait()` only from
+  `_call_connection_lost`, which needs every pipe closed; gh-119710 also wakes
+  it when the process exits). Measured with a parent-plus-grandchild repro:
+  3.11.18, 3.12.3 and 3.12.10 block until the grandchild exits, 3.13.18
+  returns at once, so whether a given install hangs depends on its patch
+  release. The wait is now bounded (2 s), and the pipes are closed after the
+  kill on every path (not only when the wait gave up) because `wait()` can
+  resolve while a survivor still holds them open, and such abandoned
+  transports can be finalized after loop close (`Event loop is closed`,
+  `I/O operation on closed pipe`), so we no longer depend on the patch release.
+  Giving up is reported on stderr with the pid and exit status instead of
+  being silent. This was the cause of the Windows CI failures in
+  `TestSubprocessTimeout` (the pngquant test took 999 s). A surviving
+  descendant is still not killed, and a `kill()` that raises anything but
+  `ProcessLookupError` (e.g. Windows `PermissionError`) no longer turns the
+  caller's `timed out` result into an exception that skips the encoder
+  fallback.
+- **CLI `--json` stdout purity.** The binary bootstrap ("[Binaries] ... already
+  installed", download progress, the `--no-download` notice) and config.json
+  diagnostics printed to stdout before the report; `json.loads(stdout)` failed
+  on every `--json` run. They now go to stderr, so stdout is exactly one JSON
+  object.
+- **CLI result cache robustness.** Stale `.tmp-*` files from crashed writers
+  are now swept on every run, including with `--cache-max-size-mb 0`
+  (previously they accumulated forever); entries written during a run are
+  protected from that run's eviction (with a cap smaller than one entry the
+  cache could never serve a hit), and the run warns on stderr when the cache
+  is still over the cap after eviction.
+- **AVIF cache hits need an AVIF-capable Pillow.** Cached AVIF entries are
+  validated by opening them with Pillow; on builds without AVIF support the
+  cache silently never hit for AVIF. `Pillow>=11.3` is now required and a
+  missing AVIF codec triggers a one-time stderr warning instead of silent
+  cache misses.
+- **CLI output I/O failures.** A failure creating a per-file output
+  subdirectory is now a per-file `failed` record (the rest of the batch and
+  the `--json` report still complete) instead of an unhandled crash; a
+  failure creating `--output` itself is a clean setup error.
+- **CLI cache placement guards.** `--cache-dir` inside (or equal to)
+  `--output` is now rejected like inside `--source`, and both containment
+  checks are Windows-case-insensitive (`os.path.normcase`).
+- **Cache concurrent writes on Windows.** Replacing an entry with
+  `os.replace` fails with `PermissionError` while another reader or writer
+  has it open; `store()` now retries briefly and treats "another writer
+  already published a complete entry" as success, so duplicate images in one
+  batch no longer produce `cache write failed` warnings or skipped writes.
+  "Complete" is checked with the same structural validation a hit uses: if
+  the replace keeps failing and the existing entry is corrupt (or the wrong
+  format), `store()` now raises and the run reports `cache write failed`
+  instead of silently leaving the bad entry to miss again on every run.
+- **The cache never deletes files it did not write.** Eviction and the temp
+  sweep now accept only the module's own names (`<64 hex>.<format>` and its
+  `.tmp-<pid>-<8 hex>` form inside a two-hex-digit shard), so pointing
+  `--cache-dir` at an existing directory can no longer make LRU eviction
+  remove unrelated files there.
+- **Pillow floor consistency.** `requirements.txt` now pins `Pillow>=11.3.0`
+  like `pyproject.toml`, so the AVIF cache precondition actually holds for
+  requirements-based installs (including CI) instead of relying on pip
+  happening to pick a new enough version.
+
+### Changed
+- CLI `--json` setup errors (bad arguments, missing `--source`, output
+  directory cannot be created) exit 1 with a message on stderr and no report;
+  documented in the README alongside the schema.
+- README CLI flag list separators normalized to plain hyphens; documented the
+  cache eviction grace, the AVIF/Pillow precondition, the temp-file sweep and
+  glob edge cases (`drafts/*` for directories, `./`-prefixed and absolute
+  patterns never match).
+- `build_exe.py` now builds on macOS and Linux as well as Windows (path
+  separator, binary names and icon handling are per platform). A missing
+  encoder is reported up front instead of failing inside PyInstaller; pass
+  `--allow-missing` to build without it.
+- Smaller executable. The build now excludes modules the app never uses
+  (build tooling, unused stdlib corners, and optional extras such as
+  `yaml`/`uvloop`/`httptools` that PyInstaller used to pick up whenever they
+  happened to be installed in the build environment) and strips symbols on
+  Linux. Measured on Linux: 22.2 MB -> 19.5 MB, and a build from a venv with
+  extra packages installed is now the same size as one from a clean venv.
+- **No third-party binaries are redistributed.** `pngquant` is
+  GPL-3.0-or-later, so bundling its `.exe` from PyPI would have put GPLv3 §6's
+  source-offer obligation on every downstream user. Downloading the unmodified
+  upstream release instead keeps the package MIT-clean and avoids shipping
+  per-architecture blobs in a platform-independent wheel. (The Windows
+  standalone exe still bundles them, unchanged, under their own licenses.)
+- Internal package renamed `app` → `image_optimizer`; entry point is now
+  `image_optimizer.main:main`, `python -m image_optimizer` replaces `python -m
+  app` (the old spelling no longer exists).
 
 ## [1.0.4] - 2026-08-19
 

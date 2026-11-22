@@ -7,18 +7,34 @@ import shutil
 import struct
 import subprocess
 import sys
+import threading
 import zlib
 from pathlib import Path
 from typing import Callable, Optional
 
 from PIL import Image, ImageOps
 
+from image_optimizer import binaries
+
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 HEX_COLOR_RE = re.compile(r"^#?[0-9A-Fa-f]{6}$")
 
-# EXIF tag ids used by the retention logic (see OPTIMIZATION_PLAN.md §1).
-# Orientation is stripped because `exif_transpose` already bakes it into
-# the pixel grid — re-writing it would double-rotate in any reader that
+# How long a single pngquant/oxipng/cjpeg/avifenc invocation is allowed to
+# run before it's treated as hung rather than legitimately slow. Generous
+# enough for a large image on slow storage; a compression call for one
+# file still running past this is far more likely stuck (malformed input,
+# a bug in the binary, a stalled network drive) than working. Mirrors the
+# timeout already used for the much cheaper `where`/`which` binary lookup
+# in _find_binary.
+SUBPROCESS_TIMEOUT = 120
+
+# After a timed-out encoder is killed, how long to wait for it to be reaped
+# before giving up on it (see Optimizer._kill_and_reap).
+REAP_TIMEOUT = 2.0
+
+# EXIF tag ids used by the retention logic below. Orientation is stripped
+# because `exif_transpose` already bakes it into the pixel grid — re-writing
+# it would double-rotate in any reader that
 # honors EXIF orientation. GPSInfo is dropped for privacy (images may be
 # publicly shared). MakerNote is vendor-specific bulk with no display value.
 EXIF_TAG_ORIENTATION = 0x0112
@@ -29,16 +45,34 @@ EXIF_TAG_MAKER_NOTE = 0x927C
 
 class Optimizer:
     def __init__(self, bin_dir: Optional[Path] = None, max_concurrency: int = 4):
+        # Searched in order, after PATH. The per-user data directory is where
+        # binaries fetched on first run land (see binaries.py); the repo's own
+        # bin/ stays last so an existing source checkout / dev workflow that
+        # drops the .exe next to the code keeps working unchanged.
         if bin_dir:
-            self.bin_dir = Path(bin_dir)
+            self._bin_dirs = [Path(bin_dir)]
         elif getattr(sys, "frozen", False):
-            self.bin_dir = Path(sys._MEIPASS) / "bin"
+            self._bin_dirs = [Path(sys._MEIPASS) / "bin"]
         else:
-            self.bin_dir = Path(__file__).resolve().parent.parent / "bin"
+            self._bin_dirs = [
+                binaries.binary_dir(),
+                Path(__file__).resolve().parent.parent / "bin",
+            ]
+        # Kept as the headline location for logging; _bin_dirs is authoritative.
+        self.bin_dir = self._bin_dirs[0]
         self.pngquant_path: Optional[Path] = None
         self.oxipng_path: Optional[Path] = None
         self.cjpeg_path: Optional[Path] = None
         self.avifenc_path: Optional[Path] = None
+        # Guards _detect_binaries: it's called once here (main thread) and
+        # again on every /api/health request via asyncio.to_thread (see
+        # image_optimizer/main.py), each on its own thread-pool thread. A real
+        # threading.Lock (not asyncio.Lock, which doesn't coordinate across
+        # OS threads) keeps two overlapping detections from interleaving
+        # their writes to the four *_path attributes below, which a reader
+        # building a /api/health response from those same attributes could
+        # otherwise observe half-updated.
+        self._detect_lock = threading.Lock()
         self._detect_binaries()
         self._semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
@@ -115,19 +149,133 @@ class Optimizer:
         except Exception:
             pass
         exe_name = f"{name}.exe" if sys.platform == "win32" else name
-        local = self.bin_dir / exe_name
-        if local.exists():
-            return local.resolve()
+        for directory in self._bin_dirs:
+            local = directory / exe_name
+            if local.exists():
+                return local.resolve()
         return None
 
+    @staticmethod
+    async def _communicate_with_timeout(
+        proc: "asyncio.subprocess.Process", timeout: Optional[float] = None
+    ) -> tuple[bytes, bytes, bool]:
+        """await proc.communicate() with a timeout, so a hung external
+        binary (malformed input, a bug in the tool itself, a stalled
+        network drive) fails just the one file being processed instead of
+        blocking its worker -- and the concurrency-limiting semaphore slot
+        it holds -- forever. On timeout the process is killed and reaped
+        (so it doesn't linger as a zombie), and a synthetic stderr message
+        is returned so every call site's existing
+        `if <output missing/returncode != 0>: msg = stderr.decode()` error
+        path picks this up exactly like any other subprocess failure, with
+        no extra branching needed at each of the four call sites.
+
+        On cancellation (e.g. the user hits Cancel): wait_for propagates
+        CancelledError the same as a bare communicate() would, so existing
+        cancel handling is unaffected -- but the child is now also killed
+        on the way out. Without this, cancelling unblocks the *worker*
+        (the await raises) but never signals the child process itself,
+        which would otherwise keep running as an orphan in the background.
+
+        The third element of the return value, `timed_out`, lets callers
+        remove any partial file the binary may have left at its own
+        output path before checking whether that path exists -- a killed
+        process can leave a non-empty but truncated/corrupt file there,
+        which an exists()-only (or exists()-and-size>0) check can't tell
+        apart from a completed one.
+
+        `timeout=None` reads the module global SUBPROCESS_TIMEOUT lazily at
+        call time rather than as a Python default argument value (which
+        would freeze whatever it was at class-definition time) -- same
+        reasoning as CONCURRENT_WORKERS in main.py's _run_worker_pool, and
+        what lets tests shrink this to something fast without threading an
+        explicit timeout through optimize_png/optimize_jpeg/optimize_webp/
+        optimize_avif.
+
+        Returns (stdout, stderr, timed_out)."""
+        if timeout is None:
+            timeout = SUBPROCESS_TIMEOUT
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            return stdout, stderr, False
+        except asyncio.TimeoutError:
+            await Optimizer._kill_and_reap(proc)
+            return b"", f"timed out after {timeout:g}s (process killed)".encode(), True
+        except asyncio.CancelledError:
+            await Optimizer._kill_and_reap(proc)
+            raise
+
+    @staticmethod
+    async def _kill_and_reap(proc: "asyncio.subprocess.Process") -> None:
+        """Force-terminate a subprocess and wait (briefly) for it to exit,
+        so it's neither left running as an orphan nor left as a zombie.
+        The wait is bounded by REAP_TIMEOUT: this is best effort, not a
+        guarantee, and it says so on stderr when it gives up.
+
+        kill() reaches only the process we started. If that process had
+        spawned a descendant (a .bat/.cmd or shim wrapper on Windows, a
+        shell wrapper without `exec`), the descendant survives and keeps
+        the stdout/stderr pipes open. On Python releases without the
+        gh-119710 fix proc.wait() does not resolve until those pipes close
+        -- asyncio wakes the waiters from _call_connection_lost, which needs
+        every pipe disconnected; gh-119710 also wakes them from
+        _process_exited -- so an unbounded wait here blocked the worker (and
+        its semaphore slot) for as long as the descendant lived, which
+        defeated the point of the timeout. Measured: 3.11.18 and 3.12.3
+        block, 3.13.18 does not (patch-release dependent).
+
+        Giving up on the wait is safe: asyncio records the exit status
+        (and reaps the child) before the pipes can block wait(), so what
+        survives the timeout is a bookkeeping orphan, not a running
+        process.
+
+        The pipes are closed on every path, not just the one that gave up.
+        A survivor keeps them open either way: when wait() resolves without
+        the pipes closing (gh-119710 wakes it from _process_exited) the
+        abandoned transport is still finalized after the event loop is
+        closed and logs "Event loop is closed" / "I/O operation on closed
+        pipe". Closing goes through the transport's private handle, best
+        effort, because asyncio has no public way to do it."""
+        try:
+            proc.kill()
+        except OSError:
+            # ProcessLookupError (already gone) is the common case, but
+            # Windows can also refuse with PermissionError, and letting
+            # that escape would replace the caller's "timed out" result
+            # with an exception, skipping the encoder fallback path.
+            pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=REAP_TIMEOUT)
+        except asyncio.TimeoutError:
+            status = getattr(proc, "returncode", None)
+            print(
+                f"[Warning] killed encoder pid {getattr(proc, 'pid', '?')} was not "
+                f"reaped within {REAP_TIMEOUT:g}s "
+                f"(exit status {'unknown' if status is None else status}); "
+                f"abandoning the wait",
+                file=sys.stderr,
+            )
+        except Exception:
+            pass
+        transport = getattr(proc, "_transport", None)
+        if transport is not None:
+            try:
+                transport.close()
+            except Exception:
+                pass
+
     def _detect_binaries(self):
-        self.pngquant_path = self._find_binary("pngquant")
-        self.oxipng_path = self._find_binary("oxipng")
-        # mozjpeg releases/prebuilt zip files name the encoder either
-        # `cjpeg` or `cjpeg-static` (the static variant shipped by several
-        # Windows/AiZ builds) — try both spellings so either is picked up.
-        self.cjpeg_path = self._find_binary_any(["cjpeg", "cjpeg-static"])
-        self.avifenc_path = self._find_binary("avifenc")
+        # See the comment on self._detect_lock in __init__: two concurrent
+        # /api/health requests must not run this body at the same time.
+        with self._detect_lock:
+            self.pngquant_path = self._find_binary("pngquant")
+            self.oxipng_path = self._find_binary("oxipng")
+            # mozjpeg releases/prebuilt zip files name the encoder either
+            # `cjpeg` or `cjpeg-static` (the static variant shipped by
+            # several Windows/AiZ builds) — try both spellings so either is
+            # picked up.
+            self.cjpeg_path = self._find_binary_any(["cjpeg", "cjpeg-static"])
+            self.avifenc_path = self._find_binary("avifenc")
 
     def _find_binary_any(self, names: list[str]) -> Optional[Path]:
         for name in names:
@@ -368,7 +516,7 @@ class Optimizer:
         img.save(dst, format="PNG")
         return True
 
-    # --- EXIF retention helpers (see OPTIMIZATION_PLAN.md §1) ---
+    # --- EXIF retention helpers ---
     @staticmethod
     def _clean_exif(exif) -> None:
         """Strip EXIF fields that must NOT survive into optimized output.
@@ -381,6 +529,17 @@ class Optimizer:
         - MakerNote: vendor-specific bulk, no display value.
         """
         exif.pop(EXIF_TAG_ORIENTATION, None)
+        # get_ifd() caches the GPS sub-IFD on the Exif object. On Pillow 11.x,
+        # popping the GPSInfo pointer alone leaves that cached IFD behind, and
+        # tobytes() writes it back out if anything read it first. Empty it
+        # before dropping the pointer so this holds whatever touched the
+        # object earlier. Only when the tag is present: asking for a missing
+        # IFD would create an empty one that Pillow could serialize.
+        if EXIF_TAG_GPS_INFO in exif:
+            try:
+                exif.get_ifd(EXIF_TAG_GPS_INFO).clear()
+            except Exception:
+                pass
         exif.pop(EXIF_TAG_GPS_INFO, None)
         try:
             exif.get_ifd(EXIF_TAG_EXIF_IFD).pop(EXIF_TAG_MAKER_NOTE, None)
@@ -659,7 +818,17 @@ class Optimizer:
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
-                    _, stderr = await proc.communicate()
+                    _, stderr, timed_out = await self._communicate_with_timeout(proc)
+
+                if timed_out:
+                    # A killed pngquant can leave a partial file at its own
+                    # --output path mid-write; remove it so the exists()
+                    # check below can't mistake a truncated PNG for a
+                    # completed quantization pass.
+                    try:
+                        pngquant_tmp.unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
                 if pngquant_tmp.exists():
                     working_path = pngquant_tmp
@@ -725,7 +894,15 @@ class Optimizer:
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
-                    await proc.communicate()
+                    _, stderr, timed_out = await self._communicate_with_timeout(proc)
+
+                if timed_out:
+                    # Same partial-write hazard as pngquant above: a killed
+                    # oxipng can leave a truncated file at --out.
+                    try:
+                        oxipng_tmp.unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
                 if oxipng_tmp.exists():
                     # Registered as a temp BEFORE the replace: if replace()
@@ -735,6 +912,19 @@ class Optimizer:
                     temp_files.append(oxipng_tmp)
                     oxipng_tmp.replace(output_path)
                 else:
+                    # Unlike pngquant above, a failed oxipng pass (timeout,
+                    # non-zero exit, or anything else that left no --out
+                    # file) previously fell through to this copy with no
+                    # signal at all -- stdout/stderr weren't even captured.
+                    # The file still came out compressed (via whatever
+                    # pngquant/normalization already produced), but
+                    # oxipng's own depth-compression pass was silently
+                    # skipped. Surface it the same way pngquant already
+                    # does above.
+                    msg = stderr.decode().strip()
+                    if progress_callback:
+                        await progress_callback(f"oxipng: {msg or 'skipped'} (skipped)")
+                    result["warning"] = msg or "oxipng produced no output"
                     shutil.copy2(working_path, output_path)
             else:
                 if working_path != output_path:
@@ -961,7 +1151,14 @@ class Optimizer:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                _, stderr = await proc.communicate()
+                _, stderr, timed_out = await self._communicate_with_timeout(proc)
+
+            if timed_out:
+                # Killed cjpeg can leave a partial file at -outfile.
+                try:
+                    tmp_jpg.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
             if tmp_jpg.exists():
                 if keep_exif and cleaned_exif:
@@ -1141,7 +1338,16 @@ class Optimizer:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                _, stderr = await proc.communicate()
+                _, stderr, timed_out = await self._communicate_with_timeout(proc)
+
+            if timed_out:
+                # Killed avifenc can leave a partial file at -o; the
+                # size>0 check below isn't enough on its own to catch a
+                # truncated-but-nonempty AVIF bitstream.
+                try:
+                    tmp_avif.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
             if tmp_avif.exists() and tmp_avif.stat().st_size > 0:
                 tmp_avif.replace(output_path)
