@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import hashlib
+import ipaddress
 import json
 import os
 import secrets
@@ -15,6 +16,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Awaitable, Callable, List, Optional
+from urllib.parse import urlsplit
 from zipfile import ZipFile
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, Request
@@ -563,6 +565,76 @@ async def session_cookie_middleware(request: Request, call_next):
             SESSION_COOKIE, new_sid, httponly=True, samesite="lax", max_age=SESSION_IDLE_TIMEOUT
         )
     return response
+
+
+# Hostname the server was told to bind to (--host / config.json "host"), set
+# by main(). A real hostname given there is trusted as a Host header value.
+_BOUND_HOST: Optional[str] = None
+
+_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+def _split_host(value: str) -> Optional[str]:
+    """Lower-cased hostname of a Host header / origin netloc (port and IPv6
+    brackets removed), or None if it does not parse."""
+    try:
+        host = urlsplit("//" + value.strip()).hostname
+    except ValueError:
+        return None
+    return host.lower() if host else None
+
+
+def _host_allowed(host_header: str) -> bool:
+    """DNS-rebinding defence. A rebinding page reaches this server under its
+    own *hostname*, so accept only: loopback names (localhost, *.localhost),
+    any IP literal (a hostname is what an attacker controls, an address
+    typed or bound by the user is not), the hostname the server was bound
+    to, and names the operator lists in IMAGE_OPTIMIZER_ALLOWED_HOSTS
+    (comma separated) for LAN use under a DNS name."""
+    host = _split_host(host_header or "")
+    if host is None:
+        return False
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    extra = {h.strip().lower() for h in os.environ.get("IMAGE_OPTIMIZER_ALLOWED_HOSTS", "").split(",") if h.strip()}
+    if _BOUND_HOST:
+        extra.add(_BOUND_HOST.strip().lower())
+    return host in extra
+
+
+@app.middleware("http")
+async def host_and_origin_middleware(request: Request, call_next):
+    """Runs before everything else (defined after the session middleware, so
+    it is the outermost layer): no session is created and no token is served
+    for a request that fails.
+
+    1. Host must pass _host_allowed (DNS rebinding).
+    2. A state-changing request that declares itself cross-site is refused:
+       Sec-Fetch-Site other than same-origin/none, or an Origin whose host
+       differs from the Host header. Requests without these headers (curl,
+       scripts, tests) are unaffected - they still need the app token."""
+    if not _host_allowed(request.headers.get("host", "")):
+        return JSONResponse({"error": "Invalid Host header"}, status_code=400)
+    if request.method not in _SAFE_METHODS:
+        site = request.headers.get("sec-fetch-site")
+        if site is not None and site not in ("same-origin", "none"):
+            return JSONResponse({"error": "Cross-site request refused"}, status_code=403)
+        origin = request.headers.get("origin")
+        if origin is not None and origin != "null":
+            try:
+                origin_netloc = urlsplit(origin).netloc.lower()
+            except ValueError:
+                origin_netloc = ""
+            if origin_netloc != request.headers.get("host", "").strip().lower():
+                return JSONResponse({"error": "Cross-site request refused"}, status_code=403)
+        elif origin == "null":
+            return JSONResponse({"error": "Cross-site request refused"}, status_code=403)
+    return await call_next(request)
 
 
 def _gen_thumbnail(src: Path, dst: Path, max_size: int = 200):
@@ -4015,6 +4087,8 @@ def main():
             f"network you fully trust."
         )
 
+    global _BOUND_HOST
+    _BOUND_HOST = args.host
     import uvicorn
     uvicorn.run(app, host=args.host, port=port, reload=False)
 

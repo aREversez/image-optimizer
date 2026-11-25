@@ -193,7 +193,7 @@ def app_module(optimizer):
 def client(app_module, optimizer):
     import image_optimizer.main as m
     from fastapi.testclient import TestClient
-    with TestClient(app_module.app) as c:
+    with TestClient(app_module.app, base_url="http://127.0.0.1:8090") as c:
         # TestClient.__enter__ runs the lifespan, and the lifespan re-creates
         # the module-global `optimizer` from auto-detection (`Optimizer(...)`)
         # — clobbering the fixture's fake-binary assignment done in app_module.

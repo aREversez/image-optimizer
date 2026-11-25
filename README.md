@@ -273,6 +273,16 @@ you specify as the output folder — fine for local, single-user use, but
 trust everyone on that network, since there's nothing stopping them from
 reading or writing files on your machine through it.
 
+To stop a malicious web page from reaching the local server through DNS
+rebinding, the server refuses requests whose `Host` header is not a loopback
+name (`localhost`), an IP address, or the host you started it with, and it
+refuses state-changing requests that the browser marks as cross-site. If you
+deliberately reach the app under another DNS name (a LAN hostname, a reverse
+proxy), list it in the `IMAGE_OPTIMIZER_ALLOWED_HOSTS` environment variable
+(comma separated, e.g. `mybox.lan,tools.example.com`). A proxy must also pass
+the original `Host` header through, or the same-origin check will reject the
+page's own requests.
+
 ## Requirements
 
 - **pip install:** Python 3.10+ (dependencies are pulled in automatically)
