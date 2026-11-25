@@ -3622,12 +3622,16 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
                 records[img_path] = fail_record(img_path, error)
             log(f"[{d}/{total}] FAIL {rel}: {error}")
             return
+        # Everything is written to a staging file next to the destination
+        # and only renamed into place once the whole result is known good,
+        # so a kill or a failure never leaves a partial file at out_path.
+        staged = persistence.staging_path(out_path)
         cache_key = None
         cached_hit = False
         result = None
         if cache is not None:
             try:
-                probe = await asyncio.to_thread(cache.probe, img_path, out_path)
+                probe = await asyncio.to_thread(cache.probe, img_path, staged)
             except OSError:
                 # Unreadable input or cache I/O trouble: fall through to the
                 # normal pipeline, which reports a real input error itself.
@@ -3642,7 +3646,7 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
                     }
         if result is None:
             result = await optimizer.optimize_png(
-                img_path, out_path,
+                img_path, staged,
                 quality=args.quality, max_width=args.max_width, compression_mode=args.mode,
                 protected_colors=protected_colors, dithering=args.dithering,
                 output_format=args.format, keep_exif=args.keep_exif,
@@ -3650,10 +3654,20 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
             if cache is not None and cache_key is not None and result["success"]:
                 try:
                     protected_entries.add(
-                        await asyncio.to_thread(cache.store, cache_key, out_path)
+                        await asyncio.to_thread(cache.store, cache_key, staged)
                     )
                 except OSError as e:
                     print(f"[Warning] cache write failed for {rel}: {e}", file=sys.stderr)
+        if result["success"]:
+            try:
+                await asyncio.to_thread(persistence.commit_staged, staged, out_path)
+            except OSError as e:
+                result = {
+                    "success": False, "original_size": result.get("original_size"),
+                    "compressed_size": None, "error": f"cannot write {out_path}: {e}",
+                }
+        else:
+            persistence.discard(staged)
         async with lock:
             counters["done"] += 1
             d = counters["done"]
