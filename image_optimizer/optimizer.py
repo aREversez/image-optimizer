@@ -471,6 +471,16 @@ class Optimizer:
             pass
 
     @staticmethod
+    def _frame_count(path: Path) -> int:
+        """Number of frames/pages in the file; 1 when it cannot be read (the
+        normal pipeline then reports the real decode error)."""
+        try:
+            with Image.open(path) as img:
+                return int(getattr(img, "n_frames", 1) or 1)
+        except Exception:
+            return 1
+
+    @staticmethod
     def _ensure_png(src: Path, dst: Path):
         """Re-encode any Pillow-readable image (jpg/bmp/tiff/...) into a real PNG.
 
@@ -668,6 +678,23 @@ class Optimizer:
     ) -> dict:
         if compression_mode not in ("standard", "lossless", "resize_only", "screenshot"):
             compression_mode = "standard"
+
+        # Refuse inputs the pipeline cannot represent. Pillow decodes only the
+        # first frame, so an animated WebP/GIF/APNG or a multi-page TIFF would
+        # otherwise be flattened to one frame and reported as a success.
+        frames = await asyncio.get_running_loop().run_in_executor(None, self._frame_count, input_path)
+        if frames > 1:
+            size = os.path.getsize(input_path)
+            return {
+                "success": False,
+                "original_size": size,
+                "compressed_size": size,
+                "error": (
+                    f"animated or multi-page image ({frames} frames): not supported, "
+                    "left untouched to avoid dropping frames"
+                ),
+                "warning": None,
+            }
 
         # Capture a cleaned EXIF copy from the source up front (before any
         # pipeline step that strips/transposes it). Attached to the output
