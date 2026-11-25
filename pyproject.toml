@@ -30,7 +30,6 @@ classifiers = [
 dependencies = [
     "fastapi>=0.104.0",
     "uvicorn>=0.24.0",
-    "jinja2>=3.1.2",
     # >=11.3 for AVIF read support: the CLI cache (and the GUI's skip_existing)
     # validate AVIF output files by opening them with Pillow, so a build
     # without AVIF support can never serve an AVIF cache hit.
