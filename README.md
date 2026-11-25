@@ -134,6 +134,7 @@ version" of the logic to drift out of sync, so the same `--quality`/
 - `--cache-dir PATH` - enable the content-hash result cache (see below); default: no cache
 - `--cache-max-size-mb N` - cache size cap, enforced after each run by evicting least-recently-used entries (default `1024`, `0` = unlimited)
 - `--exclude GLOB` / `--include GLOB` - filter which files are processed; repeatable (see below)
+- `--strict` - exit `1` when the run produced any warning, not only on failures (for CI and unattended runs)
 - `--json` - print the final report as one JSON object on stdout (see below)
 
 Output mirrors the source folder's directory structure. Name collisions
@@ -188,17 +189,18 @@ image-optimizer --source ./raw --output ./out --json | jq .summary
 
 ```json
 {
+  "warnings": [],
   "files": [
     {"rel": "icons/a.png", "output_name": "a.png", "original_size": 20480,
-     "compressed_size": 5120, "status": "compressed", "error": null}
+     "compressed_size": 5120, "status": "compressed", "error": null, "warnings": []}
   ],
   "summary": {"total": 1, "compressed": 1, "cached": 0, "excluded": 0, "failed": 0,
-              "kept_original": 0, "original_size": 20480, "compressed_size": 5120,
-              "saved_percent": 75.0}
+              "kept_original": 0, "warned": 0, "original_size": 20480,
+              "compressed_size": 5120, "saved_percent": 75.0}
 }
 ```
 
-`status` is one of `compressed`, `cached` (served from `--cache-dir`), `kept_original` (the result was not smaller, so the original's pixels were kept with metadata stripped), `excluded` or `failed`. Size totals and `saved_percent` cover the successful statuses; `total` counts every scanned file, excluded ones included. The exit code is unchanged: `1` only if a file failed. Setup errors (bad arguments, missing `--source`, an `--output` directory that cannot be created) exit `1` with a message on stderr and no JSON.
+`status` is one of `compressed`, `cached` (served from `--cache-dir`), `kept_original` (the result was not smaller, so the original's pixels were kept with metadata stripped), `excluded` or `failed`. Size totals and `saved_percent` cover the successful statuses; `total` counts every scanned file, excluded ones included. `warnings` (top level) lists run-level problems such as a missing encoder that downgrades the requested mode (for example only `oxipng` installed, so `--mode standard` is lossless-only); each file's `warnings` carries what the optimizer reported for that file, and `summary.warned` counts files with any. The exit code is `1` only if a file failed, or, with `--strict`, if the run produced any warning. Setup errors (bad arguments, missing `--source`, an `--output` directory that cannot be created) exit `1` with a message on stderr and no JSON.
 
 ## Configuration
 

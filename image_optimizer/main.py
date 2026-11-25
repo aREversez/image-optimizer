@@ -1380,18 +1380,8 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
     # their files barely shrank. JPEG without cjpeg fails outright per-file,
     # so warn before any work starts. available_modes() is the source of
     # truth.
-    warning = None
-    if optimizer is not None and (data.output_format, data.compression_mode) not in optimizer.available_modes():
-        if data.output_format in ("jpg", "jpeg"):
-            warning = (
-                "cjpeg (mozjpeg) not found — JPEG output isn't possible. Place cjpeg in the "
-                "bin/ directory (or PATH) to compress JPEGs while keeping the JPEG format."
-            )
-        else:
-            warning = (
-                "pngquant not found — Standard mode PNG output falls back to lossless-only "
-                "compression (larger files). Place pngquant in the bin/ directory for full compression."
-            )
+    warning = _mode_degradation_warning(optimizer, data.output_format, data.compression_mode)
+    if warning:
         state.logs.append(f"[Warning] {warning}")
 
     asyncio.create_task(
@@ -1516,6 +1506,28 @@ def _validate_overrides(
             if eff_mode == "screenshot" and eff_format != "png":
                 return f"Screenshot mode is PNG-only (override for file {fid!r})"
     return None
+
+
+def _mode_degradation_warning(opt: Optional["Optimizer"], output_format: str, mode: str) -> Optional[str]:
+    """Why (output_format, mode) cannot run at full strength with the
+    encoders found, or None. available_modes() is the source of truth; the
+    web batch and the CLI both call this so the wording cannot drift."""
+    if opt is None or (output_format, mode) in opt.available_modes():
+        return None
+    if output_format in ("jpg", "jpeg"):
+        return (
+            "cjpeg (mozjpeg) not found — JPEG output isn't possible. Place cjpeg in the "
+            "bin/ directory (or PATH) to compress JPEGs while keeping the JPEG format."
+        )
+    if output_format == "avif":
+        return (
+            "avifenc (libavif) not found — AVIF output isn't possible. Place avifenc in the "
+            "bin/ directory (or PATH) to produce AVIF."
+        )
+    return (
+        "pngquant not found — Standard mode PNG output falls back to lossless-only "
+        "compression (larger files). Place pngquant in the bin/ directory for full compression."
+    )
 
 
 def _dest_is_original(dest: Path, source: Path) -> bool:
@@ -3434,12 +3446,14 @@ def _matches_globs(rel_path: str, patterns: List[str]) -> bool:
 _CLI_SUCCESS_STATUSES = ("compressed", "cached", "kept_original")
 
 
-def _build_cli_report(files: list) -> dict:
+def _build_cli_report(files: list, run_warnings: Optional[list] = None) -> dict:
     """Machine-readable result of a CLI run (--json). `files` holds one record
     per scanned file; statuses are mutually exclusive: compressed, cached,
     kept_original (growth-guard fallback), excluded, failed. Size totals and
     saved_percent cover the successful statuses only. `total` counts every
-    scanned file, excluded ones included."""
+    scanned file, excluded ones included. `warnings` lists run-level warnings
+    (e.g. a missing encoder that downgrades the requested mode); each file
+    record has its own `warnings` list (empty when there is nothing to say)."""
     counts = {"compressed": 0, "cached": 0, "excluded": 0, "failed": 0, "kept_original": 0}
     orig = comp = 0
     for f in files:
@@ -3448,6 +3462,7 @@ def _build_cli_report(files: list) -> dict:
             orig += f["original_size"]
             comp += f["compressed_size"]
     return {
+        "warnings": list(run_warnings or []),
         "files": files,
         "summary": {
             "total": len(files),
@@ -3456,6 +3471,7 @@ def _build_cli_report(files: list) -> dict:
             "excluded": counts["excluded"],
             "failed": counts["failed"],
             "kept_original": counts["kept_original"],
+            "warned": sum(1 for f in files if f.get("warnings")),
             "original_size": orig,
             "compressed_size": comp,
             "saved_percent": round((1 - comp / orig) * 100, 1) if orig > 0 else 0,
@@ -3490,11 +3506,13 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
     def log(*parts) -> None:
         print(*parts, file=log_stream)
 
+    run_warnings: list = []
+
     def emit_report(files: list) -> None:
         if as_json:
             # ensure_ascii (the default) keeps stdout valid on any console
             # encoding even when file names are not ASCII.
-            print(json.dumps(_build_cli_report(files), indent=2))
+            print(json.dumps(_build_cli_report(files, run_warnings), indent=2))
             sys.stdout.flush()
 
     source = Path(args.source).resolve()
@@ -3555,7 +3573,7 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
                 excluded_size = None
             records[p] = {
                 "rel": rel_posix, "output_name": None, "original_size": excluded_size,
-                "compressed_size": None, "status": "excluded", "error": None,
+                "compressed_size": None, "status": "excluded", "error": None, "warnings": [],
             }
             continue
         images.append(p)
@@ -3634,6 +3652,10 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
 
     global optimizer
     optimizer = optimizer_instance or Optimizer(max_concurrency=CONCURRENT_WORKERS)
+    mode_warning = _mode_degradation_warning(optimizer, args.format, args.mode)
+    if mode_warning:
+        run_warnings.append(mode_warning)
+        log(f"[Warning] {mode_warning}")
     if not optimizer.pngquant_path and not optimizer.oxipng_path and args.format == "png":
         log(
             "[Warning] Neither pngquant nor oxipng found in bin/ — PNG results will be much "
@@ -3673,6 +3695,7 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
             "compressed_size": None,
             "status": "failed",
             "error": error,
+            "warnings": [],
         }
 
     async def process(idx: int, img_path: Path):
@@ -3772,12 +3795,18 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
                         else "cached" if cached_hit else "compressed"
                     ),
                     "error": None,
+                    # A non-fatal problem the optimizer reported (encoder
+                    # refused the quality floor, fell back, ...): the file
+                    # was written but not at the requested strength.
+                    "warnings": [result["warning"]] if result.get("warning") else [],
                 }
                 log(
                     f"[{d}/{total}] {'HIT ' if cached_hit else 'OK  '} {rel} -> {out_path.name}  "
                     f"{_fmt_size(result['original_size'])} -> {_fmt_size(result['compressed_size'])} "
                     f"({pct}% saved)"
                 )
+                if result.get("warning"):
+                    log(f"[Warning] {rel}: {result['warning']}")
             else:
                 counters["failed"] += 1
                 records[img_path] = fail_record(
@@ -3839,7 +3868,14 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
         saved_pct = round((1 - counters["comp"] / counters["orig"]) * 100, 1)
         log(f"Total: {_fmt_size(counters['orig'])} -> {_fmt_size(counters['comp'])} ({saved_pct}% saved)")
     emit_report([records[p] for p in scanned])
-    return 1 if counters["failed"] > 0 else 0
+    if counters["failed"] > 0:
+        return 1
+    if getattr(args, "strict", False) and (
+        run_warnings or any(r.get("warnings") for r in records.values())
+    ):
+        log("[Error] --strict: exiting 1 because the run produced warnings (see above)")
+        return 1
+    return 0
 
 
 def _download_enabled() -> bool:
@@ -3985,6 +4021,12 @@ def main():
         "--include", action="append", default=[], metavar="GLOB",
         help="Only process files matching at least one of these globs; repeatable. Same "
              "matching rules as --exclude, which is applied afterwards and takes priority.",
+    )
+    cli_group.add_argument(
+        "--strict", action="store_true",
+        help="Exit 1 when the run produced any warning (a missing encoder that downgrades the "
+             "requested mode, or a per-file warning), not only on failures. For CI and "
+             "unattended runs that must not silently produce weaker output.",
     )
     cli_group.add_argument(
         "--json", action="store_true",

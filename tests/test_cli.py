@@ -220,7 +220,7 @@ class TestCliJson:
         self._run(app_module, optimizer, src, tmp_path / "out", exclude=["skip.png"])
         cap = capsys.readouterr()
         report = json.loads(cap.out)  # raises if anything else is on stdout
-        assert set(report) == {"files", "summary"}
+        assert set(report) == {"files", "summary", "warnings"}
         assert "Done:" in cap.err and "[1/" in cap.err
         assert "Done:" not in cap.out
 
@@ -230,7 +230,7 @@ class TestCliJson:
         assert code == 1  # bad.png failed; excluded must not count
         files = {f["rel"]: f for f in json.loads(capsys.readouterr().out)["files"]}
         assert set(files) == {"conv.jpg", "sub/same.png", "bad.png", "skip.png"}
-        assert all(set(f) == {"rel", "output_name", "original_size", "compressed_size", "status", "error"}
+        assert all(set(f) == {"rel", "output_name", "original_size", "compressed_size", "status", "error", "warnings"}
                    for f in files.values())
 
         assert files["conv.jpg"]["status"] == "compressed"
