@@ -3064,11 +3064,13 @@ async def put_settings(
         elif key == "session_idle_timeout_hours":
             try:
                 h = float(value)
-                if h < 0:
+                # > 0, matching _load_app_config: it treats <= 0 as invalid
+                # and silently falls back to the default on the next start.
+                if h <= 0:
                     raise ValueError()
             except (TypeError, ValueError):
                 return JSONResponse(
-                    {"error": f"Invalid {key}: {value!r}. Must be a non-negative number."},
+                    {"error": f"Invalid {key}: {value!r}. Must be a positive number."},
                     status_code=400,
                 )
             cfg[key] = h
