@@ -3957,7 +3957,7 @@ def main():
     )
     cli_group.add_argument(
         "--max-width", type=int, default=0,
-        help="Resize so the longest side is at most this many pixels (default 0 = no resize). "
+        help="Resize so the width is at most this many pixels, keeping the aspect ratio; height is not limited (default 0 = no resize). "
              "Required (> 0) when --mode resize_only.",
     )
     cli_group.add_argument(

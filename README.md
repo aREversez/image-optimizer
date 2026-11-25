@@ -125,7 +125,7 @@ version" of the logic to drift out of sync, so the same `--quality`/
 - `--quality {high,medium,low}` - Standard/Screenshot mode color-quality floor (default `medium`)
 - `--format {png,jpg,webp,avif}` - output format (default `png`)
 - `--mode {standard,lossless,resize_only,screenshot}` - compression mode (default `standard`; `screenshot` is PNG-only)
-- `--max-width <int>` - resize so the longest side is at most this many pixels (default `0` = no resize; required `> 0` with `--mode resize_only`)
+- `--max-width <int>` - resize so the width is at most this many pixels (aspect ratio kept, height is not limited) (default `0` = no resize; required `> 0` with `--mode resize_only`)
 - `--dithering` / `--no-dithering` - dithering for Standard-mode PNG quantization (default enabled)
 - `--protect-colors "#2ecc71,#ff0000"` - hex colors to prioritize keeping exact in Standard mode's palette
 - `--keep-exif` - keep a curated subset of EXIF (camera make/model, date, exposure); GPS and orientation are always stripped regardless (default: strip all EXIF)

@@ -43,6 +43,18 @@ EXIF_TAG_EXIF_IFD = 0x8769
 EXIF_TAG_MAKER_NOTE = 0x927C
 
 
+def fit_width(size: tuple[int, int], max_width: int):
+    """Size to resize to so the width is at most max_width (aspect ratio
+    kept), or None when no resize is needed. Only the width is limited: a
+    tall portrait is left alone. The height is clamped to >= 1 so an extreme
+    panorama (5000x1 -> 100 wide) does not collapse to height 0, which Pillow
+    rejects. Single source for every output path."""
+    w, h = size
+    if max_width <= 0 or w <= max_width:
+        return None
+    return (max_width, max(1, int(h * (max_width / w))))
+
+
 class Optimizer:
     def __init__(self, bin_dir: Optional[Path] = None, max_concurrency: int = 4):
         # Searched in order, after PATH. The per-user data directory is where
@@ -486,11 +498,9 @@ class Optimizer:
     @staticmethod
     def _resize_image(src: Path, dst: Path, max_width: int):
         with Image.open(src) as img:
-            w, h = img.size
-            if w <= max_width:
+            new_size = fit_width(img.size, max_width)
+            if new_size is None:
                 return
-            ratio = max_width / w
-            new_size = (max_width, int(h * ratio))
             img = img.resize(new_size, Image.Resampling.LANCZOS)
             img.info.pop("exif", None)
             img.save(dst, format="PNG")
@@ -1003,10 +1013,9 @@ class Optimizer:
                         img = img.convert("RGB")
 
                     if max_width > 0:
-                        w, h = img.size
-                        if w > max_width:
-                            ratio = max_width / w
-                            img = img.resize((max_width, int(h * ratio)), Image.Resampling.LANCZOS)
+                        new_size = fit_width(img.size, max_width)
+                        if new_size:
+                            img = img.resize(new_size, Image.Resampling.LANCZOS)
 
                     # Drop any EXIF carried in info so default (keep_exif=False)
                     # WebP output is metadata-free; attach the cleaned copy
@@ -1123,10 +1132,9 @@ class Optimizer:
                         img = bg
 
                     if max_width > 0:
-                        w, h = img.size
-                        if w > max_width:
-                            ratio = max_width / w
-                            img = img.resize((max_width, int(h * ratio)), Image.Resampling.LANCZOS)
+                        new_size = fit_width(img.size, max_width)
+                        if new_size:
+                            img = img.resize(new_size, Image.Resampling.LANCZOS)
 
                     # cjpeg starts fresh from the PPM so metadata can't
                     # survive (matches the keep_exif=False strip-everything
@@ -1299,10 +1307,9 @@ class Optimizer:
                         img = img.convert("RGB")
 
                     if max_width > 0:
-                        w, h = img.size
-                        if w > max_width:
-                            ratio = max_width / w
-                            img = img.resize((max_width, int(h * ratio)), Image.Resampling.LANCZOS)
+                        new_size = fit_width(img.size, max_width)
+                        if new_size:
+                            img = img.resize(new_size, Image.Resampling.LANCZOS)
 
                     img.info.pop("exif", None)
                     img.save(intermediate_path, format="PNG")
