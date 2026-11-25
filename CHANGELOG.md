@@ -2,6 +2,49 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Security
+- The server now validates the `Host` header (loopback names, IP addresses,
+  the bound host, or names in `IMAGE_OPTIMIZER_ALLOWED_HOSTS`) and refuses
+  state-changing requests that the browser marks as cross-site, closing a
+  DNS-rebinding path to the app token and from there to local file read and
+  write.
+
+### Fixed
+- The CLI and the web batch no longer accept an output folder equal to the
+  source folder (originals were replaced) or inside a recursively scanned
+  source (the next run re-compressed its own output). One shared rule now
+  covers CLI, web batch and Watch.
+- A failed copy into the output folder (disk full, read-only share, bad path)
+  is now a failed file that Retry/Resume pick up, not a success with a log
+  line.
+- `skip_existing` reuses an output only for the source that produced it; a
+  new file that shifts the collision numbering no longer inherits another
+  image's result.
+- Watch mode overwrites a re-saved file's own output instead of writing
+  `name_2`, `name_3`, ...
+- Final outputs (CLI, Watch, web copy), batch state, fingerprints, the recent
+  list and config are written through a temp file and renamed, so a crash
+  leaves no partial file or truncated state.
+- Truncated or corrupt JPEG/WebP files are no longer treated as reusable.
+- Animated and multi-page inputs fail with a clear message instead of being
+  flattened to one frame.
+- `--max-width` no longer fails on extreme panoramas (height is clamped to
+  1); its help text now says it limits the width only, which it always did.
+- Resume marks sources that vanished as `missing`, so the Resume banner
+  clears.
+- Thumbnails respect EXIF orientation.
+- `PUT /api/settings` rejects a zero idle timeout, as the config loader does.
+
+### Added
+- CLI: a warning up front when a missing encoder downgrades the requested
+  mode, per-file `warnings` and a top-level `warnings` list in the `--json`
+  report (`summary.warned`), and `--strict` to exit 1 on any warning.
+
+### Removed
+- The unused `jinja2` dependency.
+
 ## [1.1.0] - 2026-11-21
 
 ### Added
