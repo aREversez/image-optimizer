@@ -24,7 +24,7 @@ from PIL import Image, features as pil_features
 if __package__ is None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from image_optimizer import binaries
+from image_optimizer import binaries, planning
 from image_optimizer.cache import (
     CACHEABLE_FORMATS,
     DEFAULT_CACHE_MAX_MB,
@@ -95,6 +95,10 @@ class AppState:
         self.files: list = []
         self.results: list = []
         self.input_dir: Optional[str] = None
+        # Whether the scan that produced input_dir descended into subfolders;
+        # start_optimization needs it to tell a safe nested output folder
+        # (non-recursive scan) from one the next scan would re-read.
+        self.input_recursive: bool = True
         # Persistent output folder of the last run (if any) — recorded by
         # _process_files so /api/reveal can open it without trusting any
         # client-supplied path.
@@ -136,6 +140,7 @@ class AppState:
         self.files = []
         self.results = []
         self.input_dir = None
+        self.input_recursive = True
         self.output_dir = None
         self.is_running = False
         self.current = 0
@@ -1019,6 +1024,7 @@ async def scan_directory(data: ScanRequest, state: AppState = Depends(get_sessio
 
     state.reset()
     state.input_dir = str(directory.resolve())
+    state.input_recursive = data.recursive
     state.new_workspace()
     state.scan_running = True
     state.scan_current = 0
@@ -1208,6 +1214,32 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
         return JSONResponse({"error": "No files to process"}, status_code=400)
 
     if data.output_dir:
+        # Same rule the CLI and Watch apply (planning.output_dir_conflict):
+        # never write into the folder being read, nor into a subfolder of it
+        # that the next recursive scan would pick up again. Skipped on
+        # resume, where input_dir is only the first file's parent folder and
+        # the scan's recursive flag is not persisted; the per-file checks
+        # below still apply there.
+        if state.input_dir and not data.resume:
+            conflict = planning.output_dir_conflict(
+                Path(state.input_dir), Path(data.output_dir), state.input_recursive,
+            )
+            if conflict:
+                return JSONResponse({"error": conflict}, status_code=400)
+        planned = _resolve_collision_free_output_paths(
+            [
+                (f["id"], f["name"], (data.overrides or {}).get(f["id"], {}).get("output_format", data.output_format))
+                for f in files_to_process
+            ],
+            Path(data.output_dir),
+        )
+        hit = planning.planned_outputs_hit_sources(
+            planned.values(), [Path(f["path"]) for f in files_to_process],
+        )
+        if hit is not None:
+            return JSONResponse({
+                "error": f"output would overwrite the original file {hit}: pick a different output folder",
+            }, status_code=400)
         _push_recent("output_dirs", str(Path(data.output_dir).resolve()))
 
     # Validate per-file overrides before mutating any state — a bad override
@@ -1409,6 +1441,13 @@ def _validate_overrides(
             if eff_mode == "screenshot" and eff_format != "png":
                 return f"Screenshot mode is PNG-only (override for file {fid!r})"
     return None
+
+
+def _dest_is_original(dest: Path, source: Path) -> bool:
+    """True if writing `dest` would replace the source file `source` (same
+    file after resolving symlinks, or the same inode). The last line of
+    defence in the web copy step, behind the up-front folder checks."""
+    return planning.same_path(dest, source) if dest.exists() else False
 
 
 def _resolve_collision_free_output_paths(
@@ -1730,6 +1769,8 @@ async def _process_files(
                     user_output = Path(output_dir)
                     rel = out_path.relative_to(opt_output_dir)
                     dest = user_output / rel
+                    if _dest_is_original(dest, input_path):
+                        raise OSError(f"refusing to overwrite the original file {dest}")
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(out_path, dest)
                     # Same reasoning as the skip_existing branch above:
@@ -2970,17 +3011,7 @@ def _watch_output_conflicts_with_input(directory: Path, output_dir: Path, recurs
       scan only lists directory's immediate children, so a nested output
       folder's contents are never re-scanned.
     """
-    d = directory.resolve()
-    o = output_dir.resolve()
-    if o == d:
-        return True
-    if recursive:
-        try:
-            o.relative_to(d)
-            return True
-        except ValueError:
-            return False
-    return False
+    return planning.output_dir_conflict(directory, output_dir, recursive) is not None
 
 
 async def _watch_loop(state: AppState, req: WatchRequest):
@@ -3364,6 +3395,10 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
         print("[Error] --output is required when using --source", file=sys.stderr)
         return 1
     output_dir = Path(args.output).resolve()
+    conflict = planning.output_dir_conflict(source, output_dir, args.recursive)
+    if conflict:
+        print(f"[Error] {conflict}", file=sys.stderr)
+        return 1
     cache_dir_arg = getattr(args, "cache_dir", None)
     cache_max_mb = getattr(args, "cache_max_size_mb", DEFAULT_CACHE_MAX_MB)
     if cache_dir_arg and cache_max_mb < 0:
@@ -3479,6 +3514,13 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
         return 1
     items = [(str(i), str(p.relative_to(source)), args.format) for i, p in enumerate(images)]
     out_paths = _resolve_collision_free_output_paths(items, output_dir)
+    hit = planning.planned_outputs_hit_sources(out_paths.values(), images)
+    if hit is not None:
+        print(
+            f"[Error] output would overwrite the original file {hit}: pick a different --output",
+            file=sys.stderr,
+        )
+        return 1
 
     global optimizer
     optimizer = optimizer_instance or Optimizer(max_concurrency=CONCURRENT_WORKERS)
