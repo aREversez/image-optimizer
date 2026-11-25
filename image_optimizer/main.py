@@ -1246,6 +1246,20 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
                 "size": f.get("size", 0), "mtime": mtime, "ctime": ctime, "thumbnail": "",
             })
         state.files = rebuilt
+        # A source that vanished since the batch was saved can never be
+        # processed again. Mark it "missing" (finished, not pending/failed)
+        # so it stops keeping the batch file - and the Resume banner - alive.
+        present = {f["path"] for f in rebuilt}
+        marked = False
+        for entry in bs.get("files", []):
+            if entry.get("status") in ("pending", "failed") and entry["path"] not in present:
+                entry["status"] = "missing"
+                marked = True
+        if marked:
+            if any(e.get("status") in ("pending", "failed") for e in bs.get("files", [])):
+                _save_batch_state(bs)
+            else:
+                _clear_batch_state(data.output_dir)
         if not state.files:
             return JSONResponse(
                 {"error": "Source files no longer available for resume"},
