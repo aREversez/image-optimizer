@@ -24,7 +24,7 @@ from PIL import Image, features as pil_features
 if __package__ is None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from image_optimizer import binaries, planning
+from image_optimizer import binaries, persistence, planning
 from image_optimizer.cache import (
     CACHEABLE_FORMATS,
     DEFAULT_CACHE_MAX_MB,
@@ -333,8 +333,11 @@ def _save_batch_state(bs: dict):
         return  # nothing to scope the file to — shouldn't happen in practice
     try:
         bs["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-        _batch_state_file(output_dir).write_text(
-            json.dumps(bs, indent=2, ensure_ascii=False), encoding="utf-8"
+        # Atomic: a crash mid-write must not leave a truncated file that
+        # _load_batch_state then treats as "no batch" and silently drops the
+        # resume data.
+        persistence.atomic_write_text(
+            _batch_state_file(output_dir), json.dumps(bs, indent=2, ensure_ascii=False),
         )
     except OSError:
         pass  # best-effort — a write failure here mustn't crash the batch
@@ -398,7 +401,7 @@ def _load_skip_fingerprints(output_dir: str) -> dict:
 
 def _save_skip_fingerprints(output_dir: str, data: dict):
     try:
-        _skip_fingerprints_file(output_dir).write_text(json.dumps(data), encoding="utf-8")
+        persistence.atomic_write_text(_skip_fingerprints_file(output_dir), json.dumps(data))
     except OSError:
         pass  # best-effort — a write failure here just means the next run recompresses instead of reusing
 
@@ -504,7 +507,7 @@ def _load_recent() -> dict:
 
 def _save_recent(data: dict):
     try:
-        _recent_file().write_text(json.dumps(data), encoding="utf-8")
+        persistence.atomic_write_text(_recent_file(), json.dumps(data))
     except Exception:
         pass  # best-effort — a read-only config dir shouldn't break the app
 
@@ -2957,9 +2960,8 @@ async def put_settings(
 
     # Persist to config.json
     try:
-        _config_file().write_text(
-            json.dumps(cfg, indent=2, ensure_ascii=False),
-            encoding="utf-8",
+        persistence.atomic_write_text(
+            _config_file(), json.dumps(cfg, indent=2, ensure_ascii=False),
         )
     except OSError as e:
         return JSONResponse(
