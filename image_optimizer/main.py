@@ -3055,34 +3055,37 @@ async def _watch_loop(state: AppState, req: WatchRequest):
     directory = Path(req.directory)
     output_dir = Path(req.output_dir) if req.output_dir else None
 
-    quality_map = {"high": 85, "medium": 75, "low": 60}
-    used_names: set[str] = set()
-    # rel_path -> the output file actually written for it, so a detected
-    # rename can find and remove the *old* name's output. A plain set
-    # (used_names) only tells us a filename is taken, not which source it
-    # came from, and the collision guard can shift the actual filename
-    # away from the naive with_suffix() guess (e.g. "_2.png") — this dict
-    # tracks the real path so cleanup targets the right file.
+    # rel_path -> the output file that source owns. A source keeps the same
+    # output for its whole life (a re-save overwrites it), a detected rename
+    # can find and remove the *old* name's output, and only a *different*
+    # source claiming the same name gets a numbered suffix. A bare set of
+    # used names could not tell "taken by me earlier" from "taken by someone
+    # else", which is what turned every re-save into name_2, name_3, ...
     output_path_for: dict[str, Path] = {}
+    # case-folded output path -> rel_path of the source that owns it.
+    owner_of: dict[str, str] = {}
 
     async def on_change(rel_path: str, abs_path: Path, renamed_from: Optional[str] = None):
         if optimizer is None:
             return
         try:
             if output_dir:
-                out_path = output_dir / Path(rel_path).with_suffix(f".{req.output_format}")
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                # Collision guard: same filename from different subdirs
-                key = str(out_path).lower()
-                if key in used_names:
+                out_path = output_path_for.get(rel_path)
+                if out_path is None:
+                    out_path = output_dir / Path(rel_path).with_suffix(f".{req.output_format}")
+                    # Collision guard: same output name from a different source
+                    # (other subfolder, or photo.png vs photo.jpg).
+                    key = str(out_path).lower()
                     n = 2
-                    while key in used_names:
+                    while owner_of.get(key, rel_path) != rel_path:
                         out_path = output_dir / Path(rel_path).with_name(
                             f"{Path(rel_path).stem}_{n}.{req.output_format}"
                         )
                         key = str(out_path).lower()
                         n += 1
-                used_names.add(key)
+                    owner_of[key] = rel_path
+                    output_path_for[rel_path] = out_path
+                out_path.parent.mkdir(parents=True, exist_ok=True)
             else:
                 return
 
@@ -3102,7 +3105,7 @@ async def _watch_loop(state: AppState, req: WatchRequest):
                     try:
                         if old_output.exists():
                             old_output.unlink()
-                        used_names.discard(str(old_output).lower())
+                        owner_of.pop(str(old_output).lower(), None)
                         state.watch_logs.append(
                             f"  Renamed: {renamed_from} -> {rel_path} (removed old output {old_output.name})"
                         )
@@ -3113,13 +3116,13 @@ async def _watch_loop(state: AppState, req: WatchRequest):
 
             state.watch_logs.append(f"Detected: {rel_path}")
 
-            q = quality_map.get(req.quality, 75)
-            if req.compression_mode in ("lossless", "resize_only"):
-                q = 95
-
+            # Encode into a staging file and rename it over the output, so a
+            # re-save replaces the previous output atomically and a failed
+            # or killed encode never leaves a partial file under the real name.
+            staged = persistence.staging_path(out_path)
             result = await optimizer.optimize_png(
                 input_path=abs_path,
-                output_path=out_path,
+                output_path=staged,
                 quality=req.quality,
                 max_width=req.max_width,
                 compression_mode=req.compression_mode,
@@ -3129,9 +3132,16 @@ async def _watch_loop(state: AppState, req: WatchRequest):
                 keep_exif=req.keep_exif,
             )
 
+            if result.get("success"):
+                try:
+                    await asyncio.to_thread(persistence.commit_staged, staged, out_path)
+                except OSError as e:
+                    result = {"success": False, "error": f"cannot write {out_path}: {e}"}
+            else:
+                persistence.discard(staged)
+
             state.watch_processed += 1
             if result.get("success"):
-                output_path_for[rel_path] = out_path
                 savings = result["original_size"] - result["compressed_size"]
                 pct = round(savings / result["original_size"] * 100, 1) if result["original_size"] > 0 else 0
                 state.watch_logs.append(
