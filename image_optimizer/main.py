@@ -1754,6 +1754,48 @@ async def _process_files(
         # re-deriving it from "name".
         result["output_name"] = str(out_path.relative_to(opt_output_dir))
 
+        if result["success"] and output_dir:
+            # Copy this file to the user's chosen output folder right away,
+            # rather than waiting for the whole batch to finish — otherwise
+            # the folder stays empty for the entire run, which looks like
+            # the wrong folder was picked.
+            #
+            # The copy is part of the job: a file that never reached the
+            # output folder (disk full, read-only share, bad path, refusal to
+            # replace an original) is a FAILED file, not a success with a log
+            # line. It stays "failed" in the batch state so Retry and Resume
+            # pick it up. The write goes through a temp file + os.replace so a
+            # crash never leaves a truncated file at the destination.
+            try:
+                user_output = Path(output_dir)
+                rel = out_path.relative_to(opt_output_dir)
+                dest = user_output / rel
+                if _dest_is_original(dest, input_path):
+                    raise OSError(f"refusing to overwrite the original file {dest}")
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                await asyncio.to_thread(persistence.atomic_copy, out_path, dest)
+                # Same reasoning as the skip_existing branch above:
+                # only set when there's a real, persistent file on
+                # disk to reveal (nothing to show when output_dir is
+                # empty and results live only in the temp workspace).
+                result["final_output_path"] = str(dest)
+                # Record what settings actually produced this file, so
+                # a later skip_existing run can tell "safe to reuse"
+                # apart from "source unchanged but settings differ" —
+                # see the fingerprint check above. Tracked on every
+                # run with a persistent output_dir (not just
+                # skip_existing runs) so a plain run followed by a
+                # skip_existing run has something to verify against.
+                nonlocal _skip_fp_dirty
+                _skip_fp[str(rel)] = _settings_fingerprint(
+                    eff_quality, eff_compression_mode, eff_max_width,
+                    eff_protected_colors, eff_dithering, eff_keep_exif, eff_output_format,
+                )
+                _skip_fp_dirty = True
+            except Exception as e:
+                result["success"] = False
+                result["error"] = f"Output copy failed: {e}"
+
         if result["success"]:
             result["savings"] = result["original_size"] - result["compressed_size"]
             result["savings_percent"] = round(
@@ -1763,39 +1805,6 @@ async def _process_files(
                 f"  OK {file_info['name']}: {_fmt_size(result['original_size'])} -> "
                 f"{_fmt_size(result['compressed_size'])} (saved {result['savings_percent']}%)"
             )
-            # Copy this file to the user's chosen output folder right away,
-            # rather than waiting for the whole batch to finish — otherwise
-            # the folder stays empty for the entire run, which looks like
-            # the wrong folder was picked.
-            if output_dir:
-                try:
-                    user_output = Path(output_dir)
-                    rel = out_path.relative_to(opt_output_dir)
-                    dest = user_output / rel
-                    if _dest_is_original(dest, input_path):
-                        raise OSError(f"refusing to overwrite the original file {dest}")
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(out_path, dest)
-                    # Same reasoning as the skip_existing branch above:
-                    # only set when there's a real, persistent file on
-                    # disk to reveal (nothing to show when output_dir is
-                    # empty and results live only in the temp workspace).
-                    result["final_output_path"] = str(dest)
-                    # Record what settings actually produced this file, so
-                    # a later skip_existing run can tell "safe to reuse"
-                    # apart from "source unchanged but settings differ" —
-                    # see the fingerprint check above. Tracked on every
-                    # run with a persistent output_dir (not just
-                    # skip_existing runs) so a plain run followed by a
-                    # skip_existing run has something to verify against.
-                    nonlocal _skip_fp_dirty
-                    _skip_fp[str(rel)] = _settings_fingerprint(
-                        eff_quality, eff_compression_mode, eff_max_width,
-                        eff_protected_colors, eff_dithering, eff_keep_exif, eff_output_format,
-                    )
-                    _skip_fp_dirty = True
-                except Exception as e:
-                    state.logs.append(f"  Output copy failed: {e}")
         else:
             state.logs.append(f"  FAILED {file_info['name']}: {result.get('error', 'unknown')}")
 
