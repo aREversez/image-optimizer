@@ -1689,7 +1689,19 @@ async def _process_files(
                 eff_quality, eff_compression_mode, eff_max_width,
                 eff_protected_colors, eff_dithering, eff_keep_exif, eff_output_format,
             )
-            settings_unchanged = _skip_fp.get(str(rel)) == eff_fingerprint
+            # The record must also name the source that produced the file
+            # (relative name + size). Without it, a new file that shifts the
+            # collision numbering (photo.bmp next to a processed photo.jpg,
+            # both -> photo.webp) would inherit the other file's output. A
+            # bare-string record from an older version has no source
+            # identity and is treated as unverifiable.
+            record = _skip_fp.get(str(rel))
+            settings_unchanged = (
+                isinstance(record, dict)
+                and record.get("fp") == eff_fingerprint
+                and record.get("src") == file_info["name"]
+                and record.get("size") == (input_path.stat().st_size if input_path.exists() else None)
+            )
             if (
                 source_unchanged
                 and settings_unchanged
@@ -1787,10 +1799,15 @@ async def _process_files(
                 # skip_existing runs) so a plain run followed by a
                 # skip_existing run has something to verify against.
                 nonlocal _skip_fp_dirty
-                _skip_fp[str(rel)] = _settings_fingerprint(
-                    eff_quality, eff_compression_mode, eff_max_width,
-                    eff_protected_colors, eff_dithering, eff_keep_exif, eff_output_format,
-                )
+                _skip_fp[str(rel)] = {
+                    "fp": _settings_fingerprint(
+                        eff_quality, eff_compression_mode, eff_max_width,
+                        eff_protected_colors, eff_dithering, eff_keep_exif, eff_output_format,
+                    ),
+                    # Which source made this file; see the reuse check.
+                    "src": file_info["name"],
+                    "size": input_path.stat().st_size,
+                }
                 _skip_fp_dirty = True
             except Exception as e:
                 result["success"] = False
