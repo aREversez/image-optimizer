@@ -21,7 +21,7 @@ from zipfile import ZipFile
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
-from PIL import Image, features as pil_features
+from PIL import Image, ImageOps, features as pil_features
 
 if __package__ is None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -643,6 +643,9 @@ def _gen_thumbnail(src: Path, dst: Path, max_size: int = 200):
         # error path (matters on Windows, where a lingering handle can keep
         # the user's file locked until GC gets around to it).
         with Image.open(src) as img:
+            # Bake in the EXIF orientation first, as the optimizer does for
+            # its output, so a portrait phone photo is not shown sideways.
+            img = ImageOps.exif_transpose(img)
             img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
             if img.mode in ("RGBA", "LA", "PA", "P"):
                 # Composite transparency onto white instead of a bare
