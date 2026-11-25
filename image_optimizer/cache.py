@@ -51,6 +51,27 @@ def settings_fingerprint(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
+def _jpeg_has_end_marker(path: Path) -> bool:
+    """A finished JPEG ends with the EOI marker (FF D9); trailing zero
+    padding some writers add is tolerated."""
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        f.seek(max(0, size - 64))
+        tail = f.read().rstrip(b"\x00")
+    return tail.endswith(b"\xff\xd9")
+
+
+def _webp_riff_size_ok(path: Path) -> bool:
+    """The RIFF header declares the payload size; a file shorter than that
+    was cut off. Trailing bytes beyond it are tolerated."""
+    with open(path, "rb") as f:
+        head = f.read(12)
+    if len(head) < 12 or head[:4] != b"RIFF" or head[8:12] != b"WEBP":
+        return False
+    declared = int.from_bytes(head[4:8], "little") + 8
+    return os.path.getsize(path) >= declared
+
+
 def is_valid_reusable_output(path: Path, expected_format: str) -> bool:
     """Best-effort corruption check for a skip_existing reuse candidate.
 
@@ -68,6 +89,16 @@ def is_valid_reusable_output(path: Path, expected_format: str) -> bool:
         with Image.open(path) as img:
             img.verify()
             fmt = (img.format or "").upper()
+        # verify() is a no-op for JPEG and only checks headers for WebP, so
+        # add the cheap structural checks it misses, then a full decode.
+        # A half-written file is the main thing this guards against.
+        if fmt == "JPEG" and not _jpeg_has_end_marker(path):
+            return False
+        if fmt == "WEBP" and not _webp_riff_size_ok(path):
+            return False
+        if fmt in ("JPEG", "WEBP"):
+            with Image.open(path) as img:
+                img.load()
     except Exception:
         return False
     expected = {
