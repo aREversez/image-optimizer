@@ -67,3 +67,7 @@ def test_vanished_entries_are_marked_missing_while_other_work_remains(client, au
     bs = json.loads(_batch_state_path(out).read_text(encoding="utf-8"))
     status = {f["name"]: f["status"] for f in bs["files"]}
     assert status == {"a.png": "failed", "gone.png": "missing"}
+    # The banner counts what is still to do. A vanished source is finished,
+    # not waiting, so it must not show up as pending work that can never run.
+    d = client.get("/api/batch-state", params={"output_dir": str(out)}, headers=auth_headers).json()
+    assert (d["pending"], d["failed"], d["missing"]) == (0, 1, 1)

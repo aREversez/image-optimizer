@@ -3089,15 +3089,22 @@ async def get_batch_state(output_dir: Optional[str] = None, state: AppState = De
         bs = candidates[0] if candidates else None
     if bs is None:
         return JSONResponse({"has_batch": False})
-    total = len(bs.get("files", []))
-    done = sum(1 for f in bs.get("files", []) if f["status"] == "done")
-    failed = sum(1 for f in bs.get("files", []) if f["status"] == "failed")
-    pending = total - done - failed
+    files = bs.get("files", [])
+    total = len(files)
+    done = sum(1 for f in files if f["status"] == "done")
+    failed = sum(1 for f in files if f["status"] == "failed")
+    # "missing" sources were removed since the batch was saved (see the
+    # resume flow); they are finished, not waiting, so counting them as
+    # pending (total - done - failed) made the Resume banner promise work
+    # that can never happen.
+    missing = sum(1 for f in files if f["status"] == "missing")
+    pending = total - done - failed - missing
     return JSONResponse({
         "has_batch": True,
         "total": total,
         "done": done,
         "failed": failed,
+        "missing": missing,
         "pending": pending,
         "output_dir": bs.get("output_dir", ""),
         "output_format": bs.get("output_format", "png"),
