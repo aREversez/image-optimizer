@@ -26,6 +26,7 @@ from PIL import Image
 def settings_fingerprint(
     quality: str, compression_mode: str, max_width: int,
     protected_colors: Optional[list], dithering: bool, keep_exif: bool, output_format: str,
+    keep_icc: bool = True,
 ) -> str:
     """Fingerprints the effective per-file compression settings that
     produced (or would produce) a given output. Used by skip_existing to
@@ -46,6 +47,7 @@ def settings_fingerprint(
         "protected_colors": colors,
         "dithering": bool(dithering),
         "keep_exif": bool(keep_exif),
+        "keep_icc": bool(keep_icc),
         "output_format": output_format,
     }, sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]

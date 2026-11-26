@@ -1962,7 +1962,7 @@ async def _process_files(
 
         state.logs.append(f"Processing: {file_info['name']}")
 
-        result = await optimizer.optimize_png(
+        result = await optimizer.optimize_image(
             input_path=input_path,
             output_path=out_path,
             quality=eff_quality,
@@ -2060,7 +2060,7 @@ async def _process_files(
             _save_batch_state(batch_state, throttle=True)
 
     def on_item_error(file_info, e):
-        # Anything process_one doesn't already catch internally (optimize_png
+        # Anything process_one doesn't already catch internally (optimize_image
         # has its own try/except, but e.g. mkdir permission errors or a
         # malformed file_info wouldn't be) lands here. Degrading to a
         # normal failed-file result keeps one bad file from taking down the
@@ -2319,7 +2319,7 @@ async def preview_optimize(data: PreviewRequest, state: AppState = Depends(get_s
     """Single-file dry run: project the compressed size of one file under
     the current settings WITHOUT touching the batch state machine.
 
-    Reuses `optimizer.optimize_png` but writes to a temp file under
+    Reuses `optimizer.optimize_image` but writes to a temp file under
     ws/preview (never ws/output, which the download ZIP rglobs), measures
     the size, then deletes the temp. Must NOT mutate state.results /
     state.current / state.total / state.output_version / state.logs /
@@ -2360,7 +2360,7 @@ async def preview_optimize(data: PreviewRequest, state: AppState = Depends(get_s
         pass
 
     try:
-        result = await optimizer.optimize_png(
+        result = await optimizer.optimize_image(
             input_path=input_path,
             output_path=out_path,
             quality=data.quality,
@@ -2373,7 +2373,7 @@ async def preview_optimize(data: PreviewRequest, state: AppState = Depends(get_s
             keep_exif=data.keep_exif,
         )
     finally:
-        # Best-effort cleanup of the preview temp. optimize_png's own
+        # Best-effort cleanup of the preview temp. optimize_image's own
         # finally-sweep already removes its *.src.png/*.pngquant.png/etc
         # sidecars; this removes the final output file too so ws/preview
         # never accumulates and can't leak into anything.
@@ -3358,7 +3358,7 @@ async def _watch_loop(state: AppState, req: WatchRequest):
             # re-save replaces the previous output atomically and a failed
             # or killed encode never leaves a partial file under the real name.
             staged = persistence.staging_path(out_path)
-            result = await optimizer.optimize_png(
+            result = await optimizer.optimize_image(
                 input_path=abs_path,
                 output_path=staged,
                 quality=req.quality,
@@ -3635,7 +3635,7 @@ def _build_cli_report(files: list, run_warnings: Optional[list] = None) -> dict:
 
 async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> int:
     """Headless batch run: no web server, no browser. Scans --source, runs
-    every image through the exact same optimizer.optimize_png pipeline the
+    every image through the exact same optimizer.optimize_image pipeline the
     web UI and Watch Mode use (so a CLI run behaves identically to a batch
     run started from the browser with the same settings — no separate
     "CLI version" of the compression logic to drift out of sync), and exits
@@ -3825,6 +3825,7 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
             _settings_fingerprint(
                 args.quality, args.mode, args.max_width, protected_colors,
                 args.dithering, args.keep_exif, args.format,
+                not getattr(args, "strip_icc", False),
             ),
             enc_fp,
         )
@@ -3904,11 +3905,12 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
                         "compressed_size": probe.hit_size, "error": None,
                     }
         if result is None:
-            result = await optimizer.optimize_png(
+            result = await optimizer.optimize_image(
                 img_path, staged,
                 quality=args.quality, max_width=args.max_width, compression_mode=args.mode,
                 protected_colors=protected_colors, dithering=args.dithering,
                 output_format=args.format, keep_exif=args.keep_exif,
+                keep_icc=not getattr(args, "strip_icc", False),
             )
             if cache is not None and cache_key is not None and result["success"]:
                 try:
@@ -4164,6 +4166,13 @@ def main():
         "--keep-exif", action="store_true",
         help="Keep a curated subset of EXIF (camera make/model, date, exposure). GPS and "
              "Orientation are always stripped regardless. Default: strip all EXIF.",
+    )
+    cli_group.add_argument(
+        "--strip-icc", action="store_true",
+        help="Drop the source's embedded ICC colour profile. Default: keep it — the pixels "
+             "are re-encoded in the source's own colour space, so removing the profile makes "
+             "wide-gamut (Adobe RGB, Display P3) images look desaturated in colour-managed "
+             "viewers. Use this only when the profile itself is sensitive/oversized.",
     )
     cli_group.add_argument(
         "--exclude", action="append", default=[], metavar="GLOB",

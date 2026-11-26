@@ -27,13 +27,13 @@ from tests.test_cli import cli_args
 def counting(optimizer, monkeypatch):
     """Counts how many files actually go through the compression pipeline."""
     calls = {"n": 0}
-    real = optimizer.optimize_png
+    real = optimizer.optimize_image
 
     async def wrapper(*a, **kw):
         calls["n"] += 1
         return await real(*a, **kw)
 
-    monkeypatch.setattr(optimizer, "optimize_png", wrapper)
+    monkeypatch.setattr(optimizer, "optimize_image", wrapper)
     return calls
 
 

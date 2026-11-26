@@ -64,7 +64,7 @@ class TestOverridesApplied:
             return {"success": True, "original_size": 10, "compressed_size": 5,
                     "error": None, "warning": None}
 
-        opt.optimize_png = rec
+        opt.optimize_image = rec
         m.optimizer = opt
         try:
             r, d = optimize_and_wait(
@@ -110,7 +110,7 @@ class TestOverridesApplied:
             return {"success": True, "original_size": 10, "compressed_size": 5,
                     "error": None, "warning": None}
 
-        opt.optimize_png = rec
+        opt.optimize_image = rec
         m.optimizer = opt
         r, d = optimize_and_wait(
             client, auth_headers,

@@ -157,7 +157,7 @@ class Optimizer:
           it doesn't do the lossy color quantization that's the whole
           point of Standard mode.
         - PNG screenshot needs pngquant too — it's a much tighter-quality
-          pngquant pass, not a different tool (see _optimize_png's
+          pngquant pass, not a different tool (see optimize_image's
           screenshot branch for the quality floor and why dithering is
           forced off there).
 
@@ -258,8 +258,8 @@ class Optimizer:
         would freeze whatever it was at class-definition time) -- same
         reasoning as CONCURRENT_WORKERS in main.py's _run_worker_pool, and
         what lets tests shrink this to something fast without threading an
-        explicit timeout through optimize_png/optimize_jpeg/optimize_webp/
-        optimize_avif.
+        explicit timeout through optimize_image/_optimize_jpeg/_optimize_webp/
+        _optimize_avif.
 
         Returns (stdout, stderr, timed_out)."""
         if timeout is None:
@@ -472,6 +472,7 @@ class Optimizer:
         result: dict,
         keep_exif: bool,
         cleaned_exif: bytes,
+        icc_profile: bytes = b"",
     ) -> None:
         """If the just-produced output isn't actually smaller than the
         original, and no format conversion was requested (the source is
@@ -485,7 +486,7 @@ class Optimizer:
         forcing jpg -> png): the original bytes wouldn't be a valid file
         at output_path's extension, so there's nothing safe to fall back
         to there — that case is handled by each pipeline's own logic
-        instead (see optimize_png's pngquant-failure branch).
+        instead (see optimize_image's pngquant-failure branch).
 
         AVIF isn't handled here — its ISOBMFF box structure needs a real
         box parser to strip safely, which is more machinery than this
@@ -513,6 +514,12 @@ class Optimizer:
             else:
                 stripped = self._strip_webp_metadata(original_bytes)
             output_path.write_bytes(stripped)
+            if icc_profile and output_format == "jpg":
+                # _strip_jpeg_metadata drops every APPn segment, which is
+                # where a JPEG's ICC profile lives (APP2). PNG (iCCP) and
+                # WebP (ICCP) are not touched by their strippers, so only
+                # JPEG needs the profile put back.
+                self._embed_jpeg_icc(output_path, icc_profile)
             if keep_exif and cleaned_exif:
                 if output_format == "png":
                     self._finalize_png_exif(output_path, cleaned_exif)
@@ -538,7 +545,7 @@ class Optimizer:
             return 1
 
     @staticmethod
-    def _ensure_png(src: Path, dst: Path):
+    def _ensure_png(src: Path, dst: Path, icc_profile: bytes = b""):
         """Re-encode any Pillow-readable image (jpg/bmp/tiff/...) into a real PNG.
 
         This is required because pngquant/oxipng only understand PNG input; without
@@ -560,17 +567,19 @@ class Optimizer:
             # re-attached at the very end of the pipeline only when
             # keep_exif=True (see _finalize_png_exif / _optimize_webp).
             img.info.pop("exif", None)
-            img.save(dst, format="PNG")
+            save_kwargs = {"icc_profile": icc_profile} if icc_profile else {}
+            img.save(dst, format="PNG", **save_kwargs)
 
     @staticmethod
-    def _resize_image(src: Path, dst: Path, max_width: int):
+    def _resize_image(src: Path, dst: Path, max_width: int, icc_profile: bytes = b""):
         with Image.open(src) as img:
             new_size = fit_width(img.size, max_width)
             if new_size is None:
                 return
             img = img.resize(new_size, Image.Resampling.LANCZOS)
             img.info.pop("exif", None)
-            img.save(dst, format="PNG")
+            save_kwargs = {"icc_profile": icc_profile} if icc_profile else {}
+            img.save(dst, format="PNG", **save_kwargs)
 
     @staticmethod
     def _make_color_map(colors: list[str], dst: Path) -> bool:
@@ -649,6 +658,23 @@ class Optimizer:
             return b""
 
     @staticmethod
+    def _capture_icc(src: Path) -> bytes:
+        """The source's embedded ICC colour profile, or b"" when it has none.
+
+        Every pipeline decodes through Pillow and re-encodes the resulting
+        pixel values unchanged, so those values stay in the source's colour
+        space. Dropping the profile therefore does not convert anything to
+        sRGB — it makes a wide-gamut photo *look* desaturated when a
+        colour-managed viewer assumes sRGB. So the profile travels with the
+        pixels unless the caller explicitly asks to strip it."""
+        try:
+            with Image.open(src) as img:
+                profile = img.info.get("icc_profile")
+                return bytes(profile) if profile else b""
+        except Exception:
+            return b""
+
+    @staticmethod
     def _strip_png_chunks(data: bytes, chunk_type: bytes) -> bytes:
         """Return `data` (a PNG file's bytes) with every chunk of
         `chunk_type` removed. Walks the chunk stream once, stops at IEND.
@@ -720,7 +746,36 @@ class Optimizer:
         except Exception:
             pass
 
-    async def optimize_png(
+    @staticmethod
+    def _finalize_png_icc(png_path: Path, icc_bytes: bytes) -> None:
+        """Make sure a finished PNG carries `icc_bytes` as its iCCP chunk.
+
+        The intermediate resizes/normalisations write the profile directly
+        (Pillow's icc_profile= argument), but pngquant's --strip and
+        oxipng --strip can drop iCCP, so the last word belongs here: if the
+        output already carries a profile, leave it alone (it came from the
+        same source); otherwise insert one before IEND. An iCCP payload is
+        a NUL-terminated Latin-1 name, a compression method byte, and the
+        zlib-compressed profile. Best-effort — never raises."""
+        if not icc_bytes:
+            return
+        try:
+            data = png_path.read_bytes()
+            if data[:8] != PNG_MAGIC:
+                return
+            if Optimizer._find_png_chunk_offset(data, b"iCCP") is not None:
+                return
+            chunk_body = b"ICC profile\x00\x00" + zlib.compress(icc_bytes, 9)
+            chunk = struct.pack(">I", len(chunk_body)) + b"iCCP" + chunk_body
+            chunk += struct.pack(">I", zlib.crc32(b"iCCP" + chunk_body) & 0xFFFFFFFF)
+            iend_start = Optimizer._find_png_chunk_offset(data, b"IEND")
+            if iend_start is None:
+                return
+            png_path.write_bytes(data[:iend_start] + chunk + data[iend_start:])
+        except Exception:
+            pass
+
+    async def optimize_image(
         self,
         input_path: Path,
         output_path: Path,
@@ -732,6 +787,7 @@ class Optimizer:
         output_format: str = "png",
         progress_callback: Optional[Callable] = None,
         keep_exif: bool = False,
+        keep_icc: bool = True,
     ) -> dict:
         if compression_mode not in ("standard", "lossless", "resize_only", "screenshot"):
             compression_mode = "standard"
@@ -762,22 +818,31 @@ class Optimizer:
         if keep_exif:
             cleaned_exif = self._capture_cleaned_exif(input_path)
 
+        # Same idea for the colour profile: read it once from the source and
+        # let each pipeline carry it onto its output. Pillow decodes into the
+        # profile's own numbers and we write those numbers back out, so the
+        # profile is what keeps the result looking the way the source did.
+        icc_profile = self._capture_icc(input_path) if keep_icc else b""
+
         if output_format == "webp":
             return await self._optimize_webp(
                 input_path, output_path, quality, max_width, compression_mode,
                 progress_callback, keep_exif=keep_exif, cleaned_exif=cleaned_exif,
+                icc_profile=icc_profile,
             )
 
         if output_format in ("jpg", "jpeg"):
             return await self._optimize_jpeg(
                 input_path, output_path, quality, max_width, compression_mode,
                 progress_callback, keep_exif=keep_exif, cleaned_exif=cleaned_exif,
+                icc_profile=icc_profile,
             )
 
         if output_format == "avif":
             return await self._optimize_avif(
                 input_path, output_path, quality, max_width, compression_mode,
                 progress_callback, keep_exif=keep_exif, cleaned_exif=cleaned_exif,
+                icc_profile=icc_profile,
             )
 
         original_size = os.path.getsize(input_path)
@@ -1040,8 +1105,20 @@ class Optimizer:
                 result["error"] = "output file not generated"
 
             self._apply_growth_guard(
-                input_path, output_path, "png", result, keep_exif, cleaned_exif
+                input_path, output_path, "png", result, keep_exif, cleaned_exif, icc_profile
             )
+
+            # After the growth guard: its fallback replaces the file with a
+            # stripped copy of the original, so anything attached earlier
+            # would be thrown away here. The chunk adds a few hundred bytes,
+            # so the reported size is refreshed to stay truthful.
+            if icc_profile:
+                self._finalize_png_icc(output_path, icc_profile)
+                if result["success"]:
+                    try:
+                        result["compressed_size"] = os.path.getsize(output_path)
+                    except OSError:
+                        pass
 
         except Exception as e:
             result["success"] = False
@@ -1061,6 +1138,10 @@ class Optimizer:
 
         return result
 
+    # Historical name, kept for callers that still use it: this method
+    # handles every output format (PNG, WebP, JPEG, AVIF), not just PNG.
+    optimize_png = optimize_image
+
     async def _optimize_webp(
         self,
         input_path: Path,
@@ -1072,6 +1153,7 @@ class Optimizer:
         *,
         keep_exif: bool = False,
         cleaned_exif: bytes = b"",
+        icc_profile: bytes = b"",
     ) -> dict:
         """WebP goes through Pillow's own encoder rather than pngquant/oxipng
         (which only understand PNG) — there's no external binary dependency
@@ -1112,6 +1194,12 @@ class Optimizer:
                         save_kwargs = {"format": "WEBP", "quality": q, "method": 6}
                     if keep_exif and cleaned_exif:
                         save_kwargs["exif"] = cleaned_exif
+                    # ICCP chunk: without it a wide-gamut source's numbers
+                    # get reinterpreted as sRGB and the image looks washed
+                    # out. Pillow writes the profile straight into the
+                    # container, so no post-processing is needed here.
+                    if icc_profile:
+                        save_kwargs["icc_profile"] = icc_profile
                     img.save(output_path, **save_kwargs)
 
             if progress_callback:
@@ -1128,7 +1216,8 @@ class Optimizer:
                 result["error"] = "output file not generated"
 
             self._apply_growth_guard(
-                input_path, output_path, "webp", result, keep_exif, cleaned_exif
+                input_path, output_path, "webp", result, keep_exif, cleaned_exif,
+                icc_profile,
             )
         except Exception as e:
             result["success"] = False
@@ -1147,6 +1236,7 @@ class Optimizer:
         *,
         keep_exif: bool = False,
         cleaned_exif: bytes = b"",
+        icc_profile: bytes = b"",
     ) -> dict:
         """Lossy JPEG re-encode through mozjpeg's cjpeg, keeping the JPEG
         format (the output stays a .jpg — no conversion to PNG/WebP).
@@ -1250,6 +1340,11 @@ class Optimizer:
                     pass
 
             if tmp_jpg.exists():
+                # The PPM intermediate carries pixels only, so cjpeg's output
+                # is metadata-free. Both segments are re-attached here, in the
+                # order a camera writes them (APP2 profile, then APP1 Exif).
+                if icc_profile:
+                    self._embed_jpeg_icc(tmp_jpg, icc_profile)
                 if keep_exif and cleaned_exif:
                     self._finalize_jpeg_exif(tmp_jpg, cleaned_exif)
                 tmp_jpg.replace(output_path)
@@ -1268,7 +1363,8 @@ class Optimizer:
                 result["error"] = "output file not generated"
 
             self._apply_growth_guard(
-                input_path, output_path, "jpg", result, keep_exif, cleaned_exif
+                input_path, output_path, "jpg", result, keep_exif, cleaned_exif,
+                icc_profile,
             )
         except Exception as e:
             result["success"] = False
@@ -1310,6 +1406,37 @@ class Optimizer:
         except Exception:
             pass
 
+    @staticmethod
+    def _embed_jpeg_icc(jpg_path: Path, icc_bytes: bytes) -> None:
+        """Attach an ICC profile to a finished JPEG as APP2 'ICC_PROFILE'
+        segment(s) right after SOI.
+
+        An ICC segment's payload is limited to 65535 bytes including its own
+        length field, so a real profile (Adobe RGB is ~560 KB) is split into
+        chunks of at most 65519 bytes, each tagged with a 1-based sequence
+        number and the total count — the layout ICC.1:2001 §B.4 specifies and
+        every colour-managed reader expects. A profile needing more than 255
+        chunks cannot be represented and is skipped rather than written
+        wrongly. Best-effort — never raises: losing colour management must not
+        turn a successful compression into a failure."""
+        if not icc_bytes:
+            return
+        try:
+            data = jpg_path.read_bytes()
+            if data[:2] != b"\xff\xd8":  # no SOI — not a JPEG, leave it alone
+                return
+            step = 65519
+            chunks = [icc_bytes[i:i + step] for i in range(0, len(icc_bytes), step)]
+            if len(chunks) > 255:
+                return
+            segments = bytearray()
+            for index, chunk in enumerate(chunks, start=1):
+                payload = b"ICC_PROFILE\x00" + bytes((index, len(chunks))) + chunk
+                segments += b"\xff\xe2" + struct.pack(">H", len(payload) + 2) + payload
+            jpg_path.write_bytes(data[:2] + bytes(segments) + data[2:])
+        except Exception:
+            pass
+
     async def _optimize_avif(
         self,
         input_path: Path,
@@ -1321,6 +1448,7 @@ class Optimizer:
         *,
         keep_exif: bool = False,
         cleaned_exif: bytes = b"",
+        icc_profile: bytes = b"",
     ) -> dict:
         """AVIF encode through avifenc. Source is decoded with Pillow (EXIF
         orientation baked in, optional resize) and written to a PNG

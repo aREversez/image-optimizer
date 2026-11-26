@@ -139,7 +139,7 @@ class TestOutputDirStructure:
             return {"success": True, "original_size": 10, "compressed_size": 5, "error": None, "warning": None}
 
         opt = Optimizer(bin_dir=fake_bin_dir)
-        opt.optimize_png = slow_optimize
+        opt.optimize_image = slow_optimize
 
         import image_optimizer.main as m
         m.optimizer = opt

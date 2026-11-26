@@ -21,7 +21,7 @@ def cli_args(**overrides) -> argparse.Namespace:
         source=None, output=None, quality="medium", format="png", mode="standard",
         max_width=0, dithering=True, protect_colors="", keep_exif=False, recursive=True,
         workers=4, cache_dir=None, cache_max_size_mb=1024,
-        exclude=None, include=None, json=False,
+        exclude=None, include=None, json=False, strip_icc=False, timeout=None,
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)

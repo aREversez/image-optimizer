@@ -95,7 +95,11 @@ if not in_path.lower().endswith((".jpg", ".jpeg", ".png", ".y4m")):
     sys.stderr.write(f"Cannot read input file: {in_path}\\n")
     sys.exit(1)
 img = Image.open(in_path)
-img.save(out_path, "PNG")
+# Real avifenc carries the input's embedded ICC profile into the AVIF's
+# colr box unless --ignore-icc is given; mirror that so the ICC-preservation
+# tests exercise the same contract here.
+kw = {"icc_profile": img.info["icc_profile"]} if img.info.get("icc_profile") else {}
+img.save(out_path, "PNG", **kw)
 sys.exit(0)
 '''
 

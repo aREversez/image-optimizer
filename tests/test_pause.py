@@ -73,7 +73,7 @@ class TestPauseResume:
             return {"success": True, "original_size": 10, "compressed_size": 5,
                     "error": None, "warning": None}
 
-        opt.optimize_png = slow
+        opt.optimize_image = slow
         m.optimizer = opt
 
         # Start the batch (fires off as a background task).
@@ -150,7 +150,7 @@ class TestPauseResume:
             return {"success": True, "original_size": 10, "compressed_size": 5,
                     "error": None, "warning": None}
 
-        opt.optimize_png = slow
+        opt.optimize_image = slow
         m.optimizer = opt
 
         client.post("/api/optimize", json={}, headers=auth_headers)
@@ -184,7 +184,7 @@ class TestPauseResume:
             return {"success": True, "original_size": 10, "compressed_size": 5,
                     "error": None, "warning": None}
 
-        opt.optimize_png = slow
+        opt.optimize_image = slow
         m.optimizer = opt
 
         client.post("/api/optimize", json={}, headers=auth_headers)
@@ -243,7 +243,7 @@ class TestPauseWithSkipExistingAndSubset:
             return {"success": True, "original_size": 10, "compressed_size": 5,
                     "error": None, "warning": None}
 
-        opt.optimize_png = slow
+        opt.optimize_image = slow
         m.optimizer = opt
 
         # Re-scan (fresh workspace) and run a NARROWED selection of 3 with

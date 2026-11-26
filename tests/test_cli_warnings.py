@@ -30,7 +30,7 @@ class WarningOptimizer:
     def available_modes(self):
         return {("png", "standard"), ("png", "lossless")}
 
-    async def optimize_png(self, input_path, output_path, **kw):
+    async def optimize_image(self, input_path, output_path, **kw):
         Path(output_path).write_bytes(Path(input_path).read_bytes())
         n = Path(output_path).stat().st_size
         return {"success": True, "original_size": n, "compressed_size": n, "error": None,

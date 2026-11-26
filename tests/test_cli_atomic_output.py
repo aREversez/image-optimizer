@@ -24,7 +24,7 @@ class PartialWriter:
     def available_modes(self):
         return {("png", "standard"), ("png", "lossless")}
 
-    async def optimize_png(self, input_path, output_path, **kw):
+    async def optimize_image(self, input_path, output_path, **kw):
         Path(output_path).write_bytes(b"\x89PNG\r\n\x1a\n" + b"partial")
         return {"success": False, "error": "encoder killed", "original_size": 123, "compressed_size": None}
 
