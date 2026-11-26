@@ -28,6 +28,11 @@ HEX_COLOR_RE = re.compile(r"^#?[0-9A-Fa-f]{6}$")
 # in _find_binary.
 SUBPROCESS_TIMEOUT = 120
 
+# Pixel count at which an encoder gets the base timeout; larger images get a
+# proportionally longer one (see Optimizer._timeout_for), capped at 8x. 4 MP
+# is roughly a phone photo, the size the 120 s default was tuned against.
+PIXELS_PER_TIMEOUT_UNIT = 4_000_000
+
 # After a timed-out encoder is killed, how long to wait for it to be reaped
 # before giving up on it (see Optimizer._kill_and_reap).
 REAP_TIMEOUT = 2.0
@@ -87,6 +92,37 @@ class Optimizer:
         self._detect_lock = threading.Lock()
         self._detect_binaries()
         self._semaphore = asyncio.Semaphore(max(1, max_concurrency))
+        # Decode/resize/encode-in-Pillow work is CPU- and memory-heavy and
+        # runs in the event loop's default thread pool, which `_semaphore`
+        # does not cover (it only bounds the external encoders). Without a
+        # second bound, the CLI dispatches one task per file and every one of
+        # them can be decoding a full-size image at the same time — peak
+        # memory ends up proportional to the batch, not to --workers.
+        self._decode_semaphore = asyncio.Semaphore(max(1, max_concurrency))
+
+    async def _run_bounded(self, func, *args):
+        """Run blocking Pillow work in a thread, at most `max_concurrency`
+        at a time. Same limit as the encoder semaphore, so a run's peak
+        memory follows --workers instead of the number of files."""
+        async with self._decode_semaphore:
+            return await asyncio.get_running_loop().run_in_executor(None, func, *args)
+
+    def _timeout_for(self, input_path: Path) -> float:
+        """Encoder timeout scaled by pixel count.
+
+        A fixed 120 s is either far too generous for a 200x200 icon or far
+        too short for a 50 MP photo going through pngquant at --speed 1,
+        where a legitimate pass can take minutes and would be killed and
+        reported as a failure. Scale the base timeout linearly from 4 MP
+        (1x) up to 8x, and let --timeout move the base."""
+        base = float(SUBPROCESS_TIMEOUT)
+        try:
+            with Image.open(input_path) as img:
+                pixels = img.size[0] * img.size[1]
+        except Exception:
+            return base
+        scale = min(8.0, max(1.0, pixels / PIXELS_PER_TIMEOUT_UNIT))
+        return base * scale
 
     @property
     def ready(self) -> bool:
@@ -682,7 +718,7 @@ class Optimizer:
         # Refuse inputs the pipeline cannot represent. Pillow decodes only the
         # first frame, so an animated WebP/GIF/APNG or a multi-page TIFF would
         # otherwise be flattened to one frame and reported as a success.
-        frames = await asyncio.get_running_loop().run_in_executor(None, self._frame_count, input_path)
+        frames = await self._run_bounded(self._frame_count, input_path)
         if frames > 1:
             size = os.path.getsize(input_path)
             return {
@@ -735,13 +771,12 @@ class Optimizer:
 
         try:
             working_path = input_path
-            loop = asyncio.get_running_loop()
 
             # Step 0: guarantee we're working with a real PNG from here on, regardless
             # of the source format and regardless of whether a resize happens next.
             if not self._is_png(working_path):
                 normalized = output_path.with_suffix(".src.png")
-                await loop.run_in_executor(None, self._ensure_png, working_path, normalized)
+                await self._run_bounded(self._ensure_png, working_path, normalized, icc_profile)
                 if normalized.exists():
                     if progress_callback:
                         await progress_callback("converted to PNG")
@@ -756,7 +791,7 @@ class Optimizer:
             # comment below for the empirical numbers behind this).
             if max_width > 0 and compression_mode != "screenshot":
                 resized = output_path.with_suffix(".resized.png")
-                await loop.run_in_executor(None, self._resize_image, working_path, resized, max_width)
+                await self._run_bounded(self._resize_image, working_path, resized, max_width, icc_profile)
                 if resized.exists():
                     if progress_callback:
                         await progress_callback(f"resized to <= {max_width}px")
@@ -840,7 +875,7 @@ class Optimizer:
                 map_path: Optional[Path] = None
                 if protected_colors:
                     map_path = output_path.with_suffix(".mapcolors.png")
-                    made = await loop.run_in_executor(None, self._make_color_map, protected_colors, map_path)
+                    made = await self._run_bounded(self._make_color_map, protected_colors, map_path)
                     if made:
                         cmd += ["--map", str(map_path)]
                         temp_files.append(map_path)
@@ -855,7 +890,7 @@ class Optimizer:
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
-                    _, stderr, timed_out = await self._communicate_with_timeout(proc)
+                    _, stderr, timed_out = await self._communicate_with_timeout(proc, timeout=self._timeout_for(working_path))
 
                 if timed_out:
                     # A killed pngquant can leave a partial file at its own
@@ -931,7 +966,7 @@ class Optimizer:
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
-                    _, stderr, timed_out = await self._communicate_with_timeout(proc)
+                    _, stderr, timed_out = await self._communicate_with_timeout(proc, timeout=self._timeout_for(working_path))
 
                 if timed_out:
                     # Same partial-write hazard as pngquant above: a killed
@@ -1029,7 +1064,6 @@ class Optimizer:
             "warning": None,
         }
         try:
-            loop = asyncio.get_running_loop()
 
             def _encode():
                 with Image.open(input_path) as opened:
@@ -1064,7 +1098,7 @@ class Optimizer:
                 await progress_callback(f"encoding WebP ({mode_desc})...")
 
             async with self._semaphore:
-                await loop.run_in_executor(None, _encode)
+                await self._run_bounded(_encode)
 
             if output_path.exists():
                 result["compressed_size"] = os.path.getsize(output_path)
@@ -1137,7 +1171,6 @@ class Optimizer:
 
         temp_files: list = []
         try:
-            loop = asyncio.get_running_loop()
             ppm_path = output_path.with_suffix(".src.ppm")
             tmp_jpg = output_path.with_suffix(".cjpeg.jpg")
             temp_files = [ppm_path, tmp_jpg]
@@ -1173,7 +1206,7 @@ class Optimizer:
             if progress_callback:
                 mode_desc = "near-lossless" if compression_mode in ("lossless", "resize_only") else f"quality={q}"
                 await progress_callback(f"encoding JPEG via mozjpeg ({mode_desc})...")
-            await loop.run_in_executor(None, _prepare_ppm)
+            await self._run_bounded(_prepare_ppm)
 
             async with self._semaphore:
                 proc = await asyncio.create_subprocess_exec(
@@ -1186,7 +1219,7 @@ class Optimizer:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                _, stderr, timed_out = await self._communicate_with_timeout(proc)
+                _, stderr, timed_out = await self._communicate_with_timeout(proc, timeout=self._timeout_for(input_path))
 
             if timed_out:
                 # Killed cjpeg can leave a partial file at -outfile.
@@ -1315,7 +1348,6 @@ class Optimizer:
 
         temp_files: list = []
         try:
-            loop = asyncio.get_running_loop()
             intermediate_path = output_path.with_suffix(".src.png")
             tmp_avif = output_path.with_suffix(".avifenc.avif")
             temp_files = [intermediate_path, tmp_avif]
@@ -1339,12 +1371,18 @@ class Optimizer:
                             img = img.resize(new_size, Image.Resampling.LANCZOS)
 
                     img.info.pop("exif", None)
-                    img.save(intermediate_path, format="PNG")
+                    # The profile rides in the PNG's iCCP chunk; avifenc reads
+                    # the embedded profile from its input and copies it into
+                    # the AVIF's colr box (that is what its --ignore-icc flag
+                    # is there to turn off), so no extra command-line plumbing
+                    # is needed — and no risk from flag support in older builds.
+                    save_kwargs = {"icc_profile": icc_profile} if icc_profile else {}
+                    img.save(intermediate_path, format="PNG", **save_kwargs)
 
             if progress_callback:
                 mode_desc = "lossless" if is_lossless else f"quality={q}"
                 await progress_callback(f"encoding AVIF via avifenc ({mode_desc})...")
-            await loop.run_in_executor(None, _prepare_intermediate)
+            await self._run_bounded(_prepare_intermediate)
 
             cmd = [
                 str(self.avifenc_path),
@@ -1372,7 +1410,7 @@ class Optimizer:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                _, stderr, timed_out = await self._communicate_with_timeout(proc)
+                _, stderr, timed_out = await self._communicate_with_timeout(proc, timeout=self._timeout_for(input_path))
 
             if timed_out:
                 # Killed avifenc can leave a partial file at -o; the

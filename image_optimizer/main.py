@@ -27,6 +27,7 @@ if __package__ is None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from image_optimizer import binaries, persistence, planning
+from image_optimizer import optimizer as optimizer_module
 from image_optimizer.cache import (
     CACHEABLE_FORMATS,
     DEFAULT_CACHE_MAX_MB,
@@ -4188,6 +4189,12 @@ def main():
              "human-readable output moves to stderr so stdout can be piped to a parser.",
     )
     cli_group.add_argument(
+        "--timeout", type=float, metavar="SECONDS",
+        help="Base time budget for one encoder invocation (default 120). Scaled up for images "
+             "larger than ~4 MP (up to 8x) so a legitimate pass over a big photo is not killed; "
+             "raise this for very large images on slow or network storage.",
+    )
+    cli_group.add_argument(
         "--cache-dir", metavar="PATH",
         help="Enable a content-hash result cache stored in PATH. Unchanged inputs with the "
              "same settings are copied from the cache instead of recompressed, even when "
@@ -4230,6 +4237,14 @@ def main():
         force=args.force_download,
         out=sys.stderr if cli_json else None,
     )
+
+    if getattr(args, "timeout", None) is not None:
+        if args.timeout <= 0:
+            print("[Error] --timeout must be > 0", file=sys.stderr)
+            sys.exit(1)
+        # Read lazily by Optimizer._timeout_for / _communicate_with_timeout,
+        # so this covers the CLI batch and the server's own encodes alike.
+        optimizer_module.SUBPROCESS_TIMEOUT = float(args.timeout)
 
     if args.source:
         CONCURRENT_WORKERS = max(1, args.workers)
