@@ -6,6 +6,7 @@ Screenshot tools and editors that re-save a file filled the output folder
 with stale copies."""
 from __future__ import annotations
 
+import os
 import time
 
 from PIL import Image
@@ -58,6 +59,27 @@ class TestWatchResave:
             Image.new("RGB", (24, 24), (0, 0, 200)).save(watch / "shot.bmp")
             wait_for(_processed(client, auth_headers, 2), timeout=20.0)
             assert sorted(p.name for p in out.iterdir()) == ["shot.png", "shot_2.png"]
+        finally:
+            client.post("/api/watch/stop", headers=auth_headers)
+
+    def test_case_only_rename_reuses_the_same_output(self, client, auth_headers, tmp_path):
+        """The owner map is case-folded, so "Shot.png" -> "shot.png" (allowed
+        on Windows and default macOS volumes) used to look like a different
+        source claiming the name and produced shot_2.png."""
+        watch, out = tmp_path / "watch", tmp_path / "out"
+        watch.mkdir()
+        out.mkdir()
+        _start(client, auth_headers, watch, out, recursive=False)
+        try:
+            src = watch / "Shot.png"
+            Image.new("RGB", (24, 24), (5, 6, 7)).save(src)
+            wait_for(_processed(client, auth_headers, 1), timeout=20.0)
+            os.rename(src, watch / "shot.png")
+            wait_for(_processed(client, auth_headers, 2), timeout=20.0)
+            # Without the fix this is ["Shot.png", "shot_2.png"]: the owner
+            # map is case-folded, so the renamed source looked like a
+            # different file claiming its own name.
+            assert sorted(p.name for p in out.iterdir()) == ["shot.png"]
         finally:
             client.post("/api/watch/stop", headers=auth_headers)
 

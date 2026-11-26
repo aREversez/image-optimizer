@@ -3305,10 +3305,16 @@ async def _watch_loop(state: AppState, req: WatchRequest):
                 if out_path is None:
                     out_path = output_dir / Path(rel_path).with_suffix(f".{req.output_format}")
                     # Collision guard: same output name from a different source
-                    # (other subfolder, or photo.png vs photo.jpg).
+                    # (other subfolder, or photo.png vs photo.jpg). The owner
+                    # map is case-folded, so a case-only rename
+                    # ("Shot.png" -> "shot.png", which Windows and default
+                    # macOS volumes allow) collides with its own previous
+                    # output; that is the same source, so take the name back
+                    # instead of numbering a duplicate — the rename cleanup
+                    # below then drops the old spelling's file.
                     key = str(out_path).lower()
                     n = 2
-                    while owner_of.get(key, rel_path) != rel_path:
+                    while owner_of.get(key, rel_path) not in (rel_path, renamed_from):
                         out_path = output_dir / Path(rel_path).with_name(
                             f"{Path(rel_path).stem}_{n}.{req.output_format}"
                         )
