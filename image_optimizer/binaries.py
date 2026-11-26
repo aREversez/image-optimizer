@@ -233,6 +233,74 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _download_url(artifact: Artifact) -> str:
+    """The URL to fetch, allowing a pinned mirror to be substituted.
+
+    pngquant's Windows build is served from a version-less URL
+    (pngquant.org/pngquant-windows.zip) that upstream can replace at any
+    time. When that happens the digest check fails and every Windows user
+    loses pngquant until a release ships a new pin — unless they can point
+    at a mirror that still serves the pinned bytes. Any override is still
+    verified against the same digest, so this changes where the bytes come
+    from, never whether they are trusted.
+    """
+    override = os.environ.get(f"IMAGE_OPTIMIZER_{artifact.tool.upper()}_URL")
+    return override.strip() if override and override.strip() else artifact.url
+
+
+def _digest_sidecar(target: Path) -> Path:
+    """Path of the recorded digest for an installed binary.
+
+    Needed on POSIX oxipng, whose pinned digest covers the release archive
+    rather than the extracted file: once the archive is gone there is nothing
+    to check a later start against, so the extracted file's own digest is
+    recorded next to it at install time."""
+    return target.with_name(target.name + ".sha256")
+
+
+def _write_digest_sidecar(target: Path, digest: str) -> None:
+    try:
+        _digest_sidecar(target).write_text(digest + "\n", encoding="ascii")
+    except OSError:
+        pass
+
+
+def _read_digest_sidecar(target: Path) -> Optional[str]:
+    try:
+        text = _digest_sidecar(target).read_text(encoding="ascii").strip()
+    except OSError:
+        return None
+    return text.lower() if len(text) == 64 else None
+
+
+def _stage_and_replace(target: Path, payload: bytes, *, executable: bool) -> None:
+    """Write `payload` next to `target` under a unique temporary name, then
+    rename it into place.
+
+    The name must be unique per process: two first runs at the same time used
+    to share `<target>.part`, so each could see the other's half-written bytes
+    and rename them into place. mkstemp also guarantees the file exists with
+    a name no glob in _find_binary could match."""
+    fd, staging_name = tempfile.mkstemp(
+        dir=str(target.parent), prefix=target.name + ".", suffix=".part"
+    )
+    staging = Path(staging_name)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if executable and sys.platform != "win32":
+            os.chmod(staging, 0o755)
+        os.replace(staging, target)
+    except BaseException:
+        try:
+            staging.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def _download(url: str, dest: Path) -> int:
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     total = 0
@@ -299,12 +367,13 @@ def _install_artifact(artifact: Artifact, target_dir: Path, *, force: bool, out)
     target = target_dir / artifact.filename
 
     if target.exists() and not force:
-        # An existing file is only trusted when we can re-verify it; otherwise
-        # (oxipng on POSIX, whose digest covers the archive rather than the
-        # binary) we take its presence at face value — re-downloading a 500 KB
-        # tarball on every start would be worse than the risk it mitigates.
-        if artifact.member_sha256:
-            if _sha256_file(target) == artifact.member_sha256:
+        # Verify against the pinned member digest, or — for an artifact whose
+        # pin covers the archive (POSIX oxipng) — against the digest recorded
+        # at install time. Taking mere presence at face value means a
+        # truncated or replaced file is executed.
+        expected = artifact.member_sha256 or _read_digest_sidecar(target)
+        if expected:
+            if _sha256_file(target) == expected:
                 print(f"[Binaries] {artifact.tool} {artifact.version} already installed", file=out)
                 return "present"
             print(
@@ -313,17 +382,26 @@ def _install_artifact(artifact: Artifact, target_dir: Path, *, force: bool, out)
                 file=out,
             )
         else:
-            print(f"[Binaries] {artifact.tool} {artifact.version} already installed", file=out)
+            # Installed by a version that did not record a digest. Trusting it
+            # keeps an offline machine working (a re-download here would fail
+            # and turn a usable install into "no encoder"); the next forced
+            # install records a digest.
+            print(
+                f"[Binaries] {artifact.tool} {artifact.version} already installed "
+                f"(digest not recorded by an earlier version)",
+                file=out,
+            )
             return "present"
 
     if not (artifact.sha256 or artifact.member_sha256):
         raise DownloadError("refusing to download an artifact with no pinned digest")
 
     target_dir.mkdir(parents=True, exist_ok=True)
+    url = _download_url(artifact)
     with tempfile.TemporaryDirectory(prefix="imgopt-dl-") as tmp:
         archive = Path(tmp) / "archive"
-        print(f"[Binaries] downloading {artifact.tool} {artifact.version} from {artifact.url}", file=out)
-        size = _download(artifact.url, archive)
+        print(f"[Binaries] downloading {artifact.tool} {artifact.version} from {url}", file=out)
+        size = _download(url, archive)
         if artifact.sha256 and _sha256_file(archive) != artifact.sha256:
             raise DownloadError("archive SHA-256 mismatch — discarded")
         payload = _read_member(artifact, archive)
@@ -336,11 +414,8 @@ def _install_artifact(artifact: Artifact, target_dir: Path, *, force: bool, out)
 
     # Write-then-rename so a crash or a second instance never leaves a
     # half-written executable where _find_binary would happily exec it.
-    staging = target.with_name(target.name + ".part")
-    staging.write_bytes(payload)
-    if artifact.executable and sys.platform != "win32":
-        os.chmod(staging, 0o755)
-    os.replace(staging, target)
+    _stage_and_replace(target, payload, executable=artifact.executable)
+    _write_digest_sidecar(target, hashlib.sha256(payload).hexdigest())
     print(f"[Binaries] installed {artifact.tool} {artifact.version} ({size // 1024} KB) -> {target}", file=out)
     return "installed"
 
@@ -366,6 +441,12 @@ def _print_manual_help(artifact: Artifact, reason: str, out) -> None:
         print(f"          expected SHA-256: {artifact.member_sha256}", file=out)
     elif artifact.sha256:
         print(f"          expected archive SHA-256: {artifact.sha256}", file=out)
+    if not os.environ.get(f"IMAGE_OPTIMIZER_{artifact.tool.upper()}_URL"):
+        print(
+            f"          or set IMAGE_OPTIMIZER_{artifact.tool.upper()}_URL to a mirror "
+            "serving the pinned bytes",
+            file=out,
+        )
 
 
 def _print_platform_help(platform_key: str, out) -> None:

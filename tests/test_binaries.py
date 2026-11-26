@@ -376,3 +376,227 @@ def test_download_enabled_env_opt_out(monkeypatch, raw, expected):
 
     monkeypatch.setenv("IMAGE_OPTIMIZER_NO_DOWNLOAD", raw)
     assert _download_enabled() is expected
+
+
+# --- R4: staging isolation, recorded digests, mirror override -------------
+
+
+def test_existing_part_file_is_never_reused(tmp_path):
+    """Two first runs at once used to share `<target>.part`. A leftover from
+    another downloader must not be overwritten, and ours must not stay."""
+    target = tmp_path / "pngquant.exe"
+    leftover = tmp_path / "pngquant.exe.part"
+    leftover.write_bytes(b"someone else's in-flight download")
+
+    binaries._stage_and_replace(target, b"payload", executable=False)
+
+    assert target.read_bytes() == b"payload"
+    assert leftover.read_bytes() == b"someone else's in-flight download"
+    assert not list(tmp_path.glob("pngquant.exe.*.part")), "our staging file must be gone"
+
+
+def test_staging_file_is_unique_per_call(tmp_path):
+    names = []
+    real_mkstemp = binaries.tempfile.mkstemp
+
+    def recording_mkstemp(*args, **kwargs):
+        fd, name = real_mkstemp(*args, **kwargs)
+        names.append(name)
+        return fd, name
+
+    binaries.tempfile.mkstemp = recording_mkstemp
+    try:
+        target = tmp_path / "oxipng"
+        binaries._stage_and_replace(target, b"one", executable=False)
+        binaries._stage_and_replace(target, b"two", executable=False)
+    finally:
+        binaries.tempfile.mkstemp = real_mkstemp
+    assert len(set(names)) == 2, names
+
+
+def test_install_records_a_digest_for_archive_pinned_artifacts(served, isolated_binary_dir):
+    """POSIX oxipng's pin covers the tarball, so the extracted binary needs
+    its own recorded digest or every later start has nothing to check."""
+    base, root = served
+    archive = _tar_bytes({"oxipng-10.1.1/oxipng": b"ELF-ish"})
+    (root / "ox.tar.gz").write_bytes(archive)
+    artifact = binaries.Artifact(
+        tool="oxipng", version="0.0.1", url=f"{base}/ox.tar.gz",
+        member="oxipng", sha256=_sha(archive), kind="tar.gz", executable=True,
+    )
+
+    first = binaries.ensure_binaries(artifacts=(artifact,), out=io.StringIO())
+    assert first.installed == ["oxipng"]
+    installed = isolated_binary_dir / "oxipng"
+    assert binaries._read_digest_sidecar(installed) == _sha(b"ELF-ish")
+
+    # Untouched: present, no download needed (the server would still answer).
+    second = binaries.ensure_binaries(artifacts=(artifact,), out=io.StringIO())
+    assert second.present == ["oxipng"]
+
+
+def test_tampered_archive_pinned_binary_is_reinstalled(served, isolated_binary_dir):
+    """Before this check, a replaced oxipng was trusted forever because its
+    pin could not be re-derived from the file itself."""
+    base, root = served
+    archive = _tar_bytes({"oxipng-10.1.1/oxipng": b"ELF-ish"})
+    (root / "ox.tar.gz").write_bytes(archive)
+    artifact = binaries.Artifact(
+        tool="oxipng", version="0.0.1", url=f"{base}/ox.tar.gz",
+        member="oxipng", sha256=_sha(archive), kind="tar.gz", executable=True,
+    )
+    binaries.ensure_binaries(artifacts=(artifact,), out=io.StringIO())
+    installed = isolated_binary_dir / "oxipng"
+    installed.write_bytes(b"planted binary")
+
+    report = binaries.ensure_binaries(artifacts=(artifact,), out=io.StringIO())
+
+    assert report.installed == ["oxipng"]
+    assert installed.read_bytes() == b"ELF-ish"
+    assert binaries._read_digest_sidecar(installed) == _sha(b"ELF-ish")
+
+
+def test_mirror_override_is_used_and_still_verified(served, isolated_binary_dir, monkeypatch):
+    """Upstream can replace pngquant's version-less Windows zip at any time;
+    a pinned mirror has to be usable without weakening the digest check."""
+    base, root = served
+    payload = b"the pinned bytes"
+    (root / "elsewhere.zip").write_bytes(_zip_bytes({"pngquant.exe": payload}))
+    artifact = binaries.Artifact(
+        tool="pngquant", version="0.0.1",
+        url="http://127.0.0.1:1/never-reachable.zip",
+        member="pngquant.exe", member_sha256=_sha(payload),
+    )
+    monkeypatch.setenv("IMAGE_OPTIMIZER_PNGQUANT_URL", f"{base}/elsewhere.zip")
+
+    report = binaries.ensure_binaries(artifacts=(artifact,), out=io.StringIO())
+
+    assert report.installed == ["pngquant"], report.failed
+    assert (isolated_binary_dir / "pngquant.exe").read_bytes() == payload
+
+
+def test_mirror_override_cannot_bypass_the_digest(served, isolated_binary_dir, monkeypatch):
+    base, root = served
+    (root / "evil.zip").write_bytes(_zip_bytes({"pngquant.exe": b"unpinned bytes"}))
+    artifact = binaries.Artifact(
+        tool="pngquant", version="0.0.1", url=f"{base}/never.zip",
+        member="pngquant.exe", member_sha256=_sha(b"the pinned bytes"),
+    )
+    monkeypatch.setenv("IMAGE_OPTIMIZER_PNGQUANT_URL", f"{base}/evil.zip")
+
+    report = binaries.ensure_binaries(artifacts=(artifact,), out=io.StringIO())
+
+    assert "pngquant" in report.failed
+    assert not (isolated_binary_dir / "pngquant.exe").exists()
+
+
+# --- R4: staging isolation, recorded digests, mirror override -------------
+
+
+def test_existing_part_file_is_never_reused(tmp_path):
+    """Two first runs at once used to share `<target>.part`. A leftover from
+    another downloader must not be overwritten, and ours must not stay."""
+    target = tmp_path / "pngquant.exe"
+    leftover = tmp_path / "pngquant.exe.part"
+    leftover.write_bytes(b"someone else's in-flight download")
+
+    binaries._stage_and_replace(target, b"payload", executable=False)
+
+    assert target.read_bytes() == b"payload"
+    assert leftover.read_bytes() == b"someone else's in-flight download"
+    assert not list(tmp_path.glob("pngquant.exe.*.part")), "our staging file must be gone"
+
+
+def test_staging_file_is_unique_per_call(tmp_path):
+    names = []
+    real_mkstemp = binaries.tempfile.mkstemp
+
+    def recording_mkstemp(*args, **kwargs):
+        fd, name = real_mkstemp(*args, **kwargs)
+        names.append(name)
+        return fd, name
+
+    binaries.tempfile.mkstemp = recording_mkstemp
+    try:
+        target = tmp_path / "oxipng"
+        binaries._stage_and_replace(target, b"one", executable=False)
+        binaries._stage_and_replace(target, b"two", executable=False)
+    finally:
+        binaries.tempfile.mkstemp = real_mkstemp
+    assert len(set(names)) == 2, names
+
+
+def test_install_records_a_digest_for_archive_pinned_artifacts(served, isolated_binary_dir):
+    """POSIX oxipng's pin covers the tarball, so the extracted binary needs
+    its own recorded digest or every later start has nothing to check."""
+    base, root = served
+    archive = _tar_bytes({"oxipng-10.1.1/oxipng": b"ELF-ish"})
+    (root / "ox.tar.gz").write_bytes(archive)
+    artifact = binaries.Artifact(
+        tool="oxipng", version="0.0.1", url=f"{base}/ox.tar.gz",
+        member="oxipng", sha256=_sha(archive), kind="tar.gz", executable=True,
+    )
+
+    first = binaries.ensure_binaries(artifacts=(artifact,), out=io.StringIO())
+    assert first.installed == ["oxipng"]
+    installed = isolated_binary_dir / "oxipng"
+    assert binaries._read_digest_sidecar(installed) == _sha(b"ELF-ish")
+
+    # Untouched: present, no download needed (the server would still answer).
+    second = binaries.ensure_binaries(artifacts=(artifact,), out=io.StringIO())
+    assert second.present == ["oxipng"]
+
+
+def test_tampered_archive_pinned_binary_is_reinstalled(served, isolated_binary_dir):
+    """Before this check, a replaced oxipng was trusted forever because its
+    pin could not be re-derived from the file itself."""
+    base, root = served
+    archive = _tar_bytes({"oxipng-10.1.1/oxipng": b"ELF-ish"})
+    (root / "ox.tar.gz").write_bytes(archive)
+    artifact = binaries.Artifact(
+        tool="oxipng", version="0.0.1", url=f"{base}/ox.tar.gz",
+        member="oxipng", sha256=_sha(archive), kind="tar.gz", executable=True,
+    )
+    binaries.ensure_binaries(artifacts=(artifact,), out=io.StringIO())
+    installed = isolated_binary_dir / "oxipng"
+    installed.write_bytes(b"planted binary")
+
+    report = binaries.ensure_binaries(artifacts=(artifact,), out=io.StringIO())
+
+    assert report.installed == ["oxipng"]
+    assert installed.read_bytes() == b"ELF-ish"
+    assert binaries._read_digest_sidecar(installed) == _sha(b"ELF-ish")
+
+
+def test_mirror_override_is_used_and_still_verified(served, isolated_binary_dir, monkeypatch):
+    """Upstream can replace pngquant's version-less Windows zip at any time;
+    a pinned mirror has to be usable without weakening the digest check."""
+    base, root = served
+    payload = b"the pinned bytes"
+    (root / "elsewhere.zip").write_bytes(_zip_bytes({"pngquant.exe": payload}))
+    artifact = binaries.Artifact(
+        tool="pngquant", version="0.0.1",
+        url="http://127.0.0.1:1/never-reachable.zip",
+        member="pngquant.exe", member_sha256=_sha(payload),
+    )
+    monkeypatch.setenv("IMAGE_OPTIMIZER_PNGQUANT_URL", f"{base}/elsewhere.zip")
+
+    report = binaries.ensure_binaries(artifacts=(artifact,), out=io.StringIO())
+
+    assert report.installed == ["pngquant"], report.failed
+    assert (isolated_binary_dir / "pngquant.exe").read_bytes() == payload
+
+
+def test_mirror_override_cannot_bypass_the_digest(served, isolated_binary_dir, monkeypatch):
+    base, root = served
+    (root / "evil.zip").write_bytes(_zip_bytes({"pngquant.exe": b"unpinned bytes"}))
+    artifact = binaries.Artifact(
+        tool="pngquant", version="0.0.1", url=f"{base}/never.zip",
+        member="pngquant.exe", member_sha256=_sha(b"the pinned bytes"),
+    )
+    monkeypatch.setenv("IMAGE_OPTIMIZER_PNGQUANT_URL", f"{base}/evil.zip")
+
+    report = binaries.ensure_binaries(artifacts=(artifact,), out=io.StringIO())
+
+    assert "pngquant" in report.failed
+    assert not (isolated_binary_dir / "pngquant.exe").exists()
