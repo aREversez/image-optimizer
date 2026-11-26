@@ -630,7 +630,24 @@ def _split_host(value: str) -> Optional[str]:
         host = urlsplit("//" + value.strip()).hostname
     except ValueError:
         return None
-    return host.lower() if host else None
+    # Lower-case, and drop the trailing dot of a fully-qualified name
+    # ("localhost." is the same host as "localhost").
+    return host.lower().rstrip(".") if host else None
+
+
+def _operator_hosts() -> set[str]:
+    """Hostnames the operator explicitly trusts: the one the server was bound
+    to plus IMAGE_OPTIMIZER_ALLOWED_HOSTS (comma separated)."""
+    hosts = {h.strip().lower().rstrip(".") for h in os.environ.get("IMAGE_OPTIMIZER_ALLOWED_HOSTS", "").split(",") if h.strip()}
+    if _BOUND_HOST:
+        hosts.add(_BOUND_HOST.strip().lower().rstrip("."))
+    return hosts
+
+
+_HOST_HINT = (
+    "If you reach the app under this name on purpose, list it in the "
+    "IMAGE_OPTIMIZER_ALLOWED_HOSTS environment variable (comma separated)."
+)
 
 
 def _host_allowed(host_header: str) -> bool:
@@ -650,10 +667,7 @@ def _host_allowed(host_header: str) -> bool:
         return True
     except ValueError:
         pass
-    extra = {h.strip().lower() for h in os.environ.get("IMAGE_OPTIMIZER_ALLOWED_HOSTS", "").split(",") if h.strip()}
-    if _BOUND_HOST:
-        extra.add(_BOUND_HOST.strip().lower())
-    return host in extra
+    return host in _operator_hosts()
 
 
 @app.middleware("http")
@@ -668,7 +682,7 @@ async def host_and_origin_middleware(request: Request, call_next):
        differs from the Host header. Requests without these headers (curl,
        scripts, tests) are unaffected - they still need the app token."""
     if not _host_allowed(request.headers.get("host", "")):
-        return JSONResponse({"error": "Invalid Host header"}, status_code=400)
+        return JSONResponse({"error": f"Invalid Host header. {_HOST_HINT}"}, status_code=400)
     if request.method not in _SAFE_METHODS:
         site = request.headers.get("sec-fetch-site")
         if site is not None and site not in ("same-origin", "none"):
@@ -679,8 +693,17 @@ async def host_and_origin_middleware(request: Request, call_next):
                 origin_netloc = urlsplit(origin).netloc.lower()
             except ValueError:
                 origin_netloc = ""
-            if origin_netloc != request.headers.get("host", "").strip().lower():
-                return JSONResponse({"error": "Cross-site request refused"}, status_code=403)
+            # Same origin as the Host header, or - for a reverse proxy that
+            # rewrites Host to the upstream address - an origin the operator
+            # listed explicitly. IP literals and localhost are deliberately
+            # not a pass here: only a name the operator named is.
+            if (
+                origin_netloc != request.headers.get("host", "").strip().lower()
+                and _split_host(origin_netloc) not in _operator_hosts()
+            ):
+                return JSONResponse(
+                    {"error": f"Cross-site request refused. {_HOST_HINT}"}, status_code=403,
+                )
         elif origin == "null":
             return JSONResponse({"error": "Cross-site request refused"}, status_code=403)
     return await call_next(request)

@@ -85,3 +85,35 @@ class TestOriginCheck:
     def test_cross_site_get_is_not_blocked_by_the_origin_rule(self, client):
         """Reads are protected by the Host and token checks, not the Origin rule."""
         assert client.get("/api/health", headers={"Origin": "https://other.example"}).status_code in (200, 503)
+
+
+class TestReverseProxyAndNormalisation:
+    def test_proxy_that_rewrites_host_works_when_the_public_name_is_allowed(self, client, monkeypatch):
+        """nginx's default sends Host: 127.0.0.1:PORT while the browser's
+        Origin is the public name. Allowed only because the operator listed
+        that name; an unlisted origin stays refused."""
+        tok = _token(client)
+        hdr = {"X-App-Token": tok, "Host": "127.0.0.1:8000", "Origin": "https://tools.example"}
+        body = {"directory": "/nonexistent"}
+        assert client.post("/api/scan", json=body, headers=hdr).status_code == 403
+        monkeypatch.setenv("IMAGE_OPTIMIZER_ALLOWED_HOSTS", "tools.example")
+        assert client.post("/api/scan", json=body, headers=hdr).status_code == 400  # reached the handler
+        hdr["Origin"] = "https://attacker.example"
+        assert client.post("/api/scan", json=body, headers=hdr).status_code == 403
+
+    def test_ip_literal_origin_is_not_a_blanket_pass_for_a_different_host(self, client):
+        tok = _token(client)
+        r = client.post("/api/scan", json={"directory": "/nonexistent"},
+                        headers={"X-App-Token": tok, "Origin": "http://192.168.1.50:8080"})
+        assert r.status_code == 403
+
+    def test_trailing_dot_and_case_are_normalised(self, client):
+        assert client.get("/", headers={"Host": "LocalHost.:8090"}).status_code == 200
+
+    def test_refusals_name_the_setting_that_fixes_them(self, client):
+        r = client.get("/", headers={"Host": "mybox.lan"})
+        assert r.status_code == 400 and "IMAGE_OPTIMIZER_ALLOWED_HOSTS" in r.json()["error"]
+        tok = _token(client)
+        r = client.post("/api/scan", json={"directory": "/x"},
+                        headers={"X-App-Token": tok, "Origin": "https://tools.example", "Host": "127.0.0.1:8000"})
+        assert r.status_code == 403 and "IMAGE_OPTIMIZER_ALLOWED_HOSTS" in r.json()["error"]
