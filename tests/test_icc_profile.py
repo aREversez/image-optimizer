@@ -159,3 +159,54 @@ def test_embedded_profile_does_not_disturb_pixels(optimizer, tmp_path):
     _run(optimizer, plain, without, "webp")
     with Image.open(with_profile) as a, Image.open(without) as b:
         assert a.tobytes() == b.tobytes()
+
+
+def _profile_with_space(space: bytes) -> bytes:
+    """A header-only ICC blob whose data colour space (bytes 16:20) is `space`."""
+    hdr = bytearray(128)
+    hdr[0:4] = (len(hdr) + 4).to_bytes(4, "big")
+    hdr[16:20] = space
+    hdr[36:40] = b"acsp"
+    return bytes(hdr) + b"\x00\x00\x00\x00"
+
+
+def test_cmyk_profile_is_not_attached_to_the_rgb_output(optimizer, tmp_path):
+    """A CMYK source is converted to RGB before encoding, so its CMYK profile
+    no longer describes the pixels. Attaching it anyway gets the output
+    rejected or rendered with the wrong colours by colour-managed readers."""
+    src = tmp_path / "print.jpg"
+    Image.new("CMYK", (64, 64), (10, 200, 10, 0)).save(
+        src, "JPEG", icc_profile=_profile_with_space(b"CMYK"),
+    )
+    for fmt in ("webp", "png", "jpg"):
+        out = tmp_path / f"out.{fmt}"
+        _run(optimizer, src, out, fmt)
+        assert _read_icc(out) == b"", fmt
+
+
+def test_gray_profile_is_not_attached_to_rgb_output(optimizer, tmp_path):
+    src = tmp_path / "gray.png"
+    Image.new("L", (64, 64), 120).save(src, "PNG", icc_profile=_profile_with_space(b"GRAY"))
+    out = tmp_path / "out.webp"  # WebP is always written as RGB(A)
+    _run(optimizer, src, out, "webp")
+    assert _read_icc(out) == b""
+
+
+def test_rgb_profile_is_still_kept(optimizer, tmp_path):
+    prof = _profile_with_space(b"RGB ")
+    src = tmp_path / "ok.png"
+    Image.new("RGB", (64, 64), (1, 2, 3)).save(src, "PNG", icc_profile=prof)
+    out = tmp_path / "out.webp"
+    _run(optimizer, src, out, "webp")
+    assert _read_icc(out) == prof
+
+
+def test_strip_icc_drops_the_profile_in_every_format(optimizer, tmp_path):
+    """Pillow's PNG writer re-attaches img.info["icc_profile"] on its own, so
+    the intermediate PNGs (PNG output, AVIF input) kept the profile even with
+    --strip-icc unless it is removed from info explicitly."""
+    for src_fmt, out_fmt in (("jpg", "png"), ("png", "png"), ("jpg", "avif"), ("jpg", "webp"), ("jpg", "jpg")):
+        src = _source(tmp_path / f"s_{src_fmt}_{out_fmt}.{src_fmt}", src_fmt)
+        out = tmp_path / f"o_{src_fmt}.{out_fmt}"
+        _run(optimizer, src, out, out_fmt, keep_icc=False)
+        assert _read_icc(out) == b"", (src_fmt, out_fmt)

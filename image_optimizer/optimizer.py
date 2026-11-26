@@ -572,6 +572,11 @@ class Optimizer:
             # re-attached at the very end of the pipeline only when
             # keep_exif=True (see _finalize_png_exif / _optimize_webp).
             img.info.pop("exif", None)
+            # Pillow's PNG writer falls back to img.info["icc_profile"] when
+            # no icc_profile= is given, so the profile has to be removed
+            # from info for --strip-icc (or a profile not describing RGB
+            # pixels) to take effect.
+            img.info.pop("icc_profile", None)
             save_kwargs = {"icc_profile": icc_profile} if icc_profile else {}
             img.save(dst, format="PNG", **save_kwargs)
 
@@ -583,6 +588,11 @@ class Optimizer:
                 return
             img = img.resize(new_size, Image.Resampling.LANCZOS)
             img.info.pop("exif", None)
+            # Pillow's PNG writer falls back to img.info["icc_profile"] when
+            # no icc_profile= is given, so the profile has to be removed
+            # from info for --strip-icc (or a profile not describing RGB
+            # pixels) to take effect.
+            img.info.pop("icc_profile", None)
             save_kwargs = {"icc_profile": icc_profile} if icc_profile else {}
             img.save(dst, format="PNG", **save_kwargs)
 
@@ -675,9 +685,20 @@ class Optimizer:
         try:
             with Image.open(src) as img:
                 profile = img.info.get("icc_profile")
-                return bytes(profile) if profile else b""
+                if not profile:
+                    return b""
+                profile = bytes(profile)
         except Exception:
             return b""
+        # Every pipeline writes RGB pixels (CMYK and palette sources are
+        # converted first, and WebP/JPEG/AVIF are RGB containers), so only a
+        # profile whose data colour space is RGB still describes the output.
+        # A CMYK or grayscale profile on RGB pixels is wrong, and strict
+        # readers drop or reject the image. The space is the 4-byte signature
+        # at offset 16 of the ICC header.
+        if profile[16:20] != b"RGB ":
+            return b""
+        return profile
 
     @staticmethod
     def _strip_png_chunks(data: bytes, chunk_type: bytes) -> bytes:
@@ -777,6 +798,17 @@ class Optimizer:
             if iend_start is None:
                 return
             png_path.write_bytes(data[:iend_start] + chunk + data[iend_start:])
+        except Exception:
+            pass
+
+    @staticmethod
+    def _remove_png_icc(png_path: Path) -> None:
+        """Drop any iCCP chunk from a finished PNG. Best-effort, never raises."""
+        try:
+            data = png_path.read_bytes()
+            if data[:8] != PNG_MAGIC or Optimizer._find_png_chunk_offset(data, b"iCCP") is None:
+                return
+            png_path.write_bytes(Optimizer._strip_png_chunks(data, b"iCCP"))
         except Exception:
             pass
 
@@ -1119,11 +1151,16 @@ class Optimizer:
             # so the reported size is refreshed to stay truthful.
             if icc_profile:
                 self._finalize_png_icc(output_path, icc_profile)
-                if result["success"]:
-                    try:
-                        result["compressed_size"] = os.path.getsize(output_path)
-                    except OSError:
-                        pass
+            else:
+                # No profile to carry (--strip-icc, or the source's profile
+                # did not describe RGB pixels): oxipng's "--strip safe" and a
+                # PNG that skipped re-encoding both keep an existing iCCP.
+                self._remove_png_icc(output_path)
+            if result["success"]:
+                try:
+                    result["compressed_size"] = os.path.getsize(output_path)
+                except OSError:
+                    pass
 
         except Exception as e:
             result["success"] = False
@@ -1525,6 +1562,7 @@ class Optimizer:
                             img = img.resize(new_size, Image.Resampling.LANCZOS)
 
                     img.info.pop("exif", None)
+                    img.info.pop("icc_profile", None)  # see _ensure_png
                     # The profile rides in the PNG's iCCP chunk; avifenc reads
                     # the embedded profile from its input and copies it into
                     # the AVIF's colr box (that is what its --ignore-icc flag
