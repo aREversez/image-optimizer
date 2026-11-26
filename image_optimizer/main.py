@@ -1921,7 +1921,8 @@ async def _process_files(
                 source_unchanged
                 and settings_unchanged
                 and dest.stat().st_size > 0
-                and _is_valid_reusable_output(dest, eff_output_format)
+                # Full decode of JPEG/WebP: keep it off the event loop.
+                and await asyncio.to_thread(_is_valid_reusable_output, dest, eff_output_format)
             ):
                 # Staged like every other write: this copy becomes the file
                 # /api/result serves and the ZIP download ships, so a kill

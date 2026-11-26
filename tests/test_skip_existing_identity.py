@@ -79,3 +79,25 @@ class TestSkipExistingBindsToSource:
         main._save_skip_fingerprints(str(out), {"a.webp": legacy_fp})
         again = _run(client, auth_headers, src, out)
         assert again and not any(r.get("skipped") for r in again)
+
+
+def test_reuse_validation_runs_off_the_event_loop(client, auth_headers, tmp_path, app_module, monkeypatch):
+    """is_valid_reusable_output now fully decodes JPEG/WebP (about 0.3 s for a
+    24 MP photo); called on the loop it would stall every worker, /api/progress
+    and the SSE stream once per reused file."""
+    src, out = tmp_path / "src", tmp_path / "out"
+    src.mkdir()
+    Image.new("RGB", (64, 64), (255, 0, 0)).save(src / "a.png")
+    _run(client, auth_headers, src, out)
+    seen = []
+    real = app_module._is_valid_reusable_output
+
+    def spy(path, fmt):
+        import asyncio
+        seen.append(asyncio._get_running_loop() is not None)  # True = called on the loop thread
+        return real(path, fmt)
+
+    monkeypatch.setattr(app_module, "_is_valid_reusable_output", spy)
+    second = _run(client, auth_headers, src, out)
+    assert second and all(r.get("skipped") for r in second)
+    assert seen == [False], seen
