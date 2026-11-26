@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import sys
 from pathlib import Path
@@ -19,6 +20,7 @@ from PIL import Image
 
 from image_optimizer import planning
 from .conftest import wait_for
+from .test_batch_resume import _batch_state_path, _save_batch_state
 from .test_cli import cli_args
 from .test_api_optimize import scan_and_wait, optimize_and_wait
 
@@ -217,6 +219,129 @@ class TestWebRejectsUnsafeOutput:
         logs = client.get("/api/progress", headers=auth_headers).json()["logs"]
         assert any("refusing to overwrite the original" in line for line in logs)
         assert os.stat(src / "a.png").st_ino == inode_before
+
+
+class TestSourceRootForRun:
+    """The root the safety check runs against must be the folder that really
+    holds the sources, not a remembered scan folder."""
+
+    def test_scan_root_used_when_every_file_lives_under_it(self, app_module, tmp_path):
+        src = _make_src(tmp_path)
+
+        class S:
+            input_dir = str(src)
+            input_recursive = True
+
+        files = [{"path": str(src / "a.png")}, {"path": str(src / "sub" / "b.png")}]
+        assert app_module._source_root_for_run(S, files) == (str(src), True)
+
+    def test_stale_scan_root_falls_back_to_the_files_own_folder(self, app_module, tmp_path):
+        """A scan of A followed by an upload leaves input_dir pointing at A;
+        checking output against A would miss the folder that holds the
+        uploads, so the run is pinned to the files' own parent instead."""
+        scanned = _make_src(tmp_path)
+        uploads = tmp_path / "uploads"
+        uploads.mkdir()
+        (uploads / "u.png").write_bytes(b"x")
+
+        class S:
+            input_dir = str(scanned)
+            input_recursive = True
+
+        assert app_module._source_root_for_run(S, [{"path": str(uploads / "u.png")}]) == (
+            str(uploads), False,
+        )
+
+    def test_no_scan_root_uses_first_parent_without_recursion(self, app_module, tmp_path):
+        src = _make_src(tmp_path)
+
+        class S:
+            input_dir = ""
+            input_recursive = True
+
+        assert app_module._source_root_for_run(S, [{"path": str(src / "a.png")}]) == (str(src), False)
+
+
+class TestResumeRechecksFolderSafety:
+    """F1 was fixed for new runs only: resume skipped the check, so a batch
+    written before the guard existed (or by an older version) could still be
+    resumed into a folder holding its originals."""
+
+    @staticmethod
+    def _batch(out, src, names, **extra):
+        bs = {
+            "output_dir": str(out),
+            "input_dir": str(src),
+            "files": [
+                {"id": str(i), "path": str(src / n), "name": n,
+                 "size": (src / n).stat().st_size, "status": "pending"}
+                for i, n in enumerate(names)
+            ],
+            "results": [],
+            "created_at": "2026-01-01T00:00:00",
+            "updated_at": "2026-01-01T00:00:00",
+        }
+        bs.update(extra)
+        _save_batch_state(bs)
+
+    @staticmethod
+    def _resume(client, headers, out):
+        return client.post("/api/optimize", json={
+            "resume": True, "output_dir": str(out),
+            "output_format": "png", "compression_mode": "lossless",
+        }, headers=headers)
+
+    def test_legacy_batch_with_output_equal_to_source_is_rejected(
+        self, client, auth_headers, tmp_path,
+    ):
+        """No input_recursive key: the batch predates the fix, so only the
+        equality case is re-checked — and this is that case."""
+        src = _make_src(tmp_path)
+        before = {p: _digest(p) for p in src.rglob("*.png")}
+        self._batch(src, src, ["a.png"])
+        r = self._resume(client, auth_headers, src)
+        assert r.status_code == 400
+        assert "source folder" in r.json()["error"]
+        assert {p: _digest(p) for p in src.rglob("*.png")} == before
+
+    def test_resume_into_a_nested_folder_of_a_recursive_batch_is_rejected(
+        self, client, auth_headers, tmp_path,
+    ):
+        src = _make_src(tmp_path)
+        self._batch(src / "out", src, ["a.png"], input_recursive=True)
+        r = self._resume(client, auth_headers, src / "out")
+        assert r.status_code == 400
+        assert "inside the source" in r.json()["error"]
+        assert not (src / "out").exists()
+
+    def test_resume_into_a_nested_folder_of_a_non_recursive_batch_is_allowed(
+        self, client, auth_headers, tmp_path,
+    ):
+        src = _make_src(tmp_path)
+        self._batch(src / "out", src, ["a.png"], input_recursive=False)
+        r = self._resume(client, auth_headers, src / "out")
+        assert r.status_code == 200
+        wait_for(lambda: (lambda p: not p["running"] and p)(
+            client.get("/api/progress", headers=auth_headers).json(),
+        ), timeout=30.0)
+        assert (src / "out" / "a.png").exists()
+
+    def test_new_batch_stores_the_scan_root_and_its_recursive_flag(
+        self, client, auth_headers, tmp_path, app_module, monkeypatch,
+    ):
+        """What resume re-checks is only correct if creation stored the scan
+        root and the flag (not the first file's parent)."""
+        monkeypatch.setattr(
+            app_module.persistence, "atomic_copy",
+            lambda s, d: (_ for _ in ()).throw(OSError("disk full")),
+        )
+        src, out = _make_src(tmp_path), tmp_path / "out"
+        scan_and_wait(client, auth_headers, src, recursive=True)
+        optimize_and_wait(client, auth_headers, quality="medium", output_format="png",
+                          compression_mode="lossless", output_dir=str(out))
+        bs = json.loads(_batch_state_path(out).read_text(encoding="utf-8"))
+        assert bs["input_dir"] == str(src.resolve())
+        assert bs["input_recursive"] is True
 
 
 class TestWatchStillUsesSharedRule:

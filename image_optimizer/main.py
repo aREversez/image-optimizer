@@ -1259,6 +1259,34 @@ async def get_thumbnail(ws_name: str, thumb_rel: str, state: AppState = Depends(
     return Response(status_code=404)
 
 
+def _source_root_for_run(state: AppState, files: list) -> tuple[str, bool]:
+    """The folder a run reads from, and whether that scan was recursive.
+
+    These are the two inputs of planning.output_dir_conflict, and both the
+    up-front check and the persisted batch state use them, so a resume
+    re-runs exactly the rule the batch was created under.
+
+    The scanned folder is preferred, but only when every source in the run
+    actually lives under it: state.input_dir survives an upload (see
+    upload_files) and a later scan of a different folder, so it can be stale
+    — and checking against a folder that does not hold these originals would
+    miss the one that does. Without a usable scan root the first file's
+    parent is used with recursive=False, which still rejects the
+    always-dangerous "output is the source folder" case without inventing a
+    recursion rule the run never had.
+    """
+    root = state.input_dir or ""
+    if root and files:
+        root_path = Path(root)
+        if all(
+            planning.is_inside(Path(f["path"]), root_path) or planning.same_path(Path(f["path"]), root_path)
+            for f in files
+        ):
+            return root, state.input_recursive
+    fallback = str(Path(files[0]["path"]).parent) if files else root
+    return fallback, False
+
+
 @app.post("/api/optimize")
 async def start_optimization(data: OptimizeRequest, state: AppState = Depends(get_session), _auth: None = Depends(require_token)):
     if state.is_running:
@@ -1348,8 +1376,15 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
         # input_dir was persisted at batch-creation time (see below) but
         # never read back out here — state.input_dir stayed None through
         # every resume, so /api/state kept reporting no source folder even
-        # though the batch clearly has one. Restore it alongside results.
+        # though the batch clearly has one. Restore it alongside results,
+        # together with the recursive flag the folder-safety check needs.
+        # Batches written before that flag was stored fall back to
+        # recursive=False: only the equality case is re-checked for them,
+        # rather than applying a nesting rule the batch was never created
+        # under (a false rejection here would make it un-resumable).
         state.input_dir = bs.get("input_dir", "")
+        stored_recursive = bs.get("input_recursive")
+        state.input_recursive = False if stored_recursive is None else bool(stored_recursive)
         batch_state = bs
         # Create a workspace for this session (the old one is gone if the
         # server restarted — _process_files needs one for its output dir).
@@ -1370,13 +1405,19 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
     if data.output_dir:
         # Same rule the CLI and Watch apply (planning.output_dir_conflict):
         # never write into the folder being read, nor into a subfolder of it
-        # that the next recursive scan would pick up again. Skipped on
-        # resume, where input_dir is only the first file's parent folder and
-        # the scan's recursive flag is not persisted; the per-file checks
-        # below still apply there.
-        if state.input_dir and not data.resume:
+        # that the next recursive scan would pick up again. Resume runs it
+        # too — that is the only guard left for a batch created before it
+        # existed, whose output folder may still point at the sources; the
+        # root and recursive flag come from the batch itself (restored
+        # above), so the rule is the one the batch was created under.
+        # state.files holds every source on resume (including the ones
+        # already done), which is what the root has to be checked against.
+        run_root, run_recursive = _source_root_for_run(
+            state, state.files if data.resume else files_to_process,
+        )
+        if run_root:
             conflict = planning.output_dir_conflict(
-                Path(state.input_dir), Path(data.output_dir), state.input_recursive,
+                Path(run_root), Path(data.output_dir), run_recursive,
             )
             if conflict:
                 return JSONResponse({"error": conflict}, status_code=400)
@@ -1387,9 +1428,14 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
             ],
             Path(data.output_dir),
         )
-        hit = planning.planned_outputs_hit_sources(
-            planned.values(), [Path(f["path"]) for f in files_to_process],
-        )
+        # On resume the finished sources are not in files_to_process, but
+        # their outputs still sit in the output folder — and a name planned
+        # for a pending file can land on one of them. Check every source the
+        # batch knows about, not just this pass's list.
+        check_sources = [Path(f["path"]) for f in files_to_process]
+        if data.resume and batch_state is not None:
+            check_sources += [Path(f["path"]) for f in batch_state.get("files", []) if f.get("path")]
+        hit = planning.planned_outputs_hit_sources(planned.values(), check_sources)
         if hit is not None:
             return JSONResponse({
                 "error": f"output would overwrite the original file {hit}: pick a different output folder",
@@ -1438,7 +1484,12 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
     if not data.resume and data.output_dir:
         batch_state = {
             "session_id": secrets.token_urlsafe(12),
-            "input_dir": str(Path(state.files[0]["path"]).parent) if state.files else "",
+            # The scan root and its recursive flag, not the first file's
+            # parent: a resume has to re-check the folder pair this run was
+            # validated against, and a parent folder would both miss the
+            # real root and invent a recursion rule that was never applied.
+            "input_dir": run_root,
+            "input_recursive": run_recursive,
             "output_dir": data.output_dir,
             "output_format": data.output_format,
             "quality": data.quality,
