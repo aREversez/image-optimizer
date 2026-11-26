@@ -19,6 +19,26 @@ def test_thumbnail_honours_exif_orientation(app_module, tmp_path):
         assert t.size == (100, 200)
 
 
+def test_image_info_reports_the_displayed_size(app_module, tmp_path):
+    """The Compare page labels both sides from _get_image_info. The output
+    has orientation baked in, so the source must report the same displayed
+    dimensions — otherwise a portrait photo reads 400x200 against 200x400."""
+    src = tmp_path / "phone.jpg"
+    im = Image.new("RGB", (400, 200), (10, 20, 30))
+    exif = Image.Exif()
+    exif[0x0112] = 6
+    im.save(src, exif=exif)
+    info = app_module._get_image_info(src)
+    assert (info["width"], info["height"]) == (200, 400)
+
+
+def test_image_info_without_orientation_is_unchanged(app_module, tmp_path):
+    src = tmp_path / "plain.jpg"
+    Image.new("RGB", (400, 200), (1, 2, 3)).save(src)
+    info = app_module._get_image_info(src)
+    assert (info["width"], info["height"]) == (400, 200)
+
+
 def test_thumbnail_without_orientation_is_unchanged(app_module, tmp_path):
     src = tmp_path / "plain.jpg"
     Image.new("RGB", (400, 200), (1, 2, 3)).save(src)

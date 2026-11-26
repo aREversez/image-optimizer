@@ -745,6 +745,20 @@ def _get_image_info(path: Path) -> Optional[dict]:
     try:
         with Image.open(path) as img:
             w, h = img.size
+            # Report the size as displayed, not the stored one. The optimized
+            # output has its EXIF orientation baked in (the optimizer
+            # transposes before encoding), so a portrait phone photo would
+            # otherwise read 400x200 here and 200x400 for its output — the
+            # Compare page would look like the resize changed the aspect
+            # ratio. Same rule as _gen_thumbnail above, without the decode.
+            try:
+                orientation = img.getexif().get(0x0112, 1)
+            except Exception:
+                # Unreadable EXIF must not cost the whole info panel; the
+                # stored size is still the best answer available.
+                orientation = 1
+            if orientation in (5, 6, 7, 8):
+                w, h = h, w
             depth = _MODE_LABELS.get(img.mode, img.mode)
             return {"width": w, "height": h, "depth": depth}
     except Exception as e:
