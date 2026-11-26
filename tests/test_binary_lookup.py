@@ -85,3 +85,18 @@ def test_every_encoder_uses_the_same_rule(tmp_path, monkeypatch, name):
     monkeypatch.setenv("PATH", str(on_path))
     opt = Optimizer(bin_dir=tmp_path / "nothing-here")
     assert opt._find_binary(name) == expected.resolve()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX execute bit")
+def test_non_executable_path_entry_is_skipped(tmp_path, monkeypatch):
+    """`which` skips files without the execute bit; the PATH walk has to as
+    well, or a stray non-executable `pngquant` wins over a working one later
+    on PATH and every run fails with PermissionError instead of using it."""
+    broken = tmp_path / "broken"
+    good = tmp_path / "good"
+    _fake_binary(broken).chmod(0o644)
+    expected = _fake_binary(good)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(broken), str(good)]))
+
+    opt = Optimizer(bin_dir=tmp_path / "nothing-here")
+    assert opt._find_binary("pngquant") == expected.resolve()

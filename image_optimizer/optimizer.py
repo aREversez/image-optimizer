@@ -218,7 +218,10 @@ class Optimizer:
                 continue
             candidate = directory / exe_name
             try:
-                if candidate.is_file():
+                # `which` only reports executable files; keep that, so a stray
+                # non-executable file does not shadow a working one later on
+                # PATH (Windows has no execute bit - .exe is the test there).
+                if candidate.is_file() and (sys.platform == "win32" or os.access(candidate, os.X_OK)):
                     return candidate.resolve()
             except OSError:
                 continue
