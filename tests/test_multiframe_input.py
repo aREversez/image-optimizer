@@ -44,3 +44,18 @@ def test_single_frame_files_of_the_same_formats_still_work(optimizer, tmp_path, 
     out = tmp_path / "out.webp"
     res = asyncio.run(optimizer.optimize_png(src, out, quality="medium", output_format="webp"))
     assert res["success"], res.get("error")
+
+
+def test_mpo_jpeg_is_not_treated_as_animated(optimizer, tmp_path):
+    """Phone photos with a depth map / gain map are JPEGs that Pillow opens
+    as MPO with n_frames >= 2. They are ordinary photos (the first frame is
+    the image), not animations, and must keep converting."""
+    src = tmp_path / "phone.jpg"
+    a = Image.new("RGB", (64, 64), (200, 0, 0))
+    a.save(src, save_all=True, append_images=[Image.new("RGB", (64, 64), (0, 0, 200))], format="MPO")
+    with Image.open(src) as im:
+        assert im.format == "MPO" and im.n_frames == 2  # the premise
+    out = tmp_path / "out.webp"
+    res = asyncio.run(optimizer.optimize_png(src, out, quality="medium", output_format="webp"))
+    assert res["success"], res.get("error")
+    assert out.exists()

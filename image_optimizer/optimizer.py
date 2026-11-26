@@ -540,6 +540,11 @@ class Optimizer:
         normal pipeline then reports the real decode error)."""
         try:
             with Image.open(path) as img:
+                # MPO is a JPEG with extra pictures (depth map, gain map,
+                # burst thumbnails). Pillow reports n_frames >= 2 for it, but
+                # the first frame IS the photo, so it is not an animation.
+                if img.format == "MPO":
+                    return 1
                 return int(getattr(img, "n_frames", 1) or 1)
         except Exception:
             return 1
