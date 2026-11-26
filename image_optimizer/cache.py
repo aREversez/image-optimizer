@@ -114,7 +114,15 @@ def is_valid_reusable_output(path: Path, expected_format: str) -> bool:
 # Bump when pipeline logic changes in a way that alters output bytes for the
 # same input + settings + encoders. Folded into every cache key, so a bump
 # orphans (and LRU eventually reclaims) all older entries.
-CACHE_SCHEMA_VERSION = 1
+#
+# v2: animated WebP/APNG and multi-page TIFF are refused instead of being
+#     flattened to their first frame. Entries from v1 may hold that
+#     flattened output, and a probe happens before optimize_image() gets to
+#     the frame check, so an animated source would otherwise still be served
+#     a one-frame result — exactly the silent animation loss that fix
+#     removed. The settings fingerprint cannot express "this policy
+#     changed", so the whole cache is invalidated once.
+CACHE_SCHEMA_VERSION = 2
 
 # Output formats the CLI cache may serve. tests/test_determinism.py is the
 # gate: a format whose real encoder is found non-deterministic there must be
