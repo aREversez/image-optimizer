@@ -29,6 +29,7 @@ compression of UI/software screenshots.
 - **Output format** — PNG (via pngquant/oxipng), WebP (via Pillow's built-in encoder, no extra binary needed), JPG (via mozjpeg's `cjpeg`, keeping JPEG rather than converting), or AVIF (via `avifenc`)
 - **Keep-format JPEG optimization** — select the JPG output format on a batch of `.jpg` files and they're genuinely re-compressed lossily by mozjpeg while staying JPEG (requires `cjpeg` in `bin/`, see `bin/README.md`)
 - **EXIF retention** (opt-in) — keep a curated EXIF subset (camera, date, exposure; GPS stripped for privacy)
+- **Colour profiles preserved** — the source's ICC profile (Adobe RGB, Display P3, …) travels with the output in every format, so wide-gamut photos keep their colours; `--strip-icc` opts out
 - **Color protection** — list hex colors to preserve in the palette
 - **Dithering toggle** — smoother gradients (standard mode)
 - **Results sorting & filtering** — sort results by compression %, compressed size, or bytes saved; filter to show all/succeeded/failed
@@ -40,7 +41,7 @@ compression of UI/software screenshots.
 - **Recent folder history** — quick-access chips with per-item removal and clear all
 - **In-app settings** — gear icon opens a settings panel (host, port, workers, timeouts, language) persisted to `config.json`
 - **Session state restoration** — page refresh restores files/results and re-attaches to a still-running batch
-- **Auto-detect binaries** — finds `pngquant`/`oxipng`/`cjpeg`/`avifenc` on PATH, in `bin/`, or in the per-user cache filled by the first-run download
+- **Auto-detect binaries** — finds `pngquant`/`oxipng`/`cjpeg`/`avifenc` in the per-user cache filled by the first-run download (digest-verified copies win), in `bin/`, then on PATH
 - **CLI mode** — `--source`/`--output` runs a batch headlessly (no browser, no server) and exits with a process exit code, for scripts and CI; shares the exact same compression pipeline and settings validation as the web UI
 - **Cross-platform** — Windows, macOS, Linux (pre-built downloads for Windows, Apple Silicon Macs and Linux x86-64; the pip package fetches verified upstream binaries on first run where the publisher ships one, otherwise the tools come from PATH)
 
@@ -129,12 +130,14 @@ version" of the logic to drift out of sync, so the same `--quality`/
 - `--dithering` / `--no-dithering` - dithering for Standard-mode PNG quantization (default enabled)
 - `--protect-colors "#2ecc71,#ff0000"` - hex colors to prioritize keeping exact in Standard mode's palette
 - `--keep-exif` - keep a curated subset of EXIF (camera make/model, date, exposure); GPS and orientation are always stripped regardless (default: strip all EXIF)
+- `--strip-icc` - drop the source's embedded ICC colour profile (default: keep it, so wide-gamut photos do not look desaturated)
 - `--recursive` / `--no-recursive` - scan subfolders too (default `--recursive`; shared with `--dir`, see Configuration below)
 - `--workers` - concurrent compression workers (shared with the web server's `--workers`, see Configuration below)
 - `--cache-dir PATH` - enable the content-hash result cache (see below); default: no cache
 - `--cache-max-size-mb N` - cache size cap, enforced after each run by evicting least-recently-used entries (default `1024`, `0` = unlimited)
 - `--exclude GLOB` / `--include GLOB` - filter which files are processed; repeatable (see below)
 - `--strict` - exit `1` when the run produced any warning, not only on failures (for CI and unattended runs)
+- `--timeout SECONDS` - base budget for one encoder invocation (default `120`); scaled up for images larger than ~4 MP (up to 8x)
 - `--json` - print the final report as one JSON object on stdout (see below)
 
 Output mirrors the source folder's directory structure. Name collisions
@@ -325,8 +328,11 @@ Offline, behind a proxy, or on an air-gapped network:
 - `image-optimizer --no-download`, or set `IMAGE_OPTIMIZER_NO_DOWNLOAD=1`
 - the app still starts — WebP output needs no external binary at all, and the UI only
   offers formats it can actually produce right now
-- install manually into the directory above (PATH is searched first), and use
-  `--force-download` later to replace a pinned copy
+- install manually into the directory above (a file there wins over PATH) or onto
+  PATH, and use `--force-download` later to replace a pinned copy
+- if upstream replaces a version-less URL so the pinned digest no longer matches,
+  set `IMAGE_OPTIMIZER_<TOOL>_URL` (for example `IMAGE_OPTIMIZER_PNGQUANT_URL`) to a
+  mirror serving the pinned bytes; the digest is still enforced
 - startup prints the exact URL, target path and expected SHA-256 for anything it
   could not fetch
 

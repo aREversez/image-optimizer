@@ -54,11 +54,41 @@ All notable changes to this project will be documented in this file.
   as landscape.
 - Thumbnails respect EXIF orientation.
 - `PUT /api/settings` rejects a zero idle timeout, as the config loader does.
+- The source's embedded ICC colour profile is preserved on every output
+  format (PNG `iCCP`, JPEG `APP2`, WebP `ICCP`, AVIF via the PNG
+  intermediate). It used to be dropped on JPEG and AVIF, which does not
+  convert anything to sRGB — it makes wide-gamut (Adobe RGB, Display P3)
+  images look desaturated. `--strip-icc` opts out.
+- Pillow decode/resize work is bounded by the same `--workers` limit as the
+  encoders. The CLI dispatches one task per file, so every image could
+  previously be decoded at once, using far more memory than the worker count
+  implies.
+- The encoder timeout scales with pixel count (1x at 4 MP up to 8x), and
+  `--timeout` sets the base. A flat 120 s turned a legitimate pngquant
+  `--speed 1` pass over a large photo into a reported failure.
+
+### Security
+- Encoder lookup searches the verified per-user directory before `PATH`, and
+  its `PATH` walk ignores empty and relative entries — on Windows the classic
+  search order includes the current directory, so a `pngquant.exe` dropped
+  next to a folder of images could have been executed.
+- The binary bootstrap stages each download under a unique temporary name
+  (two first runs shared one `.part` file) and records the installed file's
+  digest, so an oxipng whose pin only covers the release archive can still be
+  verified on later starts. `IMAGE_OPTIMIZER_<TOOL>_URL` points the fetcher at
+  a mirror when upstream replaces a version-less URL; the pinned digest still
+  applies.
 
 ### Added
 - CLI: a warning up front when a missing encoder downgrades the requested
   mode, per-file `warnings` and a top-level `warnings` list in the `--json`
   report (`summary.warned`), and `--strict` to exit 1 on any warning.
+- CLI `--strip-icc` (default: keep the profile) and `--timeout SECONDS`.
+- The macOS folder picker uses osascript. Tk must own the main thread there,
+  so the previous call from a worker thread aborted the process — including
+  in the macOS dmg builds.
+- A CI job runs the `real_encoders` determinism tests against pngquant,
+  oxipng, cjpeg and avifenc instead of the stand-ins.
 
 ### Removed
 - The unused `jinja2` dependency.
