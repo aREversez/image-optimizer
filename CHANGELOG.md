@@ -33,11 +33,25 @@ All notable changes to this project will be documented in this file.
   tens of GB of writes on 10,000-file batches. A crash loses at most about a
   second of progress; those files are processed again on resume.
 - Animated and multi-page inputs fail with a clear message instead of being
-  flattened to one frame.
+  flattened to one frame. The CLI cache is versioned up once so an entry that
+  still holds a pre-fix single frame is recompressed rather than served.
 - `--max-width` no longer fails on extreme panoramas (height is clamped to
   1); its help text now says it limits the width only, which it always did.
 - Resume marks sources that vanished as `missing`, so the Resume banner
-  clears.
+  clears, and those entries are no longer counted as pending work.
+- Resume re-runs the output-folder safety check against the batch's own scan
+  root and recursive flag (both are now stored with the batch), so a batch
+  saved before that check existed can no longer be resumed into a folder
+  holding its originals. It also checks planned output names against every
+  source in the batch, not only the files this pass will process.
+- A corrupt batch-state file is moved aside (`.corrupt-<timestamp>`) with a
+  warning instead of being silently treated as "no batch".
+- Watch mode treats a case-only rename (`Shot.png` → `shot.png`, allowed on
+  Windows and default macOS volumes) as the same source, so it overwrites the
+  existing output instead of adding a `_2` copy.
+- The Compare page reports the source's displayed size (EXIF orientation
+  applied), matching the optimized output instead of showing a portrait photo
+  as landscape.
 - Thumbnails respect EXIF orientation.
 - `PUT /api/settings` rejects a zero idle timeout, as the config loader does.
 
