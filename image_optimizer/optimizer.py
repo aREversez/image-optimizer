@@ -5,7 +5,6 @@ import os
 import re
 import shutil
 import struct
-import subprocess
 import sys
 import threading
 import zlib
@@ -62,10 +61,12 @@ def fit_width(size: tuple[int, int], max_width: int):
 
 class Optimizer:
     def __init__(self, bin_dir: Optional[Path] = None, max_concurrency: int = 4):
-        # Searched in order, after PATH. The per-user data directory is where
-        # binaries fetched on first run land (see binaries.py); the repo's own
-        # bin/ stays last so an existing source checkout / dev workflow that
-        # drops the .exe next to the code keeps working unchanged.
+        # Searched in order, before PATH. The per-user data directory is where
+        # binaries fetched on first run land (see binaries.py) and is therefore
+        # the only copy whose digest was verified; a same-named executable
+        # earlier on PATH must not shadow it. The repo's own bin/ is searched
+        # next so an existing source checkout / dev workflow that drops the
+        # .exe next to the code keeps working unchanged.
         if bin_dir:
             self._bin_dirs = [Path(bin_dir)]
         elif getattr(sys, "frozen", False):
@@ -186,21 +187,41 @@ class Optimizer:
         return modes
 
     def _find_binary(self, name: str) -> Optional[Path]:
-        try:
-            cmd = "where" if sys.platform == "win32" else "which"
-            # timeout: a hung `where`/`which` (e.g. a dead network drive on
-            # PATH) must not wedge detection — and with it /api/health —
-            # forever.
-            result = subprocess.run([cmd, name], capture_output=True, text=True, timeout=5)
-            if result.returncode == 0 and result.stdout.strip():
-                return Path(result.stdout.strip().splitlines()[0])
-        except Exception:
-            pass
+        """Locate an encoder: the pinned directories first, PATH second.
+
+        Order matters. The pinned directory is populated by binaries.py,
+        which verifies a SHA-256 before anything becomes executable; PATH is
+        whatever the user's shell, an installer, or a malicious archive put
+        there. A downloaded-and-verified pngquant must therefore win over a
+        same-named file earlier on PATH, not lose to it.
+
+        The PATH walk is done here rather than with shutil.which because on
+        Windows shutil.which prepends the current working directory — for a
+        GUI that was launched from a folder of downloaded images, that means
+        a planted pngquant.exe next to them would be executed."""
         exe_name = f"{name}.exe" if sys.platform == "win32" else name
         for directory in self._bin_dirs:
             local = directory / exe_name
-            if local.exists():
-                return local.resolve()
+            try:
+                if local.is_file():
+                    return local.resolve()
+            except OSError:
+                continue
+        for entry in os.environ.get("PATH", "").split(os.pathsep):
+            entry = entry.strip().strip('"')
+            if not entry:
+                # An empty entry means "the current directory" — exactly the
+                # case this walk exists to avoid.
+                continue
+            directory = Path(entry)
+            if not directory.is_absolute():
+                continue
+            candidate = directory / exe_name
+            try:
+                if candidate.is_file():
+                    return candidate.resolve()
+            except OSError:
+                continue
         return None
 
     @staticmethod
