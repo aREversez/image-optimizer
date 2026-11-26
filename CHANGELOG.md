@@ -28,6 +28,10 @@ All notable changes to this project will be documented in this file.
   list and config are written through a temp file and renamed, so a crash
   leaves no partial file or truncated state.
 - Truncated or corrupt JPEG/WebP files are no longer treated as reusable.
+- Batch state is saved at most about once per second (with a final flush)
+  instead of after every file, removing minutes of event-loop blocking and
+  tens of GB of writes on 10,000-file batches. A crash loses at most about a
+  second of progress; those files are processed again on resume.
 - Animated and multi-page inputs fail with a clear message instead of being
   flattened to one frame.
 - `--max-width` no longer fails on extreme panoramas (height is clamped to

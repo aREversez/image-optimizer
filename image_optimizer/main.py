@@ -326,13 +326,28 @@ def _load_batch_state(output_dir: str) -> Optional[dict]:
         return None
 
 
-def _save_batch_state(bs: dict):
-    """Persist batch state to disk, scoped to its own output_dir. Called
-    after each file completes so a crash / server restart can pick up
-    where it left off, without touching any other batch's file."""
+# Minimum seconds between throttled batch-state writes. The whole results
+# list is serialised on every save (about 31 ms at 10,000 results, on the
+# event loop), so saving after every file cost minutes of blocking and tens
+# of GB of writes on a big batch. A crash now loses at most this much
+# progress, and those files are simply processed again on resume.
+_BATCH_SAVE_MIN_INTERVAL = 1.0
+_batch_last_save: dict[str, float] = {}
+
+
+def _save_batch_state(bs: dict, throttle: bool = False):
+    """Persist batch state to disk, scoped to its own output_dir, so a crash
+    / server restart can pick up where it left off, without touching any
+    other batch's file. With throttle=True (the per-file calls) the write is
+    skipped if one happened within _BATCH_SAVE_MIN_INTERVAL; the caller must
+    finish with an unthrottled save so the last state is never lost."""
     output_dir = bs.get("output_dir")
     if not output_dir:
         return  # nothing to scope the file to — shouldn't happen in practice
+    now = time.monotonic()
+    if throttle and now - _batch_last_save.get(output_dir, float("-inf")) < _BATCH_SAVE_MIN_INTERVAL:
+        return
+    _batch_last_save[output_dir] = now
     try:
         bs["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         # Atomic: a crash mid-write must not leave a truncated file that
@@ -1839,7 +1854,7 @@ async def _process_files(
                 if file_info["path"] in _bs_lookup:
                     _bs_lookup[file_info["path"]]["status"] = "done"
                     batch_state.setdefault("results", []).append(skipped_result)
-                    _save_batch_state(batch_state)
+                    _save_batch_state(batch_state, throttle=True)
                 return
 
         state.logs.append(f"Processing: {file_info['name']}")
@@ -1939,7 +1954,7 @@ async def _process_files(
         if file_info["path"] in _bs_lookup:
             _bs_lookup[file_info["path"]]["status"] = "done" if result.get("success") else "failed"
             batch_state.setdefault("results", []).append(result)
-            _save_batch_state(batch_state)
+            _save_batch_state(batch_state, throttle=True)
 
     def on_item_error(file_info, e):
         # Anything process_one doesn't already catch internally (optimize_png
@@ -1960,7 +1975,7 @@ async def _process_files(
         # Persist failure to batch state so resume picks it up
         if file_info.get("path") in _bs_lookup:
             _bs_lookup[file_info["path"]]["status"] = "failed"
-            _save_batch_state(batch_state)
+            _save_batch_state(batch_state, throttle=True)
 
     def on_item_done(_file_info):
         state.current += 1
@@ -2006,6 +2021,10 @@ async def _process_files(
             remaining = [f for f in batch_state.get("files", []) if f["status"] in ("pending", "failed")]
             if not remaining and batch_state.get("output_dir"):
                 _clear_batch_state(batch_state["output_dir"])
+            else:
+                # Final flush: the per-file saves are throttled, so write the
+                # end state (cancel, crash, partial failure) unconditionally.
+                _save_batch_state(batch_state)
         # Persist any new/updated skip_existing fingerprints from this run
         # in one write, rather than one disk write per file (see the load
         # site's comment for why). A cancelled/crashed run still saves
