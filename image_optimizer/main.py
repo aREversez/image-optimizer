@@ -1922,7 +1922,11 @@ async def _process_files(
                 and dest.stat().st_size > 0
                 and _is_valid_reusable_output(dest, eff_output_format)
             ):
-                shutil.copy2(dest, out_path)
+                # Staged like every other write: this copy becomes the file
+                # /api/result serves and the ZIP download ships, so a kill
+                # mid-copy must not leave a truncated image under a name the
+                # UI treats as a finished result.
+                persistence.atomic_copy(dest, out_path)
                 orig_size = input_path.stat().st_size if input_path.exists() else 0
                 comp_size = dest.stat().st_size
                 savings = orig_size - comp_size
