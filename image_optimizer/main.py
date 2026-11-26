@@ -2856,8 +2856,45 @@ async def recent_clear(data: RecentClearRequest, _auth: None = Depends(require_t
     return JSONResponse({"ok": True})
 
 
+def _macos_folder_dialog(title: str) -> tuple[str, str]:
+    """Native choose-folder panel through osascript -> (path, error).
+
+    Tk is not an option here: on macOS Tk must own the main thread, and this
+    runs on the uvicorn worker thread — asking for a window there aborts the
+    process instead of returning a path. In a frozen .app it is worse still:
+    the bundled interpreter cannot run `-c` code, so the old Tk path had no
+    working fallback at all.
+
+    A user cancel (osascript exit -128) is not an error: the UI just keeps the
+    current folder."""
+    escaped = title.replace("\\", "\\\\").replace('"', '\\"')
+    script = f'POSIX path of (choose folder with prompt "{escaped}")'
+    # A .app launched from Finder gets a minimal PATH; resolve the tool here
+    # rather than relying on the environment to include /usr/bin.
+    osascript = shutil.which("osascript") or "osascript"
+    try:
+        # osascript brings Finder forward for the panel, which is what the
+        # user expects from a folder picker; a Tk dialog would instead have
+        # to fight the browser window for focus.
+        proc = subprocess.run(
+            [osascript, "-e", script],
+            capture_output=True, text=True, timeout=600,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return "", str(exc)
+    if proc.returncode != 0:
+        if "-128" in (proc.stderr or ""):
+            return "", ""
+        return "", (proc.stderr or "").strip() or f"osascript exited {proc.returncode}"
+    # `POSIX path of` appends a trailing slash for folders.
+    return (proc.stdout or "").strip().rstrip("/") or "/", ""
+
+
 @app.get("/api/browse-folder")
 async def browse_folder(title: str = "Select Folder", _auth: None = Depends(require_token)):
+    if sys.platform == "darwin":
+        path, error = await asyncio.to_thread(_macos_folder_dialog, title)
+        return JSONResponse({"path": path, "error": error} if error else {"path": path})
     try:
         import tkinter as tk
         from tkinter import filedialog
