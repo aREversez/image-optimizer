@@ -317,13 +317,47 @@ def _batch_state_file(output_dir: str) -> Path:
     return _batch_state_dir() / f"{_batch_id_for_output_dir(output_dir)}.json"
 
 
-def _load_batch_state(output_dir: str) -> Optional[dict]:
-    """Load the batch persisted for this output_dir, if any.
-    Returns None if there's no such file or it's corrupt."""
+def _quarantine_corrupt_batch_state(path: Path, error: Exception) -> None:
+    """Move an unreadable batch file aside and say so.
+
+    It used to be read with a bare `except ... return None`: the resume data
+    vanished without a word and the file stayed behind, so every later page
+    load found it again and the user could not tell "this batch is broken"
+    from "there is no batch". The file is kept (it may be the only record of
+    what was in flight) under a .corrupt-<timestamp> name, which the listing
+    and lookup globs (`*.json`, exact file name) no longer match."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    target = path.with_name(f"{path.name}.corrupt-{stamp}")
     try:
-        return json.loads(_batch_state_file(output_dir).read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        os.replace(path, target)
+    except OSError:
+        target = path
+    print(
+        f"[Warning] Batch state {path.name} is unreadable ({error}); "
+        f"this batch cannot be resumed. File kept as {target.name}."
+    )
+
+
+def _read_batch_state_file(path: Path) -> Optional[dict]:
+    """Parse one batch file. Missing means "no batch"; corrupt is surfaced
+    (see _quarantine_corrupt_batch_state), never silently treated as absent."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return None
+    except OSError as e:
+        print(f"[Warning] Could not read batch state {path.name}: {e}")
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        _quarantine_corrupt_batch_state(path, e)
+        return None
+
+
+def _load_batch_state(output_dir: str) -> Optional[dict]:
+    """Load the batch persisted for this output_dir, if any."""
+    return _read_batch_state_file(_batch_state_file(output_dir))
 
 
 # Minimum seconds between throttled batch-state writes. The whole results
@@ -376,9 +410,8 @@ def _list_unfinished_batch_states() -> list[dict]:
     to already know which output_dir to ask about."""
     out = []
     for f in _batch_state_dir().glob("*.json"):
-        try:
-            bs = json.loads(f.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+        bs = _read_batch_state_file(f)
+        if bs is None:
             continue
         files = bs.get("files", [])
         if any(item.get("status") in ("pending", "failed") for item in files):
