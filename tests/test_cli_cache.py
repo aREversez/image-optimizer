@@ -27,13 +27,13 @@ from tests.test_cli import cli_args
 def counting(optimizer, monkeypatch):
     """Counts how many files actually go through the compression pipeline."""
     calls = {"n": 0}
-    real = optimizer.optimize_png
+    real = optimizer.optimize_image
 
     async def wrapper(*a, **kw):
         calls["n"] += 1
         return await real(*a, **kw)
 
-    monkeypatch.setattr(optimizer, "optimize_png", wrapper)
+    monkeypatch.setattr(optimizer, "optimize_image", wrapper)
     return calls
 
 
@@ -520,6 +520,44 @@ class TestConcurrency:
                 fut.result()
 
         assert errors == []
+
+    def test_probe_retries_transient_permission_error_on_copy(self, tmp_path, monkeypatch):
+        """Windows: opening an entry mid-replace raises PermissionError. A
+        transient failure must be retried, not surfaced."""
+        c = ContentCache(tmp_path / "c", "png", "s", "e")
+        src = tmp_path / "in.png"
+        Image.new("RGB", (8, 8)).save(src)
+        key = c.key_for_digest(file_sha256(src))
+        c.store(key, src)
+        monkeypatch.setattr(_cache_mod, "_REPLACE_BACKOFF_SECONDS", 0)
+        real_copy2 = _cache_mod.shutil.copy2
+        calls = {"n": 0}
+
+        def flaky(a, b, *args, **kw):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise PermissionError(13, "Permission denied")
+            return real_copy2(a, b, *args, **kw)
+
+        monkeypatch.setattr(_cache_mod.shutil, "copy2", flaky)
+        probe = c.probe(src, tmp_path / "out.png")
+        assert probe.hit_size is not None
+        assert calls["n"] == 3
+
+    def test_probe_persistent_permission_error_is_a_miss(self, tmp_path, monkeypatch):
+        c = ContentCache(tmp_path / "c", "png", "s", "e")
+        src = tmp_path / "in.png"
+        Image.new("RGB", (8, 8)).save(src)
+        key = c.key_for_digest(file_sha256(src))
+        c.store(key, src)
+        monkeypatch.setattr(_cache_mod, "_REPLACE_BACKOFF_SECONDS", 0)
+
+        def locked(*args, **kw):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(_cache_mod.shutil, "copy2", locked)
+        probe = c.probe(src, tmp_path / "out.png")
+        assert probe.hit_size is None
 
     def test_probe_failure_falls_through_to_recompression(
         self, app_module, optimizer, counting, tmp_path, monkeypatch

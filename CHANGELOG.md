@@ -2,6 +2,113 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Security
+- The server now validates the `Host` header (loopback names, IP addresses,
+  the bound host, or names in `IMAGE_OPTIMIZER_ALLOWED_HOSTS`) and refuses
+  state-changing requests that the browser marks as cross-site, closing a
+  DNS-rebinding path to the app token and from there to local file read and
+  write.
+
+### Fixed
+- PNG output in Standard/Screenshot mode no longer mislabels pixels: pngquant
+  colour-manages an input that carries an ICC profile (it converts to sRGB and
+  drops the profile), so it now receives a profile-less copy and the original
+  profile is attached afterwards, directly behind IHDR (the PNG spec requires
+  iCCP before PLTE/IDAT). `--strip-icc` now works for PNG, and a profile that
+  does not describe RGB pixels (CMYK, grayscale) is no longer attached.
+- CMYK sources are converted through their ICC profile instead of a naive
+  formula.
+- `.gif` and `.mpo` files are no longer silently ignored by the scan and Watch.
+  An input that cannot be represented (animated GIF/PNG/WebP, multi-page
+  TIFF) is reported by the CLI as `skipped` (new `summary.skipped`) instead of
+  `failed`, and no longer makes the exit code `1`.
+- An output path the filesystem cannot hold (name over 255 bytes, Windows
+  MAX_PATH without long paths) fails that file up front with the reason.
+- A result larger than its source after a format conversion now carries a
+  warning instead of a plain success.
+- The CLI and the web batch no longer accept an output folder equal to the
+  source folder (originals were replaced) or inside a recursively scanned
+  source (the next run re-compressed its own output). One shared rule now
+  covers CLI, web batch and Watch.
+- A failed copy into the output folder (disk full, read-only share, bad path)
+  is now a failed file that Retry/Resume pick up, not a success with a log
+  line.
+- `skip_existing` reuses an output only for the source that produced it; a
+  new file that shifts the collision numbering no longer inherits another
+  image's result.
+- Watch mode overwrites a re-saved file's own output instead of writing
+  `name_2`, `name_3`, ...
+- Final outputs (CLI, Watch, web copy), batch state, fingerprints, the recent
+  list and config are written through a temp file and renamed, so a crash
+  leaves no partial file or truncated state.
+- Truncated or corrupt JPEG/WebP files are no longer treated as reusable.
+- Batch state is saved at most about once per second (with a final flush)
+  instead of after every file, removing minutes of event-loop blocking and
+  tens of GB of writes on 10,000-file batches. A crash loses at most about a
+  second of progress; those files are processed again on resume.
+- Animated and multi-page inputs fail with a clear message instead of being
+  flattened to one frame. The CLI cache is versioned up once so an entry that
+  still holds a pre-fix single frame is recompressed rather than served.
+- `--max-width` no longer fails on extreme panoramas (height is clamped to
+  1); its help text now says it limits the width only, which it always did.
+- Resume marks sources that vanished as `missing`, so the Resume banner
+  clears, and those entries are no longer counted as pending work.
+- Resume re-runs the output-folder safety check against the batch's own scan
+  root and recursive flag (both are now stored with the batch), so a batch
+  saved before that check existed can no longer be resumed into a folder
+  holding its originals. It also checks planned output names against every
+  source in the batch, not only the files this pass will process.
+- A corrupt batch-state file is moved aside (`.corrupt-<timestamp>`) with a
+  warning instead of being silently treated as "no batch".
+- Watch mode treats a case-only rename (`Shot.png` → `shot.png`, allowed on
+  Windows and default macOS volumes) as the same source, so it overwrites the
+  existing output instead of adding a `_2` copy.
+- The Compare page reports the source's displayed size (EXIF orientation
+  applied), matching the optimized output instead of showing a portrait photo
+  as landscape.
+- Thumbnails respect EXIF orientation.
+- `PUT /api/settings` rejects a zero idle timeout, as the config loader does.
+- The source's embedded ICC colour profile is preserved on every output
+  format (PNG `iCCP`, JPEG `APP2`, WebP `ICCP`, AVIF via the PNG
+  intermediate). It used to be dropped on JPEG and AVIF, which does not
+  convert anything to sRGB — it makes wide-gamut (Adobe RGB, Display P3)
+  images look desaturated. `--strip-icc` opts out.
+- Pillow decode/resize work is bounded by the same `--workers` limit as the
+  encoders. The CLI dispatches one task per file, so every image could
+  previously be decoded at once, using far more memory than the worker count
+  implies.
+- The encoder timeout scales with pixel count (1x at 4 MP up to 8x), and
+  `--timeout` sets the base. A flat 120 s turned a legitimate pngquant
+  `--speed 1` pass over a large photo into a reported failure.
+
+### Security
+- Encoder lookup searches the verified per-user directory before `PATH`, and
+  its `PATH` walk ignores empty and relative entries — on Windows the classic
+  search order includes the current directory, so a `pngquant.exe` dropped
+  next to a folder of images could have been executed.
+- The binary bootstrap stages each download under a unique temporary name
+  (two first runs shared one `.part` file) and records the installed file's
+  digest, so an oxipng whose pin only covers the release archive can still be
+  verified on later starts. `IMAGE_OPTIMIZER_<TOOL>_URL` points the fetcher at
+  a mirror when upstream replaces a version-less URL; the pinned digest still
+  applies.
+
+### Added
+- CLI: a warning up front when a missing encoder downgrades the requested
+  mode, per-file `warnings` and a top-level `warnings` list in the `--json`
+  report (`summary.warned`), and `--strict` to exit 1 on any warning.
+- CLI `--strip-icc` (default: keep the profile) and `--timeout SECONDS`.
+- The macOS folder picker uses osascript. Tk must own the main thread there,
+  so the previous call from a worker thread aborted the process — including
+  in the macOS dmg builds.
+- A CI job runs the `real_encoders` determinism tests against pngquant,
+  oxipng, cjpeg and avifenc instead of the stand-ins.
+
+### Removed
+- The unused `jinja2` dependency.
+
 ## [1.1.0] - 2026-11-21
 
 ### Added

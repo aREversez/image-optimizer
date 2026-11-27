@@ -146,7 +146,7 @@ class TestSseLiveStream:
             return {"success": True, "original_size": 10, "compressed_size": 5,
                     "error": None, "warning": None}
 
-        opt.optimize_png = slow
+        opt.optimize_image = slow
         m.optimizer = opt
 
         # Start the run, then immediately open the stream.

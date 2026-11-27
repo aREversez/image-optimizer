@@ -55,7 +55,8 @@ class OptimizeRequest(BaseModel):
     # frontend and backend; unknown fields are rejected with 400.
     overrides: dict[str, dict] = {}
     # Resume a previously interrupted batch. When True, the backend loads
-    # ~/.image-optimizer/batch_state.json, reconstructs state.files from it,
+    # the batch state saved for this output_dir (one file per output folder
+    # under ~/.image-optimizer/batches/), reconstructs state.files from it,
     # and only processes files whose status is "pending" or "failed".
     # Input/output dirs and compression params must match the saved batch.
     resume: bool = False

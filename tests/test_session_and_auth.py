@@ -49,7 +49,7 @@ class TestAppToken:
 class TestSessionIsolation:
     def test_two_clients_get_different_sessions(self, app_module, fake_bin_dir):
         from fastapi.testclient import TestClient
-        with TestClient(app_module.app) as a, TestClient(app_module.app) as b:
+        with TestClient(app_module.app, base_url="http://127.0.0.1:8090") as a, TestClient(app_module.app, base_url="http://127.0.0.1:8090") as b:
             a.get("/")
             b.get("/")
             assert a.cookies.get("imgopt_session") != b.cookies.get("imgopt_session")
@@ -60,7 +60,7 @@ class TestSessionIsolation:
         empty_dir = tmp_path / "empty"
         empty_dir.mkdir()
 
-        with TestClient(app_module.app) as a, TestClient(app_module.app) as b:
+        with TestClient(app_module.app, base_url="http://127.0.0.1:8090") as a, TestClient(app_module.app, base_url="http://127.0.0.1:8090") as b:
             token_a = re.search(r'window\.APP_TOKEN = "([^"]+)"', a.get("/").text).group(1)
             token_b = re.search(r'window\.APP_TOKEN = "([^"]+)"', b.get("/").text).group(1)
             ha, hb = {"X-App-Token": token_a}, {"X-App-Token": token_b}
@@ -73,7 +73,7 @@ class TestSessionIsolation:
 
     def test_cross_session_thumbnail_access_is_denied(self, app_module, fake_bin_dir, test_images):
         from fastapi.testclient import TestClient
-        with TestClient(app_module.app) as a, TestClient(app_module.app) as b:
+        with TestClient(app_module.app, base_url="http://127.0.0.1:8090") as a, TestClient(app_module.app, base_url="http://127.0.0.1:8090") as b:
             token_a = re.search(r'window\.APP_TOKEN = "([^"]+)"', a.get("/").text).group(1)
             b.get("/")
             ha = {"X-App-Token": token_a}
@@ -90,7 +90,7 @@ class TestSessionIsolation:
         empty_dir = tmp_path / "empty2"
         empty_dir.mkdir()
 
-        with TestClient(app_module.app) as a, TestClient(app_module.app) as b:
+        with TestClient(app_module.app, base_url="http://127.0.0.1:8090") as a, TestClient(app_module.app, base_url="http://127.0.0.1:8090") as b:
             token_a = re.search(r'window\.APP_TOKEN = "([^"]+)"', a.get("/").text).group(1)
             token_b = re.search(r'window\.APP_TOKEN = "([^"]+)"', b.get("/").text).group(1)
             ha, hb = {"X-App-Token": token_a}, {"X-App-Token": token_b}

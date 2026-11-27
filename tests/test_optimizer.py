@@ -10,6 +10,14 @@ from pathlib import Path
 import pytest
 from PIL import Image, ImageChops, ImageStat
 
+
+def _pixels(img) -> bytes:
+    """Decoded pixel bytes, without the deprecated Image.getdata() (Pillow
+    14 removes it) and without keeping a per-pixel tuple list in memory."""
+    with img as opened:
+        return opened.tobytes()
+
+
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 
@@ -70,7 +78,7 @@ class TestCompressionModes:
             src, out, compression_mode="lossless", progress_callback=log,
         ))
         assert any("skipping color quantization" in m for m in logs)
-        assert list(Image.open(src).getdata()) == list(Image.open(out).getdata())
+        assert _pixels(Image.open(src)) == _pixels(Image.open(out))
 
     def test_resize_only_actually_resizes_and_skips_quantization(self, tmp_path, optimizer):
         src = tmp_path / "src.png"
@@ -169,7 +177,7 @@ class TestCompressionModes:
         ))
         assert result["success"] is True
         assert any("pngquant not found" in m for m in logs)
-        assert list(Image.open(src).getdata()) == list(Image.open(out).getdata()), (
+        assert _pixels(Image.open(src)) == _pixels(Image.open(out)), (
             "fallback must be genuinely lossless, not a lossy leftover"
         )
 
@@ -292,7 +300,8 @@ class TestProtectedColorsAndDithering:
         ok = Optimizer._make_color_map(["#2ecc71", "#ff0000"], dst)
         assert ok is True
         img = Image.open(dst)
-        pixels = list(img.getdata())
+        data = img.convert("RGB").tobytes()
+        pixels = {tuple(data[i:i + 3]) for i in range(0, len(data), 3)}
         assert (46, 204, 113) in pixels  # #2ecc71
         assert (255, 0, 0) in pixels     # #ff0000
 
@@ -328,7 +337,7 @@ class TestWebP:
 
         result = asyncio.run(optimizer.optimize_png(src, out, output_format="webp", compression_mode="lossless"))
         assert result["success"] is True
-        assert list(Image.open(src).getdata()) == list(Image.open(out).getdata())
+        assert _pixels(Image.open(src)) == _pixels(Image.open(out))
 
     def test_resize_only_webp_actually_resizes(self, tmp_path, optimizer):
         src = tmp_path / "src.png"
@@ -424,8 +433,11 @@ class TestJPEG:
         with Image.open(out) as img:
             assert img.format == "JPEG"
 
-    def test_jpeg_requires_cjpeg(self, tmp_path):
+    def test_jpeg_requires_cjpeg(self, tmp_path, monkeypatch):
         from image_optimizer.optimizer import Optimizer
+        # _find_binary falls back to PATH; a developer machine (e.g. Homebrew
+        # jpeg-turbo) may have a real cjpeg there, so empty PATH too.
+        monkeypatch.setenv("PATH", str(tmp_path / "empty_path_dir"))
         opt = Optimizer(bin_dir=tmp_path / "nonexistent_bin_dir")
         assert opt.cjpeg_path is None
 
@@ -490,7 +502,7 @@ class TestGrowthGuard:
         out_bytes = out.read_bytes()
         assert b"eXIf" not in out_bytes
         assert b"fake-exif-payload-would-carry-gps" not in out_bytes
-        assert list(Image.open(src).getdata()) == list(Image.open(out).getdata())
+        assert _pixels(Image.open(src)) == _pixels(Image.open(out))
 
     def test_same_format_jpeg_falls_back_to_original_bytes_with_exif_stripped(self, tmp_path, optimizer):
         src = tmp_path / "src.jpg"
@@ -545,7 +557,7 @@ class TestMetadataStrippers:
         # still a valid, openable PNG with the same pixels
         out = tmp_path / "y.png"
         out.write_bytes(stripped)
-        assert list(Image.open(path).getdata()) == list(Image.open(out).getdata())
+        assert _pixels(Image.open(path)) == _pixels(Image.open(out))
 
     def test_strip_png_metadata_leaves_color_chunks_alone(self):
         from image_optimizer.optimizer import Optimizer
@@ -579,7 +591,7 @@ class TestMetadataStrippers:
         stripped = Optimizer._strip_jpeg_metadata(data)
         out = tmp_path / "y.jpg"
         out.write_bytes(stripped)
-        assert list(Image.open(path).getdata()) == list(Image.open(out).getdata())
+        assert _pixels(Image.open(path)) == _pixels(Image.open(out))
 
     def test_strip_jpeg_metadata_handles_malformed_input_without_raising(self):
         from image_optimizer.optimizer import Optimizer
@@ -600,7 +612,7 @@ class TestMetadataStrippers:
         assert b"EXIF" not in stripped
         out = tmp_path / "y.webp"
         out.write_bytes(stripped)
-        assert list(Image.open(path).convert("RGB").getdata()) == list(Image.open(out).convert("RGB").getdata())
+        assert _pixels(Image.open(path).convert("RGB")) == _pixels(Image.open(out).convert("RGB"))
 
     def test_strip_webp_metadata_noop_on_clean_webp(self, tmp_path):
         from image_optimizer.optimizer import Optimizer
@@ -640,9 +652,10 @@ class TestAvailableModes:
                 ("jpg", "standard"), ("jpg", "lossless"), ("jpg", "resize_only"),
                 ("avif", "standard"), ("avif", "lossless"), ("avif", "resize_only")} == modes
 
-    def test_no_binaries_drops_standard_png_and_all_jpeg(self, tmp_path):
+    def test_no_binaries_drops_standard_png_and_all_jpeg(self, tmp_path, monkeypatch):
         from image_optimizer.optimizer import Optimizer
-        # No binaries found in bin_dir → all paths None.
+        # No binaries found in bin_dir or on PATH → all paths None.
+        monkeypatch.setenv("PATH", str(tmp_path / "empty_path_dir"))
         opt = Optimizer(bin_dir=tmp_path / "nonexistent_bin_dir")
         assert opt.pngquant_path is None
         assert opt.oxipng_path is None
@@ -1370,3 +1383,15 @@ class TestSubprocessTimeout:
         assert result["success"] is True, result
         assert "synthetic failure" in (result.get("warning") or ""), result
         assert out.exists() and out.read_bytes()[:8] == PNG_MAGIC
+
+
+def test_optimize_png_is_still_available_as_an_alias(optimizer, tmp_path):
+    """The method handles every format, so it is now optimize_image; the old
+    name stays because callers (and third-party scripts) use it."""
+    from image_optimizer.optimizer import Optimizer
+
+    assert Optimizer.optimize_png is Optimizer.optimize_image
+    src = tmp_path / "a.png"
+    Image.new("RGB", (40, 40), (1, 2, 3)).save(src)
+    res = asyncio.run(optimizer.optimize_png(src, tmp_path / "b.webp", output_format="webp"))
+    assert res["success"], res

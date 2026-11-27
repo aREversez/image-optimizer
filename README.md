@@ -15,7 +15,7 @@ compression of UI/software screenshots.
 ## Features
 
 - **Local folder scanning** — select a directory, scan recursively (optional), and pick which files to optimize
-- **File upload** — drag or browse to upload individual images (PNG, JPG, BMP, TIFF, WebP)
+- **File upload** — drag or browse to upload individual images (PNG, JPG, BMP, TIFF, WebP, GIF, MPO)
 - **File sorting** — sort scanned files by modified/created time (newest/oldest) or size (large/small), handy for grabbing the latest screenshots or targeting the biggest files
 - **Watch Mode** — monitor a folder and auto-optimize new or changed images as they appear, with live SSE-streamed logs and rename detection
 - **Batch resume** — progress is persisted per output folder; an interrupted batch (crash, cancel, server restart) can be resumed where it left off
@@ -29,6 +29,7 @@ compression of UI/software screenshots.
 - **Output format** — PNG (via pngquant/oxipng), WebP (via Pillow's built-in encoder, no extra binary needed), JPG (via mozjpeg's `cjpeg`, keeping JPEG rather than converting), or AVIF (via `avifenc`)
 - **Keep-format JPEG optimization** — select the JPG output format on a batch of `.jpg` files and they're genuinely re-compressed lossily by mozjpeg while staying JPEG (requires `cjpeg` in `bin/`, see `bin/README.md`)
 - **EXIF retention** (opt-in) — keep a curated EXIF subset (camera, date, exposure; GPS stripped for privacy)
+- **Colour profiles preserved** — the source's ICC profile (Adobe RGB, Display P3, …) travels with the output in every format, so wide-gamut photos keep their colours; `--strip-icc` opts out
 - **Color protection** — list hex colors to preserve in the palette
 - **Dithering toggle** — smoother gradients (standard mode)
 - **Results sorting & filtering** — sort results by compression %, compressed size, or bytes saved; filter to show all/succeeded/failed
@@ -40,7 +41,7 @@ compression of UI/software screenshots.
 - **Recent folder history** — quick-access chips with per-item removal and clear all
 - **In-app settings** — gear icon opens a settings panel (host, port, workers, timeouts, language) persisted to `config.json`
 - **Session state restoration** — page refresh restores files/results and re-attaches to a still-running batch
-- **Auto-detect binaries** — finds `pngquant`/`oxipng`/`cjpeg`/`avifenc` on PATH, in `bin/`, or in the per-user cache filled by the first-run download
+- **Auto-detect binaries** — finds `pngquant`/`oxipng`/`cjpeg`/`avifenc` in the per-user cache filled by the first-run download (digest-verified copies win), in `bin/`, then on PATH
 - **CLI mode** — `--source`/`--output` runs a batch headlessly (no browser, no server) and exits with a process exit code, for scripts and CI; shares the exact same compression pipeline and settings validation as the web UI
 - **Cross-platform** — Windows, macOS, Linux (pre-built downloads for Windows, Apple Silicon Macs and Linux x86-64; the pip package fetches verified upstream binaries on first run where the publisher ships one, otherwise the tools come from PATH)
 
@@ -125,15 +126,18 @@ version" of the logic to drift out of sync, so the same `--quality`/
 - `--quality {high,medium,low}` - Standard/Screenshot mode color-quality floor (default `medium`)
 - `--format {png,jpg,webp,avif}` - output format (default `png`)
 - `--mode {standard,lossless,resize_only,screenshot}` - compression mode (default `standard`; `screenshot` is PNG-only)
-- `--max-width <int>` - resize so the longest side is at most this many pixels (default `0` = no resize; required `> 0` with `--mode resize_only`)
+- `--max-width <int>` - resize so the width is at most this many pixels (aspect ratio kept, height is not limited) (default `0` = no resize; required `> 0` with `--mode resize_only`)
 - `--dithering` / `--no-dithering` - dithering for Standard-mode PNG quantization (default enabled)
 - `--protect-colors "#2ecc71,#ff0000"` - hex colors to prioritize keeping exact in Standard mode's palette
 - `--keep-exif` - keep a curated subset of EXIF (camera make/model, date, exposure); GPS and orientation are always stripped regardless (default: strip all EXIF)
+- `--strip-icc` - drop the source's embedded ICC colour profile (default: keep it, so wide-gamut photos do not look desaturated)
 - `--recursive` / `--no-recursive` - scan subfolders too (default `--recursive`; shared with `--dir`, see Configuration below)
 - `--workers` - concurrent compression workers (shared with the web server's `--workers`, see Configuration below)
 - `--cache-dir PATH` - enable the content-hash result cache (see below); default: no cache
 - `--cache-max-size-mb N` - cache size cap, enforced after each run by evicting least-recently-used entries (default `1024`, `0` = unlimited)
 - `--exclude GLOB` / `--include GLOB` - filter which files are processed; repeatable (see below)
+- `--strict` - exit `1` when the run produced any warning, not only on failures (for CI and unattended runs)
+- `--timeout SECONDS` - base budget for one encoder invocation (default `120`); scaled up for images larger than ~4 MP (up to 8x)
 - `--json` - print the final report as one JSON object on stdout (see below)
 
 Output mirrors the source folder's directory structure. Name collisions
@@ -188,17 +192,22 @@ image-optimizer --source ./raw --output ./out --json | jq .summary
 
 ```json
 {
+  "warnings": [],
   "files": [
     {"rel": "icons/a.png", "output_name": "a.png", "original_size": 20480,
-     "compressed_size": 5120, "status": "compressed", "error": null}
+     "compressed_size": 5120, "status": "compressed", "error": null, "warnings": []}
   ],
   "summary": {"total": 1, "compressed": 1, "cached": 0, "excluded": 0, "failed": 0,
-              "kept_original": 0, "original_size": 20480, "compressed_size": 5120,
-              "saved_percent": 75.0}
+              "kept_original": 0, "skipped": 0, "warned": 0, "original_size": 20480,
+              "compressed_size": 5120, "saved_percent": 75.0}
 }
 ```
 
-`status` is one of `compressed`, `cached` (served from `--cache-dir`), `kept_original` (the result was not smaller, so the original's pixels were kept with metadata stripped), `excluded` or `failed`. Size totals and `saved_percent` cover the successful statuses; `total` counts every scanned file, excluded ones included. The exit code is unchanged: `1` only if a file failed. Setup errors (bad arguments, missing `--source`, an `--output` directory that cannot be created) exit `1` with a message on stderr and no JSON.
+`status` is one of `compressed`, `cached` (served from `--cache-dir`), `kept_original` (the result was not smaller, so the original's pixels were kept with metadata stripped), `excluded`, `skipped` (an input that cannot be represented, such as an animated GIF/PNG/WebP or a multi-page TIFF: left untouched, the reason is in `warnings`, and it does not make the exit code `1`) or `failed`. Size totals and `saved_percent` cover the successful statuses; `total` counts every scanned file, excluded ones included. `warnings` (top level) lists run-level problems such as a missing encoder that downgrades the requested mode (for example only `oxipng` installed, so `--mode standard` is lossless-only); each file's `warnings` carries what the optimizer reported for that file, and `summary.warned` counts files with any. The exit code is `1` only if a file failed, or, with `--strict`, if the run produced any warning. Setup errors (bad arguments, missing `--source`, an `--output` directory that cannot be created) exit `1` with a message on stderr and no JSON.
+
+### Long file names and paths
+
+An output file name is limited to 255 bytes on every common filesystem, and Windows limits a whole path to 259 characters (including the temporary file written next to each output) unless long paths are enabled. A file whose output would exceed either limit is reported as failed up front with the reason, rather than with an OS error. Changing the format can push a name over the limit (`name.jpg` to `name.webp` is one character longer). On Windows, set the registry value `HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled` to `1` to lift the path limit.
 
 ## Configuration
 
@@ -273,6 +282,16 @@ you specify as the output folder — fine for local, single-user use, but
 trust everyone on that network, since there's nothing stopping them from
 reading or writing files on your machine through it.
 
+To stop a malicious web page from reaching the local server through DNS
+rebinding, the server refuses requests whose `Host` header is not a loopback
+name (`localhost`), an IP address, or the host you started it with, and it
+refuses state-changing requests that the browser marks as cross-site. If you
+deliberately reach the app under another DNS name (a LAN hostname, a reverse
+proxy), list it in the `IMAGE_OPTIMIZER_ALLOWED_HOSTS` environment variable
+(comma separated, e.g. `mybox.lan,tools.example.com`). A proxy must also pass
+the original `Host` header through, or the same-origin check will reject the
+page's own requests.
+
 ## Requirements
 
 - **pip install:** Python 3.10+ (dependencies are pulled in automatically)
@@ -313,8 +332,11 @@ Offline, behind a proxy, or on an air-gapped network:
 - `image-optimizer --no-download`, or set `IMAGE_OPTIMIZER_NO_DOWNLOAD=1`
 - the app still starts — WebP output needs no external binary at all, and the UI only
   offers formats it can actually produce right now
-- install manually into the directory above (PATH is searched first), and use
-  `--force-download` later to replace a pinned copy
+- install manually into the directory above (a file there wins over PATH) or onto
+  PATH, and use `--force-download` later to replace a pinned copy
+- if upstream replaces a version-less URL so the pinned digest no longer matches,
+  set `IMAGE_OPTIMIZER_<TOOL>_URL` (for example `IMAGE_OPTIMIZER_PNGQUANT_URL`) to a
+  mirror serving the pinned bytes; the digest is still enforced
 - startup prints the exact URL, target path and expected SHA-256 for anything it
   could not fetch
 

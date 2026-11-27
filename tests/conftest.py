@@ -29,6 +29,25 @@ out_path = args[args.index("--output") + 1]
 in_path = args[-1]
 data = open(in_path, "rb").read()
 if data[:8] == PNG_MAGIC:
+    # Real pngquant colour-manages an input that carries an iCCP chunk: it
+    # converts the pixels to sRGB and writes gAMA + sRGB chunks instead of
+    # the profile (verified against pngquant 3.0.3). Mimic the chunk part.
+    pos, out, had_icc = 8, bytearray(data[:8]), False
+    while pos + 8 <= len(data):
+        n = int.from_bytes(data[pos:pos + 4], "big")
+        kind = data[pos + 4:pos + 8]
+        chunk = data[pos:pos + 12 + n]
+        if kind == b"iCCP":
+            had_icc = True
+        else:
+            out += chunk
+        pos += 12 + n
+    if had_icc:
+        import zlib
+        srgb = b"sRGB" + b"\\x00"
+        srgb_chunk = (1).to_bytes(4, "big") + srgb + (zlib.crc32(srgb) & 0xFFFFFFFF).to_bytes(4, "big")
+        out[33:33] = srgb_chunk
+        data = bytes(out)
     open(out_path, "wb").write(data)
     sys.exit(0)
 else:
@@ -95,7 +114,11 @@ if not in_path.lower().endswith((".jpg", ".jpeg", ".png", ".y4m")):
     sys.stderr.write(f"Cannot read input file: {in_path}\\n")
     sys.exit(1)
 img = Image.open(in_path)
-img.save(out_path, "PNG")
+# Real avifenc carries the input's embedded ICC profile into the AVIF's
+# colr box unless --ignore-icc is given; mirror that so the ICC-preservation
+# tests exercise the same contract here.
+kw = {"icc_profile": img.info["icc_profile"]} if img.info.get("icc_profile") else {}
+img.save(out_path, "PNG", **kw)
 sys.exit(0)
 '''
 
@@ -193,7 +216,7 @@ def app_module(optimizer):
 def client(app_module, optimizer):
     import image_optimizer.main as m
     from fastapi.testclient import TestClient
-    with TestClient(app_module.app) as c:
+    with TestClient(app_module.app, base_url="http://127.0.0.1:8090") as c:
         # TestClient.__enter__ runs the lifespan, and the lifespan re-creates
         # the module-global `optimizer` from auto-detection (`Optimizer(...)`)
         # — clobbering the fixture's fake-binary assignment done in app_module.

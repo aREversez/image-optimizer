@@ -17,8 +17,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # macOS is covered because releases ship a macOS dmg and the Tk
+        # folder dialog and binary lookup behave differently there. The
+        # oldest (3.10, the declared minimum) and newest (3.13) Pythons run
+        # on Ubuntu only to keep the matrix small.
+        os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ["3.11", "3.12"]
+        include:
+          - os: ubuntu-latest
+            python-version: "3.10"
+          - os: ubuntu-latest
+            python-version: "3.13"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -33,3 +42,45 @@ jobs:
 
       - name: Run tests
         run: pytest tests/ -v
+
+  # The suite above replaces every encoder with a stand-in that copies bytes
+  # through (tests/conftest.py), so pngquant's exit codes 98/99,
+  # --skip-if-larger, oxipng's real flags and avifenc's argument handling are
+  # never exercised there. This job runs the `real_encoders` determinism
+  # tests against the genuine binaries.
+  real-encoders:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Install real encoders
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pngquant libjpeg-turbo-progs libavif-bin
+          # oxipng is not packaged everywhere; use the same pinned build the
+          # bootstrap fetches, verified against the digest in binaries.py.
+          curl -fsSL -o oxipng.tar.gz \
+            https://github.com/shssoichiro/oxipng/releases/download/v10.1.1/oxipng-10.1.1-x86_64-unknown-linux-gnu.tar.gz
+          echo "5988392e88fc3d03f562f2d565e5c12a095223ae8bd983576f2aaff2fadf3738  oxipng.tar.gz" | sha256sum -c -
+          tar -xzf oxipng.tar.gz
+          sudo install -m 755 oxipng-10.1.1-x86_64-unknown-linux-gnu/oxipng /usr/local/bin/oxipng
+
+      - name: Verify the encoders are usable
+        run: |
+          for tool in pngquant oxipng cjpeg avifenc; do
+            command -v "$tool" || { echo "::error::$tool is missing"; exit 1; }
+          done
+          pngquant --version
+          oxipng --version
+          avifenc --version
+
+      - name: Run the real-encoder tests
+        run: pytest tests/ -m real_encoders -v

@@ -26,6 +26,7 @@ from PIL import Image
 def settings_fingerprint(
     quality: str, compression_mode: str, max_width: int,
     protected_colors: Optional[list], dithering: bool, keep_exif: bool, output_format: str,
+    keep_icc: bool = True,
 ) -> str:
     """Fingerprints the effective per-file compression settings that
     produced (or would produce) a given output. Used by skip_existing to
@@ -46,9 +47,31 @@ def settings_fingerprint(
         "protected_colors": colors,
         "dithering": bool(dithering),
         "keep_exif": bool(keep_exif),
+        "keep_icc": bool(keep_icc),
         "output_format": output_format,
     }, sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _jpeg_has_end_marker(path: Path) -> bool:
+    """A finished JPEG ends with the EOI marker (FF D9); trailing zero
+    padding some writers add is tolerated."""
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        f.seek(max(0, size - 64))
+        tail = f.read().rstrip(b"\x00")
+    return tail.endswith(b"\xff\xd9")
+
+
+def _webp_riff_size_ok(path: Path) -> bool:
+    """The RIFF header declares the payload size; a file shorter than that
+    was cut off. Trailing bytes beyond it are tolerated."""
+    with open(path, "rb") as f:
+        head = f.read(12)
+    if len(head) < 12 or head[:4] != b"RIFF" or head[8:12] != b"WEBP":
+        return False
+    declared = int.from_bytes(head[4:8], "little") + 8
+    return os.path.getsize(path) >= declared
 
 
 def is_valid_reusable_output(path: Path, expected_format: str) -> bool:
@@ -68,6 +91,16 @@ def is_valid_reusable_output(path: Path, expected_format: str) -> bool:
         with Image.open(path) as img:
             img.verify()
             fmt = (img.format or "").upper()
+        # verify() is a no-op for JPEG and only checks headers for WebP, so
+        # add the cheap structural checks it misses, then a full decode.
+        # A half-written file is the main thing this guards against.
+        if fmt == "JPEG" and not _jpeg_has_end_marker(path):
+            return False
+        if fmt == "WEBP" and not _webp_riff_size_ok(path):
+            return False
+        if fmt in ("JPEG", "WEBP"):
+            with Image.open(path) as img:
+                img.load()
     except Exception:
         return False
     expected = {
@@ -83,7 +116,15 @@ def is_valid_reusable_output(path: Path, expected_format: str) -> bool:
 # Bump when pipeline logic changes in a way that alters output bytes for the
 # same input + settings + encoders. Folded into every cache key, so a bump
 # orphans (and LRU eventually reclaims) all older entries.
-CACHE_SCHEMA_VERSION = 1
+#
+# v2: animated WebP/APNG and multi-page TIFF are refused instead of being
+#     flattened to their first frame. Entries from v1 may hold that
+#     flattened output, and a probe happens before optimize_image() gets to
+#     the frame check, so an animated source would otherwise still be served
+#     a one-frame result — exactly the silent animation loss that fix
+#     removed. The settings fingerprint cannot express "this policy
+#     changed", so the whole cache is invalidated once.
+CACHE_SCHEMA_VERSION = 2
 
 # Output formats the CLI cache may serve. tests/test_determinism.py is the
 # gate: a format whose real encoder is found non-deterministic there must be
@@ -156,6 +197,22 @@ def _publish(tmp: Path, entry: Path, output_format: str) -> None:
                     return
                 raise
             time.sleep(_REPLACE_BACKOFF_SECONDS * (2 ** attempt))
+
+
+def _copy_entry(entry: Path, out_path: Path) -> bool:
+    """Copy a cache entry to out_path. On Windows, opening an entry that a
+    writer is replacing at that instant fails with PermissionError; retry
+    briefly (same backoff as _publish) and return False if it never clears,
+    so probe() degrades to a miss instead of raising."""
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            shutil.copy2(entry, out_path)
+            return True
+        except PermissionError:
+            if attempt == _REPLACE_ATTEMPTS - 1:
+                return False
+            time.sleep(_REPLACE_BACKOFF_SECONDS * (2 ** attempt))
+    return False
 
 
 def file_sha256(path: Path) -> str:
@@ -239,7 +296,11 @@ class ContentCache:
         entry = self.entry_path(key)
         if not entry.is_file() or not is_valid_reusable_output(entry, self.output_format):
             return CacheProbe(key, original_size, None)
-        shutil.copy2(entry, out_path)
+        if not _copy_entry(entry, out_path):
+            # Still locked after the retries (Windows: a writer is replacing
+            # the entry right now). The cache is only an optimization, so
+            # treat it as a miss and let the caller recompress.
+            return CacheProbe(key, original_size, None)
         try:
             # Recency for LRU eviction.
             os.utime(entry, None)

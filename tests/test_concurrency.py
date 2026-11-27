@@ -44,7 +44,7 @@ class TestConcurrency:
             return {"success": True, "original_size": 10, "compressed_size": 5, "error": None, "warning": None}
 
         opt = Optimizer(bin_dir=fake_bin_dir)
-        opt.optimize_png = slow_optimize
+        opt.optimize_image = slow_optimize
         m.optimizer = opt
 
         (tmp_path / "src.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 20)
@@ -78,7 +78,7 @@ class TestConcurrency:
             return {"success": True, "original_size": 10, "compressed_size": 5, "error": None, "warning": None}
 
         opt = Optimizer(bin_dir=fake_bin_dir)
-        opt.optimize_png = flaky_optimize
+        opt.optimize_image = flaky_optimize
         m.optimizer = opt
 
         (tmp_path / "src.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 20)
@@ -106,7 +106,7 @@ class TestConcurrency:
             return {"success": True, "original_size": 10, "compressed_size": 5, "error": None, "warning": None}
 
         opt = Optimizer(bin_dir=fake_bin_dir)
-        opt.optimize_png = slow_optimize
+        opt.optimize_image = slow_optimize
         m.optimizer = opt
 
         (tmp_path / "src.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 20)

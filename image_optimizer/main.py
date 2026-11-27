@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import hashlib
+import ipaddress
 import json
 import os
 import secrets
@@ -15,16 +16,18 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Awaitable, Callable, List, Optional
+from urllib.parse import urlsplit
 from zipfile import ZipFile
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
-from PIL import Image, features as pil_features
+from PIL import Image, ImageOps, features as pil_features
 
 if __package__ is None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from image_optimizer import binaries
+from image_optimizer import binaries, persistence, planning
+from image_optimizer import optimizer as optimizer_module
 from image_optimizer.cache import (
     CACHEABLE_FORMATS,
     DEFAULT_CACHE_MAX_MB,
@@ -95,6 +98,10 @@ class AppState:
         self.files: list = []
         self.results: list = []
         self.input_dir: Optional[str] = None
+        # Whether the scan that produced input_dir descended into subfolders;
+        # start_optimization needs it to tell a safe nested output folder
+        # (non-recursive scan) from one the next scan would re-read.
+        self.input_recursive: bool = True
         # Persistent output folder of the last run (if any) — recorded by
         # _process_files so /api/reveal can open it without trusting any
         # client-supplied path.
@@ -136,6 +143,7 @@ class AppState:
         self.files = []
         self.results = []
         self.input_dir = None
+        self.input_recursive = True
         self.output_dir = None
         self.is_running = False
         self.current = 0
@@ -310,26 +318,78 @@ def _batch_state_file(output_dir: str) -> Path:
     return _batch_state_dir() / f"{_batch_id_for_output_dir(output_dir)}.json"
 
 
-def _load_batch_state(output_dir: str) -> Optional[dict]:
-    """Load the batch persisted for this output_dir, if any.
-    Returns None if there's no such file or it's corrupt."""
+def _quarantine_corrupt_batch_state(path: Path, error: Exception) -> None:
+    """Move an unreadable batch file aside and say so.
+
+    It used to be read with a bare `except ... return None`: the resume data
+    vanished without a word and the file stayed behind, so every later page
+    load found it again and the user could not tell "this batch is broken"
+    from "there is no batch". The file is kept (it may be the only record of
+    what was in flight) under a .corrupt-<timestamp> name, which the listing
+    and lookup globs (`*.json`, exact file name) no longer match."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    target = path.with_name(f"{path.name}.corrupt-{stamp}")
     try:
-        return json.loads(_batch_state_file(output_dir).read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        os.replace(path, target)
+    except OSError:
+        target = path
+    print(
+        f"[Warning] Batch state {path.name} is unreadable ({error}); "
+        f"this batch cannot be resumed. File kept as {target.name}."
+    )
+
+
+def _read_batch_state_file(path: Path) -> Optional[dict]:
+    """Parse one batch file. Missing means "no batch"; corrupt is surfaced
+    (see _quarantine_corrupt_batch_state), never silently treated as absent."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        print(f"[Warning] Could not read batch state {path.name}: {e}")
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        _quarantine_corrupt_batch_state(path, e)
         return None
 
 
-def _save_batch_state(bs: dict):
-    """Persist batch state to disk, scoped to its own output_dir. Called
-    after each file completes so a crash / server restart can pick up
-    where it left off, without touching any other batch's file."""
+def _load_batch_state(output_dir: str) -> Optional[dict]:
+    """Load the batch persisted for this output_dir, if any."""
+    return _read_batch_state_file(_batch_state_file(output_dir))
+
+
+# Minimum seconds between throttled batch-state writes. The whole results
+# list is serialised on every save (about 31 ms at 10,000 results, on the
+# event loop), so saving after every file cost minutes of blocking and tens
+# of GB of writes on a big batch. A crash now loses at most this much
+# progress, and those files are simply processed again on resume.
+_BATCH_SAVE_MIN_INTERVAL = 1.0
+_batch_last_save: dict[str, float] = {}
+
+
+def _save_batch_state(bs: dict, throttle: bool = False):
+    """Persist batch state to disk, scoped to its own output_dir, so a crash
+    / server restart can pick up where it left off, without touching any
+    other batch's file. With throttle=True (the per-file calls) the write is
+    skipped if one happened within _BATCH_SAVE_MIN_INTERVAL; the caller must
+    finish with an unthrottled save so the last state is never lost."""
     output_dir = bs.get("output_dir")
     if not output_dir:
         return  # nothing to scope the file to — shouldn't happen in practice
+    now = time.monotonic()
+    if throttle and now - _batch_last_save.get(output_dir, float("-inf")) < _BATCH_SAVE_MIN_INTERVAL:
+        return
+    _batch_last_save[output_dir] = now
     try:
         bs["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-        _batch_state_file(output_dir).write_text(
-            json.dumps(bs, indent=2, ensure_ascii=False), encoding="utf-8"
+        # Atomic: a crash mid-write must not leave a truncated file that
+        # _load_batch_state then treats as "no batch" and silently drops the
+        # resume data.
+        persistence.atomic_write_text(
+            _batch_state_file(output_dir), json.dumps(bs, indent=2, ensure_ascii=False),
         )
     except OSError:
         pass  # best-effort — a write failure here mustn't crash the batch
@@ -351,9 +411,8 @@ def _list_unfinished_batch_states() -> list[dict]:
     to already know which output_dir to ask about."""
     out = []
     for f in _batch_state_dir().glob("*.json"):
-        try:
-            bs = json.loads(f.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+        bs = _read_batch_state_file(f)
+        if bs is None:
             continue
         files = bs.get("files", [])
         if any(item.get("status") in ("pending", "failed") for item in files):
@@ -393,7 +452,7 @@ def _load_skip_fingerprints(output_dir: str) -> dict:
 
 def _save_skip_fingerprints(output_dir: str, data: dict):
     try:
-        _skip_fingerprints_file(output_dir).write_text(json.dumps(data), encoding="utf-8")
+        persistence.atomic_write_text(_skip_fingerprints_file(output_dir), json.dumps(data))
     except OSError:
         pass  # best-effort — a write failure here just means the next run recompresses instead of reusing
 
@@ -499,7 +558,7 @@ def _load_recent() -> dict:
 
 def _save_recent(data: dict):
     try:
-        _recent_file().write_text(json.dumps(data), encoding="utf-8")
+        persistence.atomic_write_text(_recent_file(), json.dumps(data))
     except Exception:
         pass  # best-effort — a read-only config dir shouldn't break the app
 
@@ -557,12 +616,108 @@ async def session_cookie_middleware(request: Request, call_next):
     return response
 
 
+# Hostname the server was told to bind to (--host / config.json "host"), set
+# by main(). A real hostname given there is trusted as a Host header value.
+_BOUND_HOST: Optional[str] = None
+
+_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+def _split_host(value: str) -> Optional[str]:
+    """Lower-cased hostname of a Host header / origin netloc (port and IPv6
+    brackets removed), or None if it does not parse."""
+    try:
+        host = urlsplit("//" + value.strip()).hostname
+    except ValueError:
+        return None
+    # Lower-case, and drop the trailing dot of a fully-qualified name
+    # ("localhost." is the same host as "localhost").
+    return host.lower().rstrip(".") if host else None
+
+
+def _operator_hosts() -> set[str]:
+    """Hostnames the operator explicitly trusts: the one the server was bound
+    to plus IMAGE_OPTIMIZER_ALLOWED_HOSTS (comma separated)."""
+    hosts = {h.strip().lower().rstrip(".") for h in os.environ.get("IMAGE_OPTIMIZER_ALLOWED_HOSTS", "").split(",") if h.strip()}
+    if _BOUND_HOST:
+        hosts.add(_BOUND_HOST.strip().lower().rstrip("."))
+    return hosts
+
+
+_HOST_HINT = (
+    "If you reach the app under this name on purpose, list it in the "
+    "IMAGE_OPTIMIZER_ALLOWED_HOSTS environment variable (comma separated)."
+)
+
+
+def _host_allowed(host_header: str) -> bool:
+    """DNS-rebinding defence. A rebinding page reaches this server under its
+    own *hostname*, so accept only: loopback names (localhost, *.localhost),
+    any IP literal (a hostname is what an attacker controls, an address
+    typed or bound by the user is not), the hostname the server was bound
+    to, and names the operator lists in IMAGE_OPTIMIZER_ALLOWED_HOSTS
+    (comma separated) for LAN use under a DNS name."""
+    host = _split_host(host_header or "")
+    if host is None:
+        return False
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    return host in _operator_hosts()
+
+
+@app.middleware("http")
+async def host_and_origin_middleware(request: Request, call_next):
+    """Runs before everything else (defined after the session middleware, so
+    it is the outermost layer): no session is created and no token is served
+    for a request that fails.
+
+    1. Host must pass _host_allowed (DNS rebinding).
+    2. A state-changing request that declares itself cross-site is refused:
+       Sec-Fetch-Site other than same-origin/none, or an Origin whose host
+       differs from the Host header. Requests without these headers (curl,
+       scripts, tests) are unaffected - they still need the app token."""
+    if not _host_allowed(request.headers.get("host", "")):
+        return JSONResponse({"error": f"Invalid Host header. {_HOST_HINT}"}, status_code=400)
+    if request.method not in _SAFE_METHODS:
+        site = request.headers.get("sec-fetch-site")
+        if site is not None and site not in ("same-origin", "none"):
+            return JSONResponse({"error": "Cross-site request refused"}, status_code=403)
+        origin = request.headers.get("origin")
+        if origin is not None and origin != "null":
+            try:
+                origin_netloc = urlsplit(origin).netloc.lower()
+            except ValueError:
+                origin_netloc = ""
+            # Same origin as the Host header, or - for a reverse proxy that
+            # rewrites Host to the upstream address - an origin the operator
+            # listed explicitly. IP literals and localhost are deliberately
+            # not a pass here: only a name the operator named is.
+            if (
+                origin_netloc != request.headers.get("host", "").strip().lower()
+                and _split_host(origin_netloc) not in _operator_hosts()
+            ):
+                return JSONResponse(
+                    {"error": f"Cross-site request refused. {_HOST_HINT}"}, status_code=403,
+                )
+        elif origin == "null":
+            return JSONResponse({"error": "Cross-site request refused"}, status_code=403)
+    return await call_next(request)
+
+
 def _gen_thumbnail(src: Path, dst: Path, max_size: int = 200):
     try:
         # Context manager so the source file handle is released even on the
         # error path (matters on Windows, where a lingering handle can keep
         # the user's file locked until GC gets around to it).
         with Image.open(src) as img:
+            # Bake in the EXIF orientation first, as the optimizer does for
+            # its output, so a portrait phone photo is not shown sideways.
+            img = ImageOps.exif_transpose(img)
             img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
             if img.mode in ("RGBA", "LA", "PA", "P"):
                 # Composite transparency onto white instead of a bare
@@ -614,6 +769,20 @@ def _get_image_info(path: Path) -> Optional[dict]:
     try:
         with Image.open(path) as img:
             w, h = img.size
+            # Report the size as displayed, not the stored one. The optimized
+            # output has its EXIF orientation baked in (the optimizer
+            # transposes before encoding), so a portrait phone photo would
+            # otherwise read 400x200 here and 200x400 for its output — the
+            # Compare page would look like the resize changed the aspect
+            # ratio. Same rule as _gen_thumbnail above, without the decode.
+            try:
+                orientation = img.getexif().get(0x0112, 1)
+            except Exception:
+                # Unreadable EXIF must not cost the whole info panel; the
+                # stored size is still the best answer available.
+                orientation = 1
+            if orientation in (5, 6, 7, 8):
+                w, h = h, w
             depth = _MODE_LABELS.get(img.mode, img.mode)
             return {"width": w, "height": h, "depth": depth}
     except Exception as e:
@@ -636,6 +805,8 @@ _MEDIA_TYPES = {
     ".tif": "image/tiff",
     ".tiff": "image/tiff",
     ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".mpo": "image/jpeg",
     ".avif": "image/avif",
 }
 
@@ -826,7 +997,7 @@ async def _run_worker_pool(
     await asyncio.gather(*workers)
 
 
-SCAN_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
+SCAN_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp", ".gif", ".mpo"}
 
 
 def _scan_images(directory: Path, recursive: bool = True) -> list:
@@ -1019,6 +1190,7 @@ async def scan_directory(data: ScanRequest, state: AppState = Depends(get_sessio
 
     state.reset()
     state.input_dir = str(directory.resolve())
+    state.input_recursive = data.recursive
     state.new_workspace()
     state.scan_running = True
     state.scan_current = 0
@@ -1113,6 +1285,34 @@ async def get_thumbnail(ws_name: str, thumb_rel: str, state: AppState = Depends(
     return Response(status_code=404)
 
 
+def _source_root_for_run(state: AppState, files: list) -> tuple[str, bool]:
+    """The folder a run reads from, and whether that scan was recursive.
+
+    These are the two inputs of planning.output_dir_conflict, and both the
+    up-front check and the persisted batch state use them, so a resume
+    re-runs exactly the rule the batch was created under.
+
+    The scanned folder is preferred, but only when every source in the run
+    actually lives under it: state.input_dir survives an upload (see
+    upload_files) and a later scan of a different folder, so it can be stale
+    — and checking against a folder that does not hold these originals would
+    miss the one that does. Without a usable scan root the first file's
+    parent is used with recursive=False, which still rejects the
+    always-dangerous "output is the source folder" case without inventing a
+    recursion rule the run never had.
+    """
+    root = state.input_dir or ""
+    if root and files:
+        root_path = Path(root)
+        if all(
+            planning.is_inside(Path(f["path"]), root_path) or planning.same_path(Path(f["path"]), root_path)
+            for f in files
+        ):
+            return root, state.input_recursive
+    fallback = str(Path(files[0]["path"]).parent) if files else root
+    return fallback, False
+
+
 @app.post("/api/optimize")
 async def start_optimization(data: OptimizeRequest, state: AppState = Depends(get_session), _auth: None = Depends(require_token)):
     if state.is_running:
@@ -1165,6 +1365,20 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
                 "size": f.get("size", 0), "mtime": mtime, "ctime": ctime, "thumbnail": "",
             })
         state.files = rebuilt
+        # A source that vanished since the batch was saved can never be
+        # processed again. Mark it "missing" (finished, not pending/failed)
+        # so it stops keeping the batch file - and the Resume banner - alive.
+        present = {f["path"] for f in rebuilt}
+        marked = False
+        for entry in bs.get("files", []):
+            if entry.get("status") in ("pending", "failed") and entry["path"] not in present:
+                entry["status"] = "missing"
+                marked = True
+        if marked:
+            if any(e.get("status") in ("pending", "failed") for e in bs.get("files", [])):
+                _save_batch_state(bs)
+            else:
+                _clear_batch_state(data.output_dir)
         if not state.files:
             return JSONResponse(
                 {"error": "Source files no longer available for resume"},
@@ -1188,8 +1402,15 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
         # input_dir was persisted at batch-creation time (see below) but
         # never read back out here — state.input_dir stayed None through
         # every resume, so /api/state kept reporting no source folder even
-        # though the batch clearly has one. Restore it alongside results.
+        # though the batch clearly has one. Restore it alongside results,
+        # together with the recursive flag the folder-safety check needs.
+        # Batches written before that flag was stored fall back to
+        # recursive=False: only the equality case is re-checked for them,
+        # rather than applying a nesting rule the batch was never created
+        # under (a false rejection here would make it un-resumable).
         state.input_dir = bs.get("input_dir", "")
+        stored_recursive = bs.get("input_recursive")
+        state.input_recursive = False if stored_recursive is None else bool(stored_recursive)
         batch_state = bs
         # Create a workspace for this session (the old one is gone if the
         # server restarted — _process_files needs one for its output dir).
@@ -1208,6 +1429,43 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
         return JSONResponse({"error": "No files to process"}, status_code=400)
 
     if data.output_dir:
+        # Same rule the CLI and Watch apply (planning.output_dir_conflict):
+        # never write into the folder being read, nor into a subfolder of it
+        # that the next recursive scan would pick up again. Resume runs it
+        # too — that is the only guard left for a batch created before it
+        # existed, whose output folder may still point at the sources; the
+        # root and recursive flag come from the batch itself (restored
+        # above), so the rule is the one the batch was created under.
+        # state.files holds every source on resume (including the ones
+        # already done), which is what the root has to be checked against.
+        run_root, run_recursive = _source_root_for_run(
+            state, state.files if data.resume else files_to_process,
+        )
+        if run_root:
+            conflict = planning.output_dir_conflict(
+                Path(run_root), Path(data.output_dir), run_recursive,
+            )
+            if conflict:
+                return JSONResponse({"error": conflict}, status_code=400)
+        planned = _resolve_collision_free_output_paths(
+            [
+                (f["id"], f["name"], (data.overrides or {}).get(f["id"], {}).get("output_format", data.output_format))
+                for f in files_to_process
+            ],
+            Path(data.output_dir),
+        )
+        # On resume the finished sources are not in files_to_process, but
+        # their outputs still sit in the output folder — and a name planned
+        # for a pending file can land on one of them. Check every source the
+        # batch knows about, not just this pass's list.
+        check_sources = [Path(f["path"]) for f in files_to_process]
+        if data.resume and batch_state is not None:
+            check_sources += [Path(f["path"]) for f in batch_state.get("files", []) if f.get("path")]
+        hit = planning.planned_outputs_hit_sources(planned.values(), check_sources)
+        if hit is not None:
+            return JSONResponse({
+                "error": f"output would overwrite the original file {hit}: pick a different output folder",
+            }, status_code=400)
         _push_recent("output_dirs", str(Path(data.output_dir).resolve()))
 
     # Validate per-file overrides before mutating any state — a bad override
@@ -1252,7 +1510,12 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
     if not data.resume and data.output_dir:
         batch_state = {
             "session_id": secrets.token_urlsafe(12),
-            "input_dir": str(Path(state.files[0]["path"]).parent) if state.files else "",
+            # The scan root and its recursive flag, not the first file's
+            # parent: a resume has to re-check the folder pair this run was
+            # validated against, and a parent folder would both miss the
+            # real root and invent a recursion rule that was never applied.
+            "input_dir": run_root,
+            "input_recursive": run_recursive,
             "output_dir": data.output_dir,
             "output_format": data.output_format,
             "quality": data.quality,
@@ -1273,18 +1536,8 @@ async def start_optimization(data: OptimizeRequest, state: AppState = Depends(ge
     # their files barely shrank. JPEG without cjpeg fails outright per-file,
     # so warn before any work starts. available_modes() is the source of
     # truth.
-    warning = None
-    if optimizer is not None and (data.output_format, data.compression_mode) not in optimizer.available_modes():
-        if data.output_format in ("jpg", "jpeg"):
-            warning = (
-                "cjpeg (mozjpeg) not found — JPEG output isn't possible. Place cjpeg in the "
-                "bin/ directory (or PATH) to compress JPEGs while keeping the JPEG format."
-            )
-        else:
-            warning = (
-                "pngquant not found — Standard mode PNG output falls back to lossless-only "
-                "compression (larger files). Place pngquant in the bin/ directory for full compression."
-            )
+    warning = _mode_degradation_warning(optimizer, data.output_format, data.compression_mode)
+    if warning:
         state.logs.append(f"[Warning] {warning}")
 
     asyncio.create_task(
@@ -1409,6 +1662,35 @@ def _validate_overrides(
             if eff_mode == "screenshot" and eff_format != "png":
                 return f"Screenshot mode is PNG-only (override for file {fid!r})"
     return None
+
+
+def _mode_degradation_warning(opt: Optional["Optimizer"], output_format: str, mode: str) -> Optional[str]:
+    """Why (output_format, mode) cannot run at full strength with the
+    encoders found, or None. available_modes() is the source of truth; the
+    web batch and the CLI both call this so the wording cannot drift."""
+    if opt is None or (output_format, mode) in opt.available_modes():
+        return None
+    if output_format in ("jpg", "jpeg"):
+        return (
+            "cjpeg (mozjpeg) not found — JPEG output isn't possible. Place cjpeg in the "
+            "bin/ directory (or PATH) to compress JPEGs while keeping the JPEG format."
+        )
+    if output_format == "avif":
+        return (
+            "avifenc (libavif) not found — AVIF output isn't possible. Place avifenc in the "
+            "bin/ directory (or PATH) to produce AVIF."
+        )
+    return (
+        "pngquant not found — Standard mode PNG output falls back to lossless-only "
+        "compression (larger files). Place pngquant in the bin/ directory for full compression."
+    )
+
+
+def _dest_is_original(dest: Path, source: Path) -> bool:
+    """True if writing `dest` would replace the source file `source` (same
+    file after resolving symlinks, or the same inode). The last line of
+    defence in the web copy step, behind the up-front folder checks."""
+    return planning.same_path(dest, source) if dest.exists() else False
 
 
 def _resolve_collision_free_output_paths(
@@ -1584,6 +1866,13 @@ async def _process_files(
         out_path = out_paths[file_info["id"]]
         if out_path is None:
             raise ValueError("unsafe file name escapes the output directory")
+        # Check the longest path this file will be written to: the final
+        # destination when a folder was chosen, else the workspace copy.
+        problem = planning.path_problem(
+            Path(output_dir) / out_path.relative_to(opt_output_dir) if output_dir else out_path
+        )
+        if problem:
+            raise ValueError(problem)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Resolve this file's effective parameters: a per-file override
@@ -1647,14 +1936,31 @@ async def _process_files(
                 eff_quality, eff_compression_mode, eff_max_width,
                 eff_protected_colors, eff_dithering, eff_keep_exif, eff_output_format,
             )
-            settings_unchanged = _skip_fp.get(str(rel)) == eff_fingerprint
+            # The record must also name the source that produced the file
+            # (relative name + size). Without it, a new file that shifts the
+            # collision numbering (photo.bmp next to a processed photo.jpg,
+            # both -> photo.webp) would inherit the other file's output. A
+            # bare-string record from an older version has no source
+            # identity and is treated as unverifiable.
+            record = _skip_fp.get(str(rel))
+            settings_unchanged = (
+                isinstance(record, dict)
+                and record.get("fp") == eff_fingerprint
+                and record.get("src") == file_info["name"]
+                and record.get("size") == (input_path.stat().st_size if input_path.exists() else None)
+            )
             if (
                 source_unchanged
                 and settings_unchanged
                 and dest.stat().st_size > 0
-                and _is_valid_reusable_output(dest, eff_output_format)
+                # Full decode of JPEG/WebP: keep it off the event loop.
+                and await asyncio.to_thread(_is_valid_reusable_output, dest, eff_output_format)
             ):
-                shutil.copy2(dest, out_path)
+                # Staged like every other write: this copy becomes the file
+                # /api/result serves and the ZIP download ships, so a kill
+                # mid-copy must not leave a truncated image under a name the
+                # UI treats as a finished result.
+                persistence.atomic_copy(dest, out_path)
                 orig_size = input_path.stat().st_size if input_path.exists() else 0
                 comp_size = dest.stat().st_size
                 savings = orig_size - comp_size
@@ -1684,12 +1990,12 @@ async def _process_files(
                 if file_info["path"] in _bs_lookup:
                     _bs_lookup[file_info["path"]]["status"] = "done"
                     batch_state.setdefault("results", []).append(skipped_result)
-                    _save_batch_state(batch_state)
+                    _save_batch_state(batch_state, throttle=True)
                 return
 
         state.logs.append(f"Processing: {file_info['name']}")
 
-        result = await optimizer.optimize_png(
+        result = await optimizer.optimize_image(
             input_path=input_path,
             output_path=out_path,
             quality=eff_quality,
@@ -1712,6 +2018,53 @@ async def _process_files(
         # re-deriving it from "name".
         result["output_name"] = str(out_path.relative_to(opt_output_dir))
 
+        if result["success"] and output_dir:
+            # Copy this file to the user's chosen output folder right away,
+            # rather than waiting for the whole batch to finish — otherwise
+            # the folder stays empty for the entire run, which looks like
+            # the wrong folder was picked.
+            #
+            # The copy is part of the job: a file that never reached the
+            # output folder (disk full, read-only share, bad path, refusal to
+            # replace an original) is a FAILED file, not a success with a log
+            # line. It stays "failed" in the batch state so Retry and Resume
+            # pick it up. The write goes through a temp file + os.replace so a
+            # crash never leaves a truncated file at the destination.
+            try:
+                user_output = Path(output_dir)
+                rel = out_path.relative_to(opt_output_dir)
+                dest = user_output / rel
+                if _dest_is_original(dest, input_path):
+                    raise OSError(f"refusing to overwrite the original file {dest}")
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                await asyncio.to_thread(persistence.atomic_copy, out_path, dest)
+                # Same reasoning as the skip_existing branch above:
+                # only set when there's a real, persistent file on
+                # disk to reveal (nothing to show when output_dir is
+                # empty and results live only in the temp workspace).
+                result["final_output_path"] = str(dest)
+                # Record what settings actually produced this file, so
+                # a later skip_existing run can tell "safe to reuse"
+                # apart from "source unchanged but settings differ" —
+                # see the fingerprint check above. Tracked on every
+                # run with a persistent output_dir (not just
+                # skip_existing runs) so a plain run followed by a
+                # skip_existing run has something to verify against.
+                nonlocal _skip_fp_dirty
+                _skip_fp[str(rel)] = {
+                    "fp": _settings_fingerprint(
+                        eff_quality, eff_compression_mode, eff_max_width,
+                        eff_protected_colors, eff_dithering, eff_keep_exif, eff_output_format,
+                    ),
+                    # Which source made this file; see the reuse check.
+                    "src": file_info["name"],
+                    "size": input_path.stat().st_size,
+                }
+                _skip_fp_dirty = True
+            except Exception as e:
+                result["success"] = False
+                result["error"] = f"Output copy failed: {e}"
+
         if result["success"]:
             result["savings"] = result["original_size"] - result["compressed_size"]
             result["savings_percent"] = round(
@@ -1721,37 +2074,6 @@ async def _process_files(
                 f"  OK {file_info['name']}: {_fmt_size(result['original_size'])} -> "
                 f"{_fmt_size(result['compressed_size'])} (saved {result['savings_percent']}%)"
             )
-            # Copy this file to the user's chosen output folder right away,
-            # rather than waiting for the whole batch to finish — otherwise
-            # the folder stays empty for the entire run, which looks like
-            # the wrong folder was picked.
-            if output_dir:
-                try:
-                    user_output = Path(output_dir)
-                    rel = out_path.relative_to(opt_output_dir)
-                    dest = user_output / rel
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(out_path, dest)
-                    # Same reasoning as the skip_existing branch above:
-                    # only set when there's a real, persistent file on
-                    # disk to reveal (nothing to show when output_dir is
-                    # empty and results live only in the temp workspace).
-                    result["final_output_path"] = str(dest)
-                    # Record what settings actually produced this file, so
-                    # a later skip_existing run can tell "safe to reuse"
-                    # apart from "source unchanged but settings differ" —
-                    # see the fingerprint check above. Tracked on every
-                    # run with a persistent output_dir (not just
-                    # skip_existing runs) so a plain run followed by a
-                    # skip_existing run has something to verify against.
-                    nonlocal _skip_fp_dirty
-                    _skip_fp[str(rel)] = _settings_fingerprint(
-                        eff_quality, eff_compression_mode, eff_max_width,
-                        eff_protected_colors, eff_dithering, eff_keep_exif, eff_output_format,
-                    )
-                    _skip_fp_dirty = True
-                except Exception as e:
-                    state.logs.append(f"  Output copy failed: {e}")
         else:
             state.logs.append(f"  FAILED {file_info['name']}: {result.get('error', 'unknown')}")
 
@@ -1768,10 +2090,10 @@ async def _process_files(
         if file_info["path"] in _bs_lookup:
             _bs_lookup[file_info["path"]]["status"] = "done" if result.get("success") else "failed"
             batch_state.setdefault("results", []).append(result)
-            _save_batch_state(batch_state)
+            _save_batch_state(batch_state, throttle=True)
 
     def on_item_error(file_info, e):
-        # Anything process_one doesn't already catch internally (optimize_png
+        # Anything process_one doesn't already catch internally (optimize_image
         # has its own try/except, but e.g. mkdir permission errors or a
         # malformed file_info wouldn't be) lands here. Degrading to a
         # normal failed-file result keeps one bad file from taking down the
@@ -1789,7 +2111,7 @@ async def _process_files(
         # Persist failure to batch state so resume picks it up
         if file_info.get("path") in _bs_lookup:
             _bs_lookup[file_info["path"]]["status"] = "failed"
-            _save_batch_state(batch_state)
+            _save_batch_state(batch_state, throttle=True)
 
     def on_item_done(_file_info):
         state.current += 1
@@ -1835,6 +2157,10 @@ async def _process_files(
             remaining = [f for f in batch_state.get("files", []) if f["status"] in ("pending", "failed")]
             if not remaining and batch_state.get("output_dir"):
                 _clear_batch_state(batch_state["output_dir"])
+            else:
+                # Final flush: the per-file saves are throttled, so write the
+                # end state (cancel, crash, partial failure) unconditionally.
+                _save_batch_state(batch_state)
         # Persist any new/updated skip_existing fingerprints from this run
         # in one write, rather than one disk write per file (see the load
         # site's comment for why). A cancelled/crashed run still saves
@@ -2026,7 +2352,7 @@ async def preview_optimize(data: PreviewRequest, state: AppState = Depends(get_s
     """Single-file dry run: project the compressed size of one file under
     the current settings WITHOUT touching the batch state machine.
 
-    Reuses `optimizer.optimize_png` but writes to a temp file under
+    Reuses `optimizer.optimize_image` but writes to a temp file under
     ws/preview (never ws/output, which the download ZIP rglobs), measures
     the size, then deletes the temp. Must NOT mutate state.results /
     state.current / state.total / state.output_version / state.logs /
@@ -2067,7 +2393,7 @@ async def preview_optimize(data: PreviewRequest, state: AppState = Depends(get_s
         pass
 
     try:
-        result = await optimizer.optimize_png(
+        result = await optimizer.optimize_image(
             input_path=input_path,
             output_path=out_path,
             quality=data.quality,
@@ -2080,7 +2406,7 @@ async def preview_optimize(data: PreviewRequest, state: AppState = Depends(get_s
             keep_exif=data.keep_exif,
         )
     finally:
-        # Best-effort cleanup of the preview temp. optimize_png's own
+        # Best-effort cleanup of the preview temp. optimize_image's own
         # finally-sweep already removes its *.src.png/*.pngquant.png/etc
         # sidecars; this removes the final output file too so ws/preview
         # never accumulates and can't leak into anything.
@@ -2563,8 +2889,45 @@ async def recent_clear(data: RecentClearRequest, _auth: None = Depends(require_t
     return JSONResponse({"ok": True})
 
 
+def _macos_folder_dialog(title: str) -> tuple[str, str]:
+    """Native choose-folder panel through osascript -> (path, error).
+
+    Tk is not an option here: on macOS Tk must own the main thread, and this
+    runs on the uvicorn worker thread — asking for a window there aborts the
+    process instead of returning a path. In a frozen .app it is worse still:
+    the bundled interpreter cannot run `-c` code, so the old Tk path had no
+    working fallback at all.
+
+    A user cancel (osascript exit -128) is not an error: the UI just keeps the
+    current folder."""
+    escaped = title.replace("\\", "\\\\").replace('"', '\\"')
+    script = f'POSIX path of (choose folder with prompt "{escaped}")'
+    # A .app launched from Finder gets a minimal PATH; resolve the tool here
+    # rather than relying on the environment to include /usr/bin.
+    osascript = shutil.which("osascript") or "osascript"
+    try:
+        # osascript brings Finder forward for the panel, which is what the
+        # user expects from a folder picker; a Tk dialog would instead have
+        # to fight the browser window for focus.
+        proc = subprocess.run(
+            [osascript, "-e", script],
+            capture_output=True, text=True, timeout=600,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return "", str(exc)
+    if proc.returncode != 0:
+        if "-128" in (proc.stderr or ""):
+            return "", ""
+        return "", (proc.stderr or "").strip() or f"osascript exited {proc.returncode}"
+    # `POSIX path of` appends a trailing slash for folders.
+    return (proc.stdout or "").strip().rstrip("/") or "/", ""
+
+
 @app.get("/api/browse-folder")
 async def browse_folder(title: str = "Select Folder", _auth: None = Depends(require_token)):
+    if sys.platform == "darwin":
+        path, error = await asyncio.to_thread(_macos_folder_dialog, title)
+        return JSONResponse({"path": path, "error": error} if error else {"path": path})
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -2797,15 +3160,22 @@ async def get_batch_state(output_dir: Optional[str] = None, state: AppState = De
         bs = candidates[0] if candidates else None
     if bs is None:
         return JSONResponse({"has_batch": False})
-    total = len(bs.get("files", []))
-    done = sum(1 for f in bs.get("files", []) if f["status"] == "done")
-    failed = sum(1 for f in bs.get("files", []) if f["status"] == "failed")
-    pending = total - done - failed
+    files = bs.get("files", [])
+    total = len(files)
+    done = sum(1 for f in files if f["status"] == "done")
+    failed = sum(1 for f in files if f["status"] == "failed")
+    # "missing" sources were removed since the batch was saved (see the
+    # resume flow); they are finished, not waiting, so counting them as
+    # pending (total - done - failed) made the Resume banner promise work
+    # that can never happen.
+    missing = sum(1 for f in files if f["status"] == "missing")
+    pending = total - done - failed - missing
     return JSONResponse({
         "has_batch": True,
         "total": total,
         "done": done,
         "failed": failed,
+        "missing": missing,
         "pending": pending,
         "output_dir": bs.get("output_dir", ""),
         "output_format": bs.get("output_format", "png"),
@@ -2893,11 +3263,13 @@ async def put_settings(
         elif key == "session_idle_timeout_hours":
             try:
                 h = float(value)
-                if h < 0:
+                # > 0, matching _load_app_config: it treats <= 0 as invalid
+                # and silently falls back to the default on the next start.
+                if h <= 0:
                     raise ValueError()
             except (TypeError, ValueError):
                 return JSONResponse(
-                    {"error": f"Invalid {key}: {value!r}. Must be a non-negative number."},
+                    {"error": f"Invalid {key}: {value!r}. Must be a positive number."},
                     status_code=400,
                 )
             cfg[key] = h
@@ -2916,9 +3288,8 @@ async def put_settings(
 
     # Persist to config.json
     try:
-        _config_file().write_text(
-            json.dumps(cfg, indent=2, ensure_ascii=False),
-            encoding="utf-8",
+        persistence.atomic_write_text(
+            _config_file(), json.dumps(cfg, indent=2, ensure_ascii=False),
         )
     except OSError as e:
         return JSONResponse(
@@ -2970,17 +3341,7 @@ def _watch_output_conflicts_with_input(directory: Path, output_dir: Path, recurs
       scan only lists directory's immediate children, so a nested output
       folder's contents are never re-scanned.
     """
-    d = directory.resolve()
-    o = output_dir.resolve()
-    if o == d:
-        return True
-    if recursive:
-        try:
-            o.relative_to(d)
-            return True
-        except ValueError:
-            return False
-    return False
+    return planning.output_dir_conflict(directory, output_dir, recursive) is not None
 
 
 async def _watch_loop(state: AppState, req: WatchRequest):
@@ -2996,34 +3357,43 @@ async def _watch_loop(state: AppState, req: WatchRequest):
     directory = Path(req.directory)
     output_dir = Path(req.output_dir) if req.output_dir else None
 
-    quality_map = {"high": 85, "medium": 75, "low": 60}
-    used_names: set[str] = set()
-    # rel_path -> the output file actually written for it, so a detected
-    # rename can find and remove the *old* name's output. A plain set
-    # (used_names) only tells us a filename is taken, not which source it
-    # came from, and the collision guard can shift the actual filename
-    # away from the naive with_suffix() guess (e.g. "_2.png") — this dict
-    # tracks the real path so cleanup targets the right file.
+    # rel_path -> the output file that source owns. A source keeps the same
+    # output for its whole life (a re-save overwrites it), a detected rename
+    # can find and remove the *old* name's output, and only a *different*
+    # source claiming the same name gets a numbered suffix. A bare set of
+    # used names could not tell "taken by me earlier" from "taken by someone
+    # else", which is what turned every re-save into name_2, name_3, ...
     output_path_for: dict[str, Path] = {}
+    # case-folded output path -> rel_path of the source that owns it.
+    owner_of: dict[str, str] = {}
 
     async def on_change(rel_path: str, abs_path: Path, renamed_from: Optional[str] = None):
         if optimizer is None:
             return
         try:
             if output_dir:
-                out_path = output_dir / Path(rel_path).with_suffix(f".{req.output_format}")
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                # Collision guard: same filename from different subdirs
-                key = str(out_path).lower()
-                if key in used_names:
+                out_path = output_path_for.get(rel_path)
+                if out_path is None:
+                    out_path = output_dir / Path(rel_path).with_suffix(f".{req.output_format}")
+                    # Collision guard: same output name from a different source
+                    # (other subfolder, or photo.png vs photo.jpg). The owner
+                    # map is case-folded, so a case-only rename
+                    # ("Shot.png" -> "shot.png", which Windows and default
+                    # macOS volumes allow) collides with its own previous
+                    # output; that is the same source, so take the name back
+                    # instead of numbering a duplicate — the rename cleanup
+                    # below then drops the old spelling's file.
+                    key = str(out_path).lower()
                     n = 2
-                    while key in used_names:
+                    while owner_of.get(key, rel_path) not in (rel_path, renamed_from):
                         out_path = output_dir / Path(rel_path).with_name(
                             f"{Path(rel_path).stem}_{n}.{req.output_format}"
                         )
                         key = str(out_path).lower()
                         n += 1
-                used_names.add(key)
+                    owner_of[key] = rel_path
+                    output_path_for[rel_path] = out_path
+                out_path.parent.mkdir(parents=True, exist_ok=True)
             else:
                 return
 
@@ -3043,7 +3413,7 @@ async def _watch_loop(state: AppState, req: WatchRequest):
                     try:
                         if old_output.exists():
                             old_output.unlink()
-                        used_names.discard(str(old_output).lower())
+                        owner_of.pop(str(old_output).lower(), None)
                         state.watch_logs.append(
                             f"  Renamed: {renamed_from} -> {rel_path} (removed old output {old_output.name})"
                         )
@@ -3054,25 +3424,38 @@ async def _watch_loop(state: AppState, req: WatchRequest):
 
             state.watch_logs.append(f"Detected: {rel_path}")
 
-            q = quality_map.get(req.quality, 75)
-            if req.compression_mode in ("lossless", "resize_only"):
-                q = 95
+            # Encode into a staging file and rename it over the output, so a
+            # re-save replaces the previous output atomically and a failed
+            # or killed encode never leaves a partial file under the real name.
+            staged = persistence.staging_path(out_path)
+            try:
+                result = await optimizer.optimize_image(
+                    input_path=abs_path,
+                    output_path=staged,
+                    quality=req.quality,
+                    max_width=req.max_width,
+                    compression_mode=req.compression_mode,
+                    protected_colors=req.protected_colors,
+                    dithering=req.dithering,
+                    output_format=req.output_format,
+                    keep_exif=req.keep_exif,
+                )
+            except BaseException:
+                # Cancelled (Watch stopped) or crashed mid-encode: do not
+                # leave the half-written staging file behind.
+                persistence.discard(staged)
+                raise
 
-            result = await optimizer.optimize_png(
-                input_path=abs_path,
-                output_path=out_path,
-                quality=req.quality,
-                max_width=req.max_width,
-                compression_mode=req.compression_mode,
-                protected_colors=req.protected_colors,
-                dithering=req.dithering,
-                output_format=req.output_format,
-                keep_exif=req.keep_exif,
-            )
+            if result.get("success"):
+                try:
+                    await asyncio.to_thread(persistence.commit_staged, staged, out_path)
+                except OSError as e:
+                    result = {"success": False, "error": f"cannot write {out_path}: {e}"}
+            else:
+                persistence.discard(staged)
 
             state.watch_processed += 1
             if result.get("success"):
-                output_path_for[rel_path] = out_path
                 savings = result["original_size"] - result["compressed_size"]
                 pct = round(savings / result["original_size"] * 100, 1) if result["original_size"] > 0 else 0
                 state.watch_logs.append(
@@ -3293,13 +3676,17 @@ def _matches_globs(rel_path: str, patterns: List[str]) -> bool:
 _CLI_SUCCESS_STATUSES = ("compressed", "cached", "kept_original")
 
 
-def _build_cli_report(files: list) -> dict:
+def _build_cli_report(files: list, run_warnings: Optional[list] = None) -> dict:
     """Machine-readable result of a CLI run (--json). `files` holds one record
     per scanned file; statuses are mutually exclusive: compressed, cached,
-    kept_original (growth-guard fallback), excluded, failed. Size totals and
+    kept_original (growth-guard fallback), excluded, skipped (an input the
+    pipeline cannot represent, e.g. an animation: left untouched, not an
+    error), failed. Size totals and
     saved_percent cover the successful statuses only. `total` counts every
-    scanned file, excluded ones included."""
-    counts = {"compressed": 0, "cached": 0, "excluded": 0, "failed": 0, "kept_original": 0}
+    scanned file, excluded ones included. `warnings` lists run-level warnings
+    (e.g. a missing encoder that downgrades the requested mode); each file
+    record has its own `warnings` list (empty when there is nothing to say)."""
+    counts = {"compressed": 0, "cached": 0, "excluded": 0, "failed": 0, "kept_original": 0, "skipped": 0}
     orig = comp = 0
     for f in files:
         counts[f["status"]] += 1
@@ -3307,6 +3694,7 @@ def _build_cli_report(files: list) -> dict:
             orig += f["original_size"]
             comp += f["compressed_size"]
     return {
+        "warnings": list(run_warnings or []),
         "files": files,
         "summary": {
             "total": len(files),
@@ -3314,7 +3702,9 @@ def _build_cli_report(files: list) -> dict:
             "cached": counts["cached"],
             "excluded": counts["excluded"],
             "failed": counts["failed"],
+            "skipped": counts["skipped"],
             "kept_original": counts["kept_original"],
+            "warned": sum(1 for f in files if f.get("warnings")),
             "original_size": orig,
             "compressed_size": comp,
             "saved_percent": round((1 - comp / orig) * 100, 1) if orig > 0 else 0,
@@ -3324,7 +3714,7 @@ def _build_cli_report(files: list) -> dict:
 
 async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> int:
     """Headless batch run: no web server, no browser. Scans --source, runs
-    every image through the exact same optimizer.optimize_png pipeline the
+    every image through the exact same optimizer.optimize_image pipeline the
     web UI and Watch Mode use (so a CLI run behaves identically to a batch
     run started from the browser with the same settings — no separate
     "CLI version" of the compression logic to drift out of sync), and exits
@@ -3349,11 +3739,13 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
     def log(*parts) -> None:
         print(*parts, file=log_stream)
 
+    run_warnings: list = []
+
     def emit_report(files: list) -> None:
         if as_json:
             # ensure_ascii (the default) keeps stdout valid on any console
             # encoding even when file names are not ASCII.
-            print(json.dumps(_build_cli_report(files), indent=2))
+            print(json.dumps(_build_cli_report(files, run_warnings), indent=2))
             sys.stdout.flush()
 
     source = Path(args.source).resolve()
@@ -3364,6 +3756,10 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
         print("[Error] --output is required when using --source", file=sys.stderr)
         return 1
     output_dir = Path(args.output).resolve()
+    conflict = planning.output_dir_conflict(source, output_dir, args.recursive)
+    if conflict:
+        print(f"[Error] {conflict}", file=sys.stderr)
+        return 1
     cache_dir_arg = getattr(args, "cache_dir", None)
     cache_max_mb = getattr(args, "cache_max_size_mb", DEFAULT_CACHE_MAX_MB)
     if cache_dir_arg and cache_max_mb < 0:
@@ -3410,7 +3806,7 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
                 excluded_size = None
             records[p] = {
                 "rel": rel_posix, "output_name": None, "original_size": excluded_size,
-                "compressed_size": None, "status": "excluded", "error": None,
+                "compressed_size": None, "status": "excluded", "error": None, "warnings": [],
             }
             continue
         images.append(p)
@@ -3479,9 +3875,20 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
         return 1
     items = [(str(i), str(p.relative_to(source)), args.format) for i, p in enumerate(images)]
     out_paths = _resolve_collision_free_output_paths(items, output_dir)
+    hit = planning.planned_outputs_hit_sources(out_paths.values(), images)
+    if hit is not None:
+        print(
+            f"[Error] output would overwrite the original file {hit}: pick a different --output",
+            file=sys.stderr,
+        )
+        return 1
 
     global optimizer
     optimizer = optimizer_instance or Optimizer(max_concurrency=CONCURRENT_WORKERS)
+    mode_warning = _mode_degradation_warning(optimizer, args.format, args.mode)
+    if mode_warning:
+        run_warnings.append(mode_warning)
+        log(f"[Warning] {mode_warning}")
     if not optimizer.pngquant_path and not optimizer.oxipng_path and args.format == "png":
         log(
             "[Warning] Neither pngquant nor oxipng found in bin/ — PNG results will be much "
@@ -3497,12 +3904,13 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
             _settings_fingerprint(
                 args.quality, args.mode, args.max_width, protected_colors,
                 args.dithering, args.keep_exif, args.format,
+                not getattr(args, "strip_icc", False),
             ),
             enc_fp,
         )
 
     total = len(images)
-    counters = {"done": 0, "ok": 0, "failed": 0, "orig": 0, "comp": 0, "cached": 0}
+    counters = {"done": 0, "ok": 0, "failed": 0, "skipped": 0, "orig": 0, "comp": 0, "cached": 0}
     # Entry paths stored during this run; handed to evict(protect=...) so a
     # run never deletes the results it just wrote (see cache.ContentCache.evict).
     protected_entries: set = set()
@@ -3521,6 +3929,7 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
             "compressed_size": None,
             "status": "failed",
             "error": error,
+            "warnings": [],
         }
 
     async def process(idx: int, img_path: Path):
@@ -3537,6 +3946,15 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
                 )
             log(f"[{d}/{total}] FAIL {rel}: resolved output path escapes --output directory")
             return
+        problem = planning.path_problem(out_path)
+        if problem:
+            async with lock:
+                counters["done"] += 1
+                counters["failed"] += 1
+                d = counters["done"]
+                records[img_path] = fail_record(img_path, problem)
+            log(f"[{d}/{total}] FAIL {rel}: {problem}")
+            return
         try:
             out_path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as e:
@@ -3552,12 +3970,16 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
                 records[img_path] = fail_record(img_path, error)
             log(f"[{d}/{total}] FAIL {rel}: {error}")
             return
+        # Everything is written to a staging file next to the destination
+        # and only renamed into place once the whole result is known good,
+        # so a kill or a failure never leaves a partial file at out_path.
+        staged = persistence.staging_path(out_path)
         cache_key = None
         cached_hit = False
         result = None
         if cache is not None:
             try:
-                probe = await asyncio.to_thread(cache.probe, img_path, out_path)
+                probe = await asyncio.to_thread(cache.probe, img_path, staged)
             except OSError:
                 # Unreadable input or cache I/O trouble: fall through to the
                 # normal pipeline, which reports a real input error itself.
@@ -3571,19 +3993,34 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
                         "compressed_size": probe.hit_size, "error": None,
                     }
         if result is None:
-            result = await optimizer.optimize_png(
-                img_path, out_path,
-                quality=args.quality, max_width=args.max_width, compression_mode=args.mode,
-                protected_colors=protected_colors, dithering=args.dithering,
-                output_format=args.format, keep_exif=args.keep_exif,
-            )
+            try:
+                result = await optimizer.optimize_image(
+                    img_path, staged,
+                    quality=args.quality, max_width=args.max_width, compression_mode=args.mode,
+                    protected_colors=protected_colors, dithering=args.dithering,
+                    output_format=args.format, keep_exif=args.keep_exif,
+                    keep_icc=not getattr(args, "strip_icc", False),
+                )
+            except BaseException:
+                persistence.discard(staged)  # cancelled/crashed mid-encode
+                raise
             if cache is not None and cache_key is not None and result["success"]:
                 try:
                     protected_entries.add(
-                        await asyncio.to_thread(cache.store, cache_key, out_path)
+                        await asyncio.to_thread(cache.store, cache_key, staged)
                     )
                 except OSError as e:
                     print(f"[Warning] cache write failed for {rel}: {e}", file=sys.stderr)
+        if result["success"]:
+            try:
+                await asyncio.to_thread(persistence.commit_staged, staged, out_path)
+            except OSError as e:
+                result = {
+                    "success": False, "original_size": result.get("original_size"),
+                    "compressed_size": None, "error": f"cannot write {out_path}: {e}",
+                }
+        else:
+            persistence.discard(staged)
         async with lock:
             counters["done"] += 1
             d = counters["done"]
@@ -3606,12 +4043,34 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
                         else "cached" if cached_hit else "compressed"
                     ),
                     "error": None,
+                    # A non-fatal problem the optimizer reported (encoder
+                    # refused the quality floor, fell back, ...): the file
+                    # was written but not at the requested strength.
+                    "warnings": [result["warning"]] if result.get("warning") else [],
                 }
                 log(
                     f"[{d}/{total}] {'HIT ' if cached_hit else 'OK  '} {rel} -> {out_path.name}  "
                     f"{_fmt_size(result['original_size'])} -> {_fmt_size(result['compressed_size'])} "
                     f"({pct}% saved)"
                 )
+                if result.get("warning"):
+                    log(f"[Warning] {rel}: {result['warning']}")
+            elif result.get("unsupported"):
+                # Refused on purpose (e.g. an animation that would be
+                # flattened): the file is untouched and nothing is wrong
+                # with the run, so it is a skip with the reason as a warning
+                # (--strict still turns it into an exit 1).
+                counters["skipped"] += 1
+                records[img_path] = {
+                    "rel": img_path.relative_to(source).as_posix(),
+                    "output_name": None,
+                    "original_size": result.get("original_size"),
+                    "compressed_size": None,
+                    "status": "skipped",
+                    "error": None,
+                    "warnings": [result.get("error") or "unsupported input"],
+                }
+                log(f"[{d}/{total}] SKIP {rel}: {result.get('error') or 'unsupported input'}")
             else:
                 counters["failed"] += 1
                 records[img_path] = fail_record(
@@ -3661,7 +4120,11 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
         evicted = 0
 
     log()
-    log(f"Done: {counters['ok']} succeeded, {counters['failed']} failed, {total} total")
+    log(
+        f"Done: {counters['ok']} succeeded, {counters['failed']} failed, "
+        + (f"{counters['skipped']} skipped, " if counters["skipped"] else "")
+        + f"{total} total"
+    )
     if n_excluded:
         log(f"Excluded: {n_excluded} file(s) by --include/--exclude")
     if cache is not None:
@@ -3673,7 +4136,14 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
         saved_pct = round((1 - counters["comp"] / counters["orig"]) * 100, 1)
         log(f"Total: {_fmt_size(counters['orig'])} -> {_fmt_size(counters['comp'])} ({saved_pct}% saved)")
     emit_report([records[p] for p in scanned])
-    return 1 if counters["failed"] > 0 else 0
+    if counters["failed"] > 0:
+        return 1
+    if getattr(args, "strict", False) and (
+        run_warnings or any(r.get("warnings") for r in records.values())
+    ):
+        log("[Error] --strict: exiting 1 because the run produced warnings (see above)")
+        return 1
+    return 0
 
 
 def _download_enabled() -> bool:
@@ -3791,7 +4261,7 @@ def main():
     )
     cli_group.add_argument(
         "--max-width", type=int, default=0,
-        help="Resize so the longest side is at most this many pixels (default 0 = no resize). "
+        help="Resize so the width is at most this many pixels, keeping the aspect ratio; height is not limited (default 0 = no resize). "
              "Required (> 0) when --mode resize_only.",
     )
     cli_group.add_argument(
@@ -3810,6 +4280,13 @@ def main():
              "Orientation are always stripped regardless. Default: strip all EXIF.",
     )
     cli_group.add_argument(
+        "--strip-icc", action="store_true",
+        help="Drop the source's embedded ICC colour profile. Default: keep it — the pixels "
+             "are re-encoded in the source's own colour space, so removing the profile makes "
+             "wide-gamut (Adobe RGB, Display P3) images look desaturated in colour-managed "
+             "viewers. Use this only when the profile itself is sensitive/oversized.",
+    )
+    cli_group.add_argument(
         "--exclude", action="append", default=[], metavar="GLOB",
         help="Skip files matching this glob; repeatable. A pattern without '/' matches the "
              "file name at any depth ('*.bak'); a pattern with '/' matches the path relative "
@@ -3821,10 +4298,22 @@ def main():
              "matching rules as --exclude, which is applied afterwards and takes priority.",
     )
     cli_group.add_argument(
+        "--strict", action="store_true",
+        help="Exit 1 when the run produced any warning (a missing encoder that downgrades the "
+             "requested mode, or a per-file warning), not only on failures. For CI and "
+             "unattended runs that must not silently produce weaker output.",
+    )
+    cli_group.add_argument(
         "--json", action="store_true",
         help="Print the final report as a single JSON object on stdout (per-file status "
              "compressed/cached/kept_original/excluded/failed, plus a summary). All "
              "human-readable output moves to stderr so stdout can be piped to a parser.",
+    )
+    cli_group.add_argument(
+        "--timeout", type=float, metavar="SECONDS",
+        help="Base time budget for one encoder invocation (default 120). Scaled up for images "
+             "larger than ~4 MP (up to 8x) so a legitimate pass over a big photo is not killed; "
+             "raise this for very large images on slow or network storage.",
     )
     cli_group.add_argument(
         "--cache-dir", metavar="PATH",
@@ -3869,6 +4358,14 @@ def main():
         force=args.force_download,
         out=sys.stderr if cli_json else None,
     )
+
+    if getattr(args, "timeout", None) is not None:
+        if args.timeout <= 0:
+            print("[Error] --timeout must be > 0", file=sys.stderr)
+            sys.exit(1)
+        # Read lazily by Optimizer._timeout_for / _communicate_with_timeout,
+        # so this covers the CLI batch and the server's own encodes alike.
+        optimizer_module.SUBPROCESS_TIMEOUT = float(args.timeout)
 
     if args.source:
         CONCURRENT_WORKERS = max(1, args.workers)
@@ -3921,6 +4418,8 @@ def main():
             f"network you fully trust."
         )
 
+    global _BOUND_HOST
+    _BOUND_HOST = args.host
     import uvicorn
     uvicorn.run(app, host=args.host, port=port, reload=False)
 

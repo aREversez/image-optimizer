@@ -1,18 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import os
 import re
 import shutil
 import struct
-import subprocess
 import sys
 import threading
 import zlib
 from pathlib import Path
 from typing import Callable, Optional
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageCms, ImageOps
 
 from image_optimizer import binaries
 
@@ -27,6 +27,11 @@ HEX_COLOR_RE = re.compile(r"^#?[0-9A-Fa-f]{6}$")
 # timeout already used for the much cheaper `where`/`which` binary lookup
 # in _find_binary.
 SUBPROCESS_TIMEOUT = 120
+
+# Pixel count at which an encoder gets the base timeout; larger images get a
+# proportionally longer one (see Optimizer._timeout_for), capped at 8x. 4 MP
+# is roughly a phone photo, the size the 120 s default was tuned against.
+PIXELS_PER_TIMEOUT_UNIT = 4_000_000
 
 # After a timed-out encoder is killed, how long to wait for it to be reaped
 # before giving up on it (see Optimizer._kill_and_reap).
@@ -43,12 +48,54 @@ EXIF_TAG_EXIF_IFD = 0x8769
 EXIF_TAG_MAKER_NOTE = 0x927C
 
 
+def cmyk_to_rgb(img):
+    """Convert a CMYK image to RGB for the RGB-only output formats.
+
+    Image.convert("RGB") applies a naive formula that ignores the embedded
+    profile; against a colour-managed rendering it was about 30 levels off on
+    average. With a CMYK profile the conversion goes profile -> sRGB (relative
+    colorimetric with black point compensation, what print-to-screen
+    conversions normally use). Without one, or if the profile cannot be used,
+    it falls back to the plain conversion. The result is plain sRGB, so no
+    profile is carried forward (see Optimizer._capture_icc)."""
+    profile = img.info.get("icc_profile")
+    if profile and profile[16:20] == b"CMYK":
+        try:
+            out = ImageCms.profileToProfile(
+                img,
+                ImageCms.ImageCmsProfile(io.BytesIO(profile)),
+                ImageCms.createProfile("sRGB"),
+                renderingIntent=ImageCms.Intent.RELATIVE_COLORIMETRIC,
+                outputMode="RGB",
+                flags=ImageCms.Flags.BLACKPOINTCOMPENSATION,
+            )
+            if out is not None:
+                return out
+        except Exception:
+            pass
+    return img.convert("RGB")
+
+
+def fit_width(size: tuple[int, int], max_width: int):
+    """Size to resize to so the width is at most max_width (aspect ratio
+    kept), or None when no resize is needed. Only the width is limited: a
+    tall portrait is left alone. The height is clamped to >= 1 so an extreme
+    panorama (5000x1 -> 100 wide) does not collapse to height 0, which Pillow
+    rejects. Single source for every output path."""
+    w, h = size
+    if max_width <= 0 or w <= max_width:
+        return None
+    return (max_width, max(1, int(h * (max_width / w))))
+
+
 class Optimizer:
     def __init__(self, bin_dir: Optional[Path] = None, max_concurrency: int = 4):
-        # Searched in order, after PATH. The per-user data directory is where
-        # binaries fetched on first run land (see binaries.py); the repo's own
-        # bin/ stays last so an existing source checkout / dev workflow that
-        # drops the .exe next to the code keeps working unchanged.
+        # Searched in order, before PATH. The per-user data directory is where
+        # binaries fetched on first run land (see binaries.py) and is therefore
+        # the only copy whose digest was verified; a same-named executable
+        # earlier on PATH must not shadow it. The repo's own bin/ is searched
+        # next so an existing source checkout / dev workflow that drops the
+        # .exe next to the code keeps working unchanged.
         if bin_dir:
             self._bin_dirs = [Path(bin_dir)]
         elif getattr(sys, "frozen", False):
@@ -75,6 +122,37 @@ class Optimizer:
         self._detect_lock = threading.Lock()
         self._detect_binaries()
         self._semaphore = asyncio.Semaphore(max(1, max_concurrency))
+        # Decode/resize/encode-in-Pillow work is CPU- and memory-heavy and
+        # runs in the event loop's default thread pool, which `_semaphore`
+        # does not cover (it only bounds the external encoders). Without a
+        # second bound, the CLI dispatches one task per file and every one of
+        # them can be decoding a full-size image at the same time — peak
+        # memory ends up proportional to the batch, not to --workers.
+        self._decode_semaphore = asyncio.Semaphore(max(1, max_concurrency))
+
+    async def _run_bounded(self, func, *args):
+        """Run blocking Pillow work in a thread, at most `max_concurrency`
+        at a time. Same limit as the encoder semaphore, so a run's peak
+        memory follows --workers instead of the number of files."""
+        async with self._decode_semaphore:
+            return await asyncio.get_running_loop().run_in_executor(None, func, *args)
+
+    def _timeout_for(self, input_path: Path) -> float:
+        """Encoder timeout scaled by pixel count.
+
+        A fixed 120 s is either far too generous for a 200x200 icon or far
+        too short for a 50 MP photo going through pngquant at --speed 1,
+        where a legitimate pass can take minutes and would be killed and
+        reported as a failure. Scale the base timeout linearly from 4 MP
+        (1x) up to 8x, and let --timeout move the base."""
+        base = float(SUBPROCESS_TIMEOUT)
+        try:
+            with Image.open(input_path) as img:
+                pixels = img.size[0] * img.size[1]
+        except Exception:
+            return base
+        scale = min(8.0, max(1.0, pixels / PIXELS_PER_TIMEOUT_UNIT))
+        return base * scale
 
     @property
     def ready(self) -> bool:
@@ -108,7 +186,7 @@ class Optimizer:
           it doesn't do the lossy color quantization that's the whole
           point of Standard mode.
         - PNG screenshot needs pngquant too — it's a much tighter-quality
-          pngquant pass, not a different tool (see _optimize_png's
+          pngquant pass, not a different tool (see optimize_image's
           screenshot branch for the quality floor and why dithering is
           forced off there).
 
@@ -138,21 +216,44 @@ class Optimizer:
         return modes
 
     def _find_binary(self, name: str) -> Optional[Path]:
-        try:
-            cmd = "where" if sys.platform == "win32" else "which"
-            # timeout: a hung `where`/`which` (e.g. a dead network drive on
-            # PATH) must not wedge detection — and with it /api/health —
-            # forever.
-            result = subprocess.run([cmd, name], capture_output=True, text=True, timeout=5)
-            if result.returncode == 0 and result.stdout.strip():
-                return Path(result.stdout.strip().splitlines()[0])
-        except Exception:
-            pass
+        """Locate an encoder: the pinned directories first, PATH second.
+
+        Order matters. The pinned directory is populated by binaries.py,
+        which verifies a SHA-256 before anything becomes executable; PATH is
+        whatever the user's shell, an installer, or a malicious archive put
+        there. A downloaded-and-verified pngquant must therefore win over a
+        same-named file earlier on PATH, not lose to it.
+
+        The PATH walk is done here rather than with shutil.which because on
+        Windows shutil.which prepends the current working directory — for a
+        GUI that was launched from a folder of downloaded images, that means
+        a planted pngquant.exe next to them would be executed."""
         exe_name = f"{name}.exe" if sys.platform == "win32" else name
         for directory in self._bin_dirs:
             local = directory / exe_name
-            if local.exists():
-                return local.resolve()
+            try:
+                if local.is_file():
+                    return local.resolve()
+            except OSError:
+                continue
+        for entry in os.environ.get("PATH", "").split(os.pathsep):
+            entry = entry.strip().strip('"')
+            if not entry:
+                # An empty entry means "the current directory" — exactly the
+                # case this walk exists to avoid.
+                continue
+            directory = Path(entry)
+            if not directory.is_absolute():
+                continue
+            candidate = directory / exe_name
+            try:
+                # `which` only reports executable files; keep that, so a stray
+                # non-executable file does not shadow a working one later on
+                # PATH (Windows has no execute bit - .exe is the test there).
+                if candidate.is_file() and (sys.platform == "win32" or os.access(candidate, os.X_OK)):
+                    return candidate.resolve()
+            except OSError:
+                continue
         return None
 
     @staticmethod
@@ -189,8 +290,8 @@ class Optimizer:
         would freeze whatever it was at class-definition time) -- same
         reasoning as CONCURRENT_WORKERS in main.py's _run_worker_pool, and
         what lets tests shrink this to something fast without threading an
-        explicit timeout through optimize_png/optimize_jpeg/optimize_webp/
-        optimize_avif.
+        explicit timeout through optimize_image/_optimize_jpeg/_optimize_webp/
+        _optimize_avif.
 
         Returns (stdout, stderr, timed_out)."""
         if timeout is None:
@@ -403,6 +504,7 @@ class Optimizer:
         result: dict,
         keep_exif: bool,
         cleaned_exif: bytes,
+        icc_profile: bytes = b"",
     ) -> None:
         """If the just-produced output isn't actually smaller than the
         original, and no format conversion was requested (the source is
@@ -416,7 +518,7 @@ class Optimizer:
         forcing jpg -> png): the original bytes wouldn't be a valid file
         at output_path's extension, so there's nothing safe to fall back
         to there — that case is handled by each pipeline's own logic
-        instead (see optimize_png's pngquant-failure branch).
+        instead (see optimize_image's pngquant-failure branch).
 
         AVIF isn't handled here — its ISOBMFF box structure needs a real
         box parser to strip safely, which is more machinery than this
@@ -444,6 +546,12 @@ class Optimizer:
             else:
                 stripped = self._strip_webp_metadata(original_bytes)
             output_path.write_bytes(stripped)
+            if icc_profile and output_format == "jpg":
+                # _strip_jpeg_metadata drops every APPn segment, which is
+                # where a JPEG's ICC profile lives (APP2). PNG (iCCP) and
+                # WebP (ICCP) are not touched by their strippers, so only
+                # JPEG needs the profile put back.
+                self._embed_jpeg_icc(output_path, icc_profile)
             if keep_exif and cleaned_exif:
                 if output_format == "png":
                     self._finalize_png_exif(output_path, cleaned_exif)
@@ -459,7 +567,22 @@ class Optimizer:
             pass
 
     @staticmethod
-    def _ensure_png(src: Path, dst: Path):
+    def _frame_count(path: Path) -> int:
+        """Number of frames/pages in the file; 1 when it cannot be read (the
+        normal pipeline then reports the real decode error)."""
+        try:
+            with Image.open(path) as img:
+                # MPO is a JPEG with extra pictures (depth map, gain map,
+                # burst thumbnails). Pillow reports n_frames >= 2 for it, but
+                # the first frame IS the photo, so it is not an animation.
+                if img.format == "MPO":
+                    return 1
+                return int(getattr(img, "n_frames", 1) or 1)
+        except Exception:
+            return 1
+
+    @staticmethod
+    def _ensure_png(src: Path, dst: Path, icc_profile: bytes = b""):
         """Re-encode any Pillow-readable image (jpg/bmp/tiff/...) into a real PNG.
 
         This is required because pngquant/oxipng only understand PNG input; without
@@ -472,7 +595,7 @@ class Optimizer:
             # sideways in the optimized output.
             img = ImageOps.exif_transpose(img)
             if img.mode == "CMYK":
-                img = img.convert("RGB")
+                img = cmyk_to_rgb(img)
             # Drop EXIF at normalization. The compress pipeline
             # (pngquant --strip / oxipng --strip safe) strips it anyway in
             # production, but the test stand-in binaries only copy bytes
@@ -481,19 +604,29 @@ class Optimizer:
             # re-attached at the very end of the pipeline only when
             # keep_exif=True (see _finalize_png_exif / _optimize_webp).
             img.info.pop("exif", None)
-            img.save(dst, format="PNG")
+            # Pillow's PNG writer falls back to img.info["icc_profile"] when
+            # no icc_profile= is given, so the profile has to be removed
+            # from info for --strip-icc (or a profile not describing RGB
+            # pixels) to take effect.
+            img.info.pop("icc_profile", None)
+            save_kwargs = {"icc_profile": icc_profile} if icc_profile else {}
+            img.save(dst, format="PNG", **save_kwargs)
 
     @staticmethod
-    def _resize_image(src: Path, dst: Path, max_width: int):
+    def _resize_image(src: Path, dst: Path, max_width: int, icc_profile: bytes = b""):
         with Image.open(src) as img:
-            w, h = img.size
-            if w <= max_width:
+            new_size = fit_width(img.size, max_width)
+            if new_size is None:
                 return
-            ratio = max_width / w
-            new_size = (max_width, int(h * ratio))
             img = img.resize(new_size, Image.Resampling.LANCZOS)
             img.info.pop("exif", None)
-            img.save(dst, format="PNG")
+            # Pillow's PNG writer falls back to img.info["icc_profile"] when
+            # no icc_profile= is given, so the profile has to be removed
+            # from info for --strip-icc (or a profile not describing RGB
+            # pixels) to take effect.
+            img.info.pop("icc_profile", None)
+            save_kwargs = {"icc_profile": icc_profile} if icc_profile else {}
+            img.save(dst, format="PNG", **save_kwargs)
 
     @staticmethod
     def _make_color_map(colors: list[str], dst: Path) -> bool:
@@ -572,6 +705,34 @@ class Optimizer:
             return b""
 
     @staticmethod
+    def _capture_icc(src: Path) -> bytes:
+        """The source's embedded ICC colour profile, or b"" when it has none.
+
+        Every pipeline decodes through Pillow and re-encodes the resulting
+        pixel values unchanged, so those values stay in the source's colour
+        space. Dropping the profile therefore does not convert anything to
+        sRGB — it makes a wide-gamut photo *look* desaturated when a
+        colour-managed viewer assumes sRGB. So the profile travels with the
+        pixels unless the caller explicitly asks to strip it."""
+        try:
+            with Image.open(src) as img:
+                profile = img.info.get("icc_profile")
+                if not profile:
+                    return b""
+                profile = bytes(profile)
+        except Exception:
+            return b""
+        # Every pipeline writes RGB pixels (CMYK and palette sources are
+        # converted first, and WebP/JPEG/AVIF are RGB containers), so only a
+        # profile whose data colour space is RGB still describes the output.
+        # A CMYK or grayscale profile on RGB pixels is wrong, and strict
+        # readers drop or reject the image. The space is the 4-byte signature
+        # at offset 16 of the ICC header.
+        if profile[16:20] != b"RGB ":
+            return b""
+        return profile
+
+    @staticmethod
     def _strip_png_chunks(data: bytes, chunk_type: bytes) -> bytes:
         """Return `data` (a PNG file's bytes) with every chunk of
         `chunk_type` removed. Walks the chunk stream once, stops at IEND.
@@ -643,7 +804,99 @@ class Optimizer:
         except Exception:
             pass
 
-    async def optimize_png(
+    @staticmethod
+    def _finalize_png_icc(png_path: Path, icc_bytes: bytes) -> None:
+        """Make sure a finished PNG carries `icc_bytes` as its iCCP chunk.
+
+        The intermediate resizes/normalisations write the profile directly
+        (Pillow's icc_profile= argument), but pngquant's --strip and
+        oxipng --strip can drop iCCP, so the last word belongs here: if the
+        output already carries a profile, leave it alone (it came from the
+        same source); otherwise insert one right after IHDR. An iCCP payload is
+        a NUL-terminated Latin-1 name, a compression method byte, and the
+        zlib-compressed profile. Best-effort — never raises."""
+        if not icc_bytes:
+            return
+        try:
+            data = png_path.read_bytes()
+            if data[:8] != PNG_MAGIC:
+                return
+            if Optimizer._find_png_chunk_offset(data, b"iCCP") is not None:
+                return
+            chunk_body = b"ICC profile\x00\x00" + zlib.compress(icc_bytes, 9)
+            chunk = struct.pack(">I", len(chunk_body)) + b"iCCP" + chunk_body
+            chunk += struct.pack(">I", zlib.crc32(b"iCCP" + chunk_body) & 0xFFFFFFFF)
+            # The PNG spec wants iCCP before PLTE and IDAT, and sRGB/gAMA/cHRM
+            # must not accompany it (an sRGB chunk would claim the opposite
+            # of the profile). Right behind IHDR satisfies all of that.
+            for stale in (b"sRGB", b"gAMA", b"cHRM"):
+                data = Optimizer._strip_png_chunks(data, stale)
+            if data[12:16] != b"IHDR":
+                return
+            at = 8 + 8 + int.from_bytes(data[8:12], "big") + 4
+            png_path.write_bytes(data[:at] + chunk + data[at:])
+        except Exception:
+            pass
+
+    @staticmethod
+    def _write_without_icc(src: Path, dst: Path) -> bool:
+        """Write a copy of PNG `src` without its iCCP chunk to `dst`.
+        Returns False (and writes nothing) when there is nothing to strip.
+
+        pngquant colour-manages an input that carries a profile - it converts
+        the pixels to sRGB and replaces the profile with gAMA + sRGB. Feeding
+        it this copy keeps the pixels in the source's own space, so the
+        original profile can be attached to the result afterwards and still
+        describe them."""
+        try:
+            data = src.read_bytes()
+            if data[:8] != PNG_MAGIC or Optimizer._find_png_chunk_offset(data, b"iCCP") is None:
+                return False
+            dst.write_bytes(Optimizer._strip_png_chunks(data, b"iCCP"))
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _remove_png_icc(png_path: Path) -> None:
+        """Drop any iCCP chunk from a finished PNG. Best-effort, never raises."""
+        try:
+            data = png_path.read_bytes()
+            if data[:8] != PNG_MAGIC or Optimizer._find_png_chunk_offset(data, b"iCCP") is None:
+                return
+            png_path.write_bytes(Optimizer._strip_png_chunks(data, b"iCCP"))
+        except Exception:
+            pass
+
+    async def optimize_image(self, input_path: Path, output_path: Path, *args, **kwargs) -> dict:
+        """Run the pipeline for one file (see `_optimize_image` for the
+        parameters), then flag a result that came out larger than its
+        source."""
+        result = await self._optimize_image(input_path, output_path, *args, **kwargs)
+        self._warn_if_larger(input_path, output_path, result)
+        return result
+
+    @staticmethod
+    def _warn_if_larger(input_path: Path, output_path: Path, result: dict) -> None:
+        """A same-format result that grows is already replaced by the stripped
+        original (`_apply_growth_guard`). Across formats the original cannot
+        stand in, so a larger result is kept and flagged instead of being
+        reported as a plain success. An existing warning is never replaced."""
+        try:
+            if not result.get("success") or result.get("warning") or result.get("kept_original"):
+                return
+            orig, comp = result.get("original_size"), result.get("compressed_size")
+            if orig and comp and comp > orig:
+                result["warning"] = (
+                    f"output is larger than the original ({comp} vs {orig} bytes): "
+                    f"converting {Path(input_path).suffix.lower() or 'this'} to "
+                    f"{Path(output_path).suffix.lower()} can increase the size; "
+                    "keep the original format if size matters"
+                )
+        except Exception:
+            pass
+
+    async def _optimize_image(
         self,
         input_path: Path,
         output_path: Path,
@@ -655,9 +908,30 @@ class Optimizer:
         output_format: str = "png",
         progress_callback: Optional[Callable] = None,
         keep_exif: bool = False,
+        keep_icc: bool = True,
     ) -> dict:
         if compression_mode not in ("standard", "lossless", "resize_only", "screenshot"):
             compression_mode = "standard"
+
+        # Refuse inputs the pipeline cannot represent. Pillow decodes only the
+        # first frame, so an animated WebP/GIF/APNG or a multi-page TIFF would
+        # otherwise be flattened to one frame and reported as a success.
+        frames = await self._run_bounded(self._frame_count, input_path)
+        if frames > 1:
+            size = os.path.getsize(input_path)
+            return {
+                "success": False,
+                "original_size": size,
+                "compressed_size": size,
+                "error": (
+                    f"animated or multi-page image ({frames} frames): not supported, "
+                    "left untouched to avoid dropping frames"
+                ),
+                "warning": None,
+                # A deliberate refusal, not an encoder failure: callers that
+                # distinguish the two (the CLI report) can say "skipped".
+                "unsupported": True,
+            }
 
         # Capture a cleaned EXIF copy from the source up front (before any
         # pipeline step that strips/transposes it). Attached to the output
@@ -668,22 +942,31 @@ class Optimizer:
         if keep_exif:
             cleaned_exif = self._capture_cleaned_exif(input_path)
 
+        # Same idea for the colour profile: read it once from the source and
+        # let each pipeline carry it onto its output. Pillow decodes into the
+        # profile's own numbers and we write those numbers back out, so the
+        # profile is what keeps the result looking the way the source did.
+        icc_profile = self._capture_icc(input_path) if keep_icc else b""
+
         if output_format == "webp":
             return await self._optimize_webp(
                 input_path, output_path, quality, max_width, compression_mode,
                 progress_callback, keep_exif=keep_exif, cleaned_exif=cleaned_exif,
+                icc_profile=icc_profile,
             )
 
         if output_format in ("jpg", "jpeg"):
             return await self._optimize_jpeg(
                 input_path, output_path, quality, max_width, compression_mode,
                 progress_callback, keep_exif=keep_exif, cleaned_exif=cleaned_exif,
+                icc_profile=icc_profile,
             )
 
         if output_format == "avif":
             return await self._optimize_avif(
                 input_path, output_path, quality, max_width, compression_mode,
                 progress_callback, keep_exif=keep_exif, cleaned_exif=cleaned_exif,
+                icc_profile=icc_profile,
             )
 
         original_size = os.path.getsize(input_path)
@@ -698,13 +981,12 @@ class Optimizer:
 
         try:
             working_path = input_path
-            loop = asyncio.get_running_loop()
 
             # Step 0: guarantee we're working with a real PNG from here on, regardless
             # of the source format and regardless of whether a resize happens next.
             if not self._is_png(working_path):
                 normalized = output_path.with_suffix(".src.png")
-                await loop.run_in_executor(None, self._ensure_png, working_path, normalized)
+                await self._run_bounded(self._ensure_png, working_path, normalized, icc_profile)
                 if normalized.exists():
                     if progress_callback:
                         await progress_callback("converted to PNG")
@@ -719,7 +1001,7 @@ class Optimizer:
             # comment below for the empirical numbers behind this).
             if max_width > 0 and compression_mode != "screenshot":
                 resized = output_path.with_suffix(".resized.png")
-                await loop.run_in_executor(None, self._resize_image, working_path, resized, max_width)
+                await self._run_bounded(self._resize_image, working_path, resized, max_width, icc_profile)
                 if resized.exists():
                     if progress_callback:
                         await progress_callback(f"resized to <= {max_width}px")
@@ -803,14 +1085,20 @@ class Optimizer:
                 map_path: Optional[Path] = None
                 if protected_colors:
                     map_path = output_path.with_suffix(".mapcolors.png")
-                    made = await loop.run_in_executor(None, self._make_color_map, protected_colors, map_path)
+                    made = await self._run_bounded(self._make_color_map, protected_colors, map_path)
                     if made:
                         cmd += ["--map", str(map_path)]
                         temp_files.append(map_path)
                     else:
                         map_path = None
 
-                cmd += ["--output", str(pngquant_tmp), str(working_path)]
+                pq_input = working_path
+                if icc_profile:
+                    noicc = output_path.with_suffix(".noicc.png")
+                    if await asyncio.to_thread(self._write_without_icc, working_path, noicc):
+                        temp_files.append(noicc)
+                        pq_input = noicc
+                cmd += ["--output", str(pngquant_tmp), str(pq_input)]
 
                 async with self._semaphore:
                     proc = await asyncio.create_subprocess_exec(
@@ -818,7 +1106,7 @@ class Optimizer:
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
-                    _, stderr, timed_out = await self._communicate_with_timeout(proc)
+                    _, stderr, timed_out = await self._communicate_with_timeout(proc, timeout=await asyncio.to_thread(self._timeout_for, working_path))
 
                 if timed_out:
                     # A killed pngquant can leave a partial file at its own
@@ -894,7 +1182,7 @@ class Optimizer:
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
-                    _, stderr, timed_out = await self._communicate_with_timeout(proc)
+                    _, stderr, timed_out = await self._communicate_with_timeout(proc, timeout=await asyncio.to_thread(self._timeout_for, working_path))
 
                 if timed_out:
                     # Same partial-write hazard as pngquant above: a killed
@@ -947,8 +1235,25 @@ class Optimizer:
                 result["error"] = "output file not generated"
 
             self._apply_growth_guard(
-                input_path, output_path, "png", result, keep_exif, cleaned_exif
+                input_path, output_path, "png", result, keep_exif, cleaned_exif, icc_profile
             )
+
+            # After the growth guard: its fallback replaces the file with a
+            # stripped copy of the original, so anything attached earlier
+            # would be thrown away here. The chunk adds a few hundred bytes,
+            # so the reported size is refreshed to stay truthful.
+            if icc_profile:
+                self._finalize_png_icc(output_path, icc_profile)
+            else:
+                # No profile to carry (--strip-icc, or the source's profile
+                # did not describe RGB pixels): oxipng's "--strip safe" and a
+                # PNG that skipped re-encoding both keep an existing iCCP.
+                self._remove_png_icc(output_path)
+            if result["success"]:
+                try:
+                    result["compressed_size"] = os.path.getsize(output_path)
+                except OSError:
+                    pass
 
         except Exception as e:
             result["success"] = False
@@ -968,6 +1273,10 @@ class Optimizer:
 
         return result
 
+    # Historical name, kept for callers that still use it: this method
+    # handles every output format (PNG, WebP, JPEG, AVIF), not just PNG.
+    optimize_png = optimize_image
+
     async def _optimize_webp(
         self,
         input_path: Path,
@@ -979,6 +1288,7 @@ class Optimizer:
         *,
         keep_exif: bool = False,
         cleaned_exif: bytes = b"",
+        icc_profile: bytes = b"",
     ) -> dict:
         """WebP goes through Pillow's own encoder rather than pngquant/oxipng
         (which only understand PNG) — there's no external binary dependency
@@ -992,7 +1302,6 @@ class Optimizer:
             "warning": None,
         }
         try:
-            loop = asyncio.get_running_loop()
 
             def _encode():
                 with Image.open(input_path) as opened:
@@ -1000,13 +1309,12 @@ class Optimizer:
                     # output shouldn't come out sideways either.
                     img = ImageOps.exif_transpose(opened)
                     if img.mode == "CMYK":
-                        img = img.convert("RGB")
+                        img = cmyk_to_rgb(img)
 
                     if max_width > 0:
-                        w, h = img.size
-                        if w > max_width:
-                            ratio = max_width / w
-                            img = img.resize((max_width, int(h * ratio)), Image.Resampling.LANCZOS)
+                        new_size = fit_width(img.size, max_width)
+                        if new_size:
+                            img = img.resize(new_size, Image.Resampling.LANCZOS)
 
                     # Drop any EXIF carried in info so default (keep_exif=False)
                     # WebP output is metadata-free; attach the cleaned copy
@@ -1021,6 +1329,12 @@ class Optimizer:
                         save_kwargs = {"format": "WEBP", "quality": q, "method": 6}
                     if keep_exif and cleaned_exif:
                         save_kwargs["exif"] = cleaned_exif
+                    # ICCP chunk: without it a wide-gamut source's numbers
+                    # get reinterpreted as sRGB and the image looks washed
+                    # out. Pillow writes the profile straight into the
+                    # container, so no post-processing is needed here.
+                    if icc_profile:
+                        save_kwargs["icc_profile"] = icc_profile
                     img.save(output_path, **save_kwargs)
 
             if progress_callback:
@@ -1028,7 +1342,7 @@ class Optimizer:
                 await progress_callback(f"encoding WebP ({mode_desc})...")
 
             async with self._semaphore:
-                await loop.run_in_executor(None, _encode)
+                await self._run_bounded(_encode)
 
             if output_path.exists():
                 result["compressed_size"] = os.path.getsize(output_path)
@@ -1037,7 +1351,8 @@ class Optimizer:
                 result["error"] = "output file not generated"
 
             self._apply_growth_guard(
-                input_path, output_path, "webp", result, keep_exif, cleaned_exif
+                input_path, output_path, "webp", result, keep_exif, cleaned_exif,
+                icc_profile,
             )
         except Exception as e:
             result["success"] = False
@@ -1056,6 +1371,7 @@ class Optimizer:
         *,
         keep_exif: bool = False,
         cleaned_exif: bytes = b"",
+        icc_profile: bytes = b"",
     ) -> dict:
         """Lossy JPEG re-encode through mozjpeg's cjpeg, keeping the JPEG
         format (the output stays a .jpg — no conversion to PNG/WebP).
@@ -1101,7 +1417,6 @@ class Optimizer:
 
         temp_files: list = []
         try:
-            loop = asyncio.get_running_loop()
             ppm_path = output_path.with_suffix(".src.ppm")
             tmp_jpg = output_path.with_suffix(".cjpeg.jpg")
             temp_files = [ppm_path, tmp_jpg]
@@ -1112,7 +1427,7 @@ class Optimizer:
                     # — a portrait phone JPEG must not come out sideways.
                     img = ImageOps.exif_transpose(opened)
                     if img.mode == "CMYK":
-                        img = img.convert("RGB")
+                        img = cmyk_to_rgb(img)
                     elif img.mode not in ("RGB", "L", "I;16"):
                         # RGBA/LA/PA/P carry an alpha channel JPEG can't
                         # hold — composite transparency onto white instead
@@ -1123,10 +1438,9 @@ class Optimizer:
                         img = bg
 
                     if max_width > 0:
-                        w, h = img.size
-                        if w > max_width:
-                            ratio = max_width / w
-                            img = img.resize((max_width, int(h * ratio)), Image.Resampling.LANCZOS)
+                        new_size = fit_width(img.size, max_width)
+                        if new_size:
+                            img = img.resize(new_size, Image.Resampling.LANCZOS)
 
                     # cjpeg starts fresh from the PPM so metadata can't
                     # survive (matches the keep_exif=False strip-everything
@@ -1138,7 +1452,7 @@ class Optimizer:
             if progress_callback:
                 mode_desc = "near-lossless" if compression_mode in ("lossless", "resize_only") else f"quality={q}"
                 await progress_callback(f"encoding JPEG via mozjpeg ({mode_desc})...")
-            await loop.run_in_executor(None, _prepare_ppm)
+            await self._run_bounded(_prepare_ppm)
 
             async with self._semaphore:
                 proc = await asyncio.create_subprocess_exec(
@@ -1151,7 +1465,7 @@ class Optimizer:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                _, stderr, timed_out = await self._communicate_with_timeout(proc)
+                _, stderr, timed_out = await self._communicate_with_timeout(proc, timeout=await asyncio.to_thread(self._timeout_for, input_path))
 
             if timed_out:
                 # Killed cjpeg can leave a partial file at -outfile.
@@ -1161,6 +1475,11 @@ class Optimizer:
                     pass
 
             if tmp_jpg.exists():
+                # The PPM intermediate carries pixels only, so cjpeg's output
+                # is metadata-free. Both segments are re-attached here, in the
+                # order a camera writes them (APP2 profile, then APP1 Exif).
+                if icc_profile:
+                    self._embed_jpeg_icc(tmp_jpg, icc_profile)
                 if keep_exif and cleaned_exif:
                     self._finalize_jpeg_exif(tmp_jpg, cleaned_exif)
                 tmp_jpg.replace(output_path)
@@ -1179,7 +1498,8 @@ class Optimizer:
                 result["error"] = "output file not generated"
 
             self._apply_growth_guard(
-                input_path, output_path, "jpg", result, keep_exif, cleaned_exif
+                input_path, output_path, "jpg", result, keep_exif, cleaned_exif,
+                icc_profile,
             )
         except Exception as e:
             result["success"] = False
@@ -1221,6 +1541,42 @@ class Optimizer:
         except Exception:
             pass
 
+    @staticmethod
+    def _embed_jpeg_icc(jpg_path: Path, icc_bytes: bytes) -> None:
+        """Attach an ICC profile to a finished JPEG as APP2 'ICC_PROFILE'
+        segment(s) right after SOI.
+
+        An ICC segment's payload is limited to 65535 bytes including its own
+        length field, so a real profile (Adobe RGB is ~560 KB) is split into
+        chunks of at most 65519 bytes, each tagged with a 1-based sequence
+        number and the total count — the layout ICC.1:2001 §B.4 specifies and
+        every colour-managed reader expects. A profile needing more than 255
+        chunks cannot be represented and is skipped rather than written
+        wrongly. Best-effort — never raises: losing colour management must not
+        turn a successful compression into a failure."""
+        if not icc_bytes:
+            return
+        try:
+            data = jpg_path.read_bytes()
+            if data[:2] != b"\xff\xd8":  # no SOI — not a JPEG, leave it alone
+                return
+            step = 65519
+            chunks = [icc_bytes[i:i + step] for i in range(0, len(icc_bytes), step)]
+            if len(chunks) > 255:
+                return
+            segments = bytearray()
+            for index, chunk in enumerate(chunks, start=1):
+                payload = b"ICC_PROFILE\x00" + bytes((index, len(chunks))) + chunk
+                segments += b"\xff\xe2" + struct.pack(">H", len(payload) + 2) + payload
+            # Keep a leading JFIF APP0 directly after SOI (the JFIF spec
+            # requires it there); the profile goes right behind it.
+            at = 2
+            if data[2:4] == b"\xff\xe0" and len(data) >= 6:
+                at = 4 + struct.unpack(">H", data[4:6])[0]
+            jpg_path.write_bytes(data[:at] + bytes(segments) + data[at:])
+        except Exception:
+            pass
+
     async def _optimize_avif(
         self,
         input_path: Path,
@@ -1232,6 +1588,7 @@ class Optimizer:
         *,
         keep_exif: bool = False,
         cleaned_exif: bytes = b"",
+        icc_profile: bytes = b"",
     ) -> dict:
         """AVIF encode through avifenc. Source is decoded with Pillow (EXIF
         orientation baked in, optional resize) and written to a PNG
@@ -1280,7 +1637,6 @@ class Optimizer:
 
         temp_files: list = []
         try:
-            loop = asyncio.get_running_loop()
             intermediate_path = output_path.with_suffix(".src.png")
             tmp_avif = output_path.with_suffix(".avifenc.avif")
             temp_files = [intermediate_path, tmp_avif]
@@ -1289,7 +1645,7 @@ class Optimizer:
                 with Image.open(input_path) as opened:
                     img = ImageOps.exif_transpose(opened)
                     if img.mode == "CMYK":
-                        img = img.convert("RGB")
+                        img = cmyk_to_rgb(img)
                     elif img.mode not in ("RGB", "RGBA", "L"):
                         # Anything else (P/palette, LA, etc.) — normalize to
                         # RGBA so a possible alpha channel survives; avifenc
@@ -1299,18 +1655,24 @@ class Optimizer:
                         img = img.convert("RGB")
 
                     if max_width > 0:
-                        w, h = img.size
-                        if w > max_width:
-                            ratio = max_width / w
-                            img = img.resize((max_width, int(h * ratio)), Image.Resampling.LANCZOS)
+                        new_size = fit_width(img.size, max_width)
+                        if new_size:
+                            img = img.resize(new_size, Image.Resampling.LANCZOS)
 
                     img.info.pop("exif", None)
-                    img.save(intermediate_path, format="PNG")
+                    img.info.pop("icc_profile", None)  # see _ensure_png
+                    # The profile rides in the PNG's iCCP chunk; avifenc reads
+                    # the embedded profile from its input and copies it into
+                    # the AVIF's colr box (that is what its --ignore-icc flag
+                    # is there to turn off), so no extra command-line plumbing
+                    # is needed — and no risk from flag support in older builds.
+                    save_kwargs = {"icc_profile": icc_profile} if icc_profile else {}
+                    img.save(intermediate_path, format="PNG", **save_kwargs)
 
             if progress_callback:
                 mode_desc = "lossless" if is_lossless else f"quality={q}"
                 await progress_callback(f"encoding AVIF via avifenc ({mode_desc})...")
-            await loop.run_in_executor(None, _prepare_intermediate)
+            await self._run_bounded(_prepare_intermediate)
 
             cmd = [
                 str(self.avifenc_path),
@@ -1338,7 +1700,7 @@ class Optimizer:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                _, stderr, timed_out = await self._communicate_with_timeout(proc)
+                _, stderr, timed_out = await self._communicate_with_timeout(proc, timeout=await asyncio.to_thread(self._timeout_for, input_path))
 
             if timed_out:
                 # Killed avifenc can leave a partial file at -o; the
