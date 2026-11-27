@@ -12,6 +12,22 @@ All notable changes to this project will be documented in this file.
   write.
 
 ### Fixed
+- PNG output in Standard/Screenshot mode no longer mislabels pixels: pngquant
+  colour-manages an input that carries an ICC profile (it converts to sRGB and
+  drops the profile), so it now receives a profile-less copy and the original
+  profile is attached afterwards, directly behind IHDR (the PNG spec requires
+  iCCP before PLTE/IDAT). `--strip-icc` now works for PNG, and a profile that
+  does not describe RGB pixels (CMYK, grayscale) is no longer attached.
+- CMYK sources are converted through their ICC profile instead of a naive
+  formula.
+- `.gif` and `.mpo` files are no longer silently ignored by the scan and Watch.
+  An input that cannot be represented (animated GIF/PNG/WebP, multi-page
+  TIFF) is reported by the CLI as `skipped` (new `summary.skipped`) instead of
+  `failed`, and no longer makes the exit code `1`.
+- An output path the filesystem cannot hold (name over 255 bytes, Windows
+  MAX_PATH without long paths) fails that file up front with the reason.
+- A result larger than its source after a format conversion now carries a
+  warning instead of a plain success.
 - The CLI and the web batch no longer accept an output folder equal to the
   source folder (originals were replaced) or inside a recursively scanned
   source (the next run re-compressed its own output). One shared rule now
