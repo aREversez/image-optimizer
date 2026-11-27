@@ -22,6 +22,9 @@ from typing import Union
 _REPLACE_ATTEMPTS = 6
 _REPLACE_BACKOFF_SECONDS = 0.005
 
+# Characters of the destination name kept in a temp name (see staging_path).
+_STEM_KEEP = 60
+
 
 def staging_path(dest: Path) -> Path:
     """A unique hidden sibling of `dest` that keeps dest's suffix.
@@ -31,7 +34,11 @@ def staging_path(dest: Path) -> Path:
     leftover from a crash out of normal listings and out of "already
     optimized" checks that match the real output name."""
     dest = Path(dest)
-    return dest.with_name(f".{dest.stem}.part-{os.getpid()}-{uuid.uuid4().hex[:8]}{dest.suffix}")
+    # The stem is cut so the whole name stays well inside the 255-byte limit
+    # of common filesystems; a legal 240-character output name must not make
+    # its own staging file un-creatable.
+    stem = dest.stem[:_STEM_KEEP]
+    return dest.with_name(f".{stem}.part-{os.getpid()}-{uuid.uuid4().hex[:8]}{dest.suffix}")
 
 
 def replace_with_retry(src: Path, dest: Path) -> None:
@@ -83,7 +90,7 @@ def atomic_write_text(
     data before the rename (survives power loss, costs a disk flush per
     call, so it is off for state files that are rewritten after every image)."""
     path = Path(path)
-    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
+    tmp = path.with_name(f".{path.name[:_STEM_KEEP]}.tmp-{os.getpid()}-{uuid.uuid4().hex[:8]}")
     try:
         with open(tmp, "w", encoding=encoding, newline="") as f:
             f.write(text)
