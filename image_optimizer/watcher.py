@@ -38,7 +38,7 @@ from typing import Awaitable, Callable, Optional
 
 # Same extensions the scan flow accepts (see image_optimizer/main.py SCAN_EXTS) — case-
 # folded so "photo.PNG" is caught on case-sensitive filesystems too.
-IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".gif", ".mpo"}
 
 
 class FolderWatcher:

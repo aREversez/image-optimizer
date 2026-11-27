@@ -805,6 +805,8 @@ _MEDIA_TYPES = {
     ".tif": "image/tiff",
     ".tiff": "image/tiff",
     ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".mpo": "image/jpeg",
     ".avif": "image/avif",
 }
 
@@ -995,7 +997,7 @@ async def _run_worker_pool(
     await asyncio.gather(*workers)
 
 
-SCAN_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
+SCAN_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp", ".gif", ".mpo"}
 
 
 def _scan_images(directory: Path, recursive: bool = True) -> list:
@@ -3670,12 +3672,14 @@ _CLI_SUCCESS_STATUSES = ("compressed", "cached", "kept_original")
 def _build_cli_report(files: list, run_warnings: Optional[list] = None) -> dict:
     """Machine-readable result of a CLI run (--json). `files` holds one record
     per scanned file; statuses are mutually exclusive: compressed, cached,
-    kept_original (growth-guard fallback), excluded, failed. Size totals and
+    kept_original (growth-guard fallback), excluded, skipped (an input the
+    pipeline cannot represent, e.g. an animation: left untouched, not an
+    error), failed. Size totals and
     saved_percent cover the successful statuses only. `total` counts every
     scanned file, excluded ones included. `warnings` lists run-level warnings
     (e.g. a missing encoder that downgrades the requested mode); each file
     record has its own `warnings` list (empty when there is nothing to say)."""
-    counts = {"compressed": 0, "cached": 0, "excluded": 0, "failed": 0, "kept_original": 0}
+    counts = {"compressed": 0, "cached": 0, "excluded": 0, "failed": 0, "kept_original": 0, "skipped": 0}
     orig = comp = 0
     for f in files:
         counts[f["status"]] += 1
@@ -3691,6 +3695,7 @@ def _build_cli_report(files: list, run_warnings: Optional[list] = None) -> dict:
             "cached": counts["cached"],
             "excluded": counts["excluded"],
             "failed": counts["failed"],
+            "skipped": counts["skipped"],
             "kept_original": counts["kept_original"],
             "warned": sum(1 for f in files if f.get("warnings")),
             "original_size": orig,
@@ -3898,7 +3903,7 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
         )
 
     total = len(images)
-    counters = {"done": 0, "ok": 0, "failed": 0, "orig": 0, "comp": 0, "cached": 0}
+    counters = {"done": 0, "ok": 0, "failed": 0, "skipped": 0, "orig": 0, "comp": 0, "cached": 0}
     # Entry paths stored during this run; handed to evict(protect=...) so a
     # run never deletes the results it just wrote (see cache.ContentCache.evict).
     protected_entries: set = set()
@@ -4034,6 +4039,22 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
                 )
                 if result.get("warning"):
                     log(f"[Warning] {rel}: {result['warning']}")
+            elif result.get("unsupported"):
+                # Refused on purpose (e.g. an animation that would be
+                # flattened): the file is untouched and nothing is wrong
+                # with the run, so it is a skip with the reason as a warning
+                # (--strict still turns it into an exit 1).
+                counters["skipped"] += 1
+                records[img_path] = {
+                    "rel": img_path.relative_to(source).as_posix(),
+                    "output_name": None,
+                    "original_size": result.get("original_size"),
+                    "compressed_size": None,
+                    "status": "skipped",
+                    "error": None,
+                    "warnings": [result.get("error") or "unsupported input"],
+                }
+                log(f"[{d}/{total}] SKIP {rel}: {result.get('error') or 'unsupported input'}")
             else:
                 counters["failed"] += 1
                 records[img_path] = fail_record(
@@ -4083,7 +4104,11 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
         evicted = 0
 
     log()
-    log(f"Done: {counters['ok']} succeeded, {counters['failed']} failed, {total} total")
+    log(
+        f"Done: {counters['ok']} succeeded, {counters['failed']} failed, "
+        + (f"{counters['skipped']} skipped, " if counters["skipped"] else "")
+        + f"{total} total"
+    )
     if n_excluded:
         log(f"Excluded: {n_excluded} file(s) by --include/--exclude")
     if cache is not None:

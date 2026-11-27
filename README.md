@@ -15,7 +15,7 @@ compression of UI/software screenshots.
 ## Features
 
 - **Local folder scanning** — select a directory, scan recursively (optional), and pick which files to optimize
-- **File upload** — drag or browse to upload individual images (PNG, JPG, BMP, TIFF, WebP)
+- **File upload** — drag or browse to upload individual images (PNG, JPG, BMP, TIFF, WebP, GIF, MPO)
 - **File sorting** — sort scanned files by modified/created time (newest/oldest) or size (large/small), handy for grabbing the latest screenshots or targeting the biggest files
 - **Watch Mode** — monitor a folder and auto-optimize new or changed images as they appear, with live SSE-streamed logs and rename detection
 - **Batch resume** — progress is persisted per output folder; an interrupted batch (crash, cancel, server restart) can be resumed where it left off
@@ -198,12 +198,12 @@ image-optimizer --source ./raw --output ./out --json | jq .summary
      "compressed_size": 5120, "status": "compressed", "error": null, "warnings": []}
   ],
   "summary": {"total": 1, "compressed": 1, "cached": 0, "excluded": 0, "failed": 0,
-              "kept_original": 0, "warned": 0, "original_size": 20480,
+              "kept_original": 0, "skipped": 0, "warned": 0, "original_size": 20480,
               "compressed_size": 5120, "saved_percent": 75.0}
 }
 ```
 
-`status` is one of `compressed`, `cached` (served from `--cache-dir`), `kept_original` (the result was not smaller, so the original's pixels were kept with metadata stripped), `excluded` or `failed`. Size totals and `saved_percent` cover the successful statuses; `total` counts every scanned file, excluded ones included. `warnings` (top level) lists run-level problems such as a missing encoder that downgrades the requested mode (for example only `oxipng` installed, so `--mode standard` is lossless-only); each file's `warnings` carries what the optimizer reported for that file, and `summary.warned` counts files with any. The exit code is `1` only if a file failed, or, with `--strict`, if the run produced any warning. Setup errors (bad arguments, missing `--source`, an `--output` directory that cannot be created) exit `1` with a message on stderr and no JSON.
+`status` is one of `compressed`, `cached` (served from `--cache-dir`), `kept_original` (the result was not smaller, so the original's pixels were kept with metadata stripped), `excluded`, `skipped` (an input that cannot be represented, such as an animated GIF/PNG/WebP or a multi-page TIFF: left untouched, the reason is in `warnings`, and it does not make the exit code `1`) or `failed`. Size totals and `saved_percent` cover the successful statuses; `total` counts every scanned file, excluded ones included. `warnings` (top level) lists run-level problems such as a missing encoder that downgrades the requested mode (for example only `oxipng` installed, so `--mode standard` is lossless-only); each file's `warnings` carries what the optimizer reported for that file, and `summary.warned` counts files with any. The exit code is `1` only if a file failed, or, with `--strict`, if the run produced any warning. Setup errors (bad arguments, missing `--source`, an `--output` directory that cannot be created) exit `1` with a message on stderr and no JSON.
 
 ## Configuration
 

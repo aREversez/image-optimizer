@@ -871,6 +871,9 @@ class Optimizer:
                     "left untouched to avoid dropping frames"
                 ),
                 "warning": None,
+                # A deliberate refusal, not an encoder failure: callers that
+                # distinguish the two (the CLI report) can say "skipped".
+                "unsupported": True,
             }
 
         # Capture a cleaned EXIF copy from the source up front (before any
