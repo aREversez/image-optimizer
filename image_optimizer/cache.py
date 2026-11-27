@@ -199,6 +199,22 @@ def _publish(tmp: Path, entry: Path, output_format: str) -> None:
             time.sleep(_REPLACE_BACKOFF_SECONDS * (2 ** attempt))
 
 
+def _copy_entry(entry: Path, out_path: Path) -> bool:
+    """Copy a cache entry to out_path. On Windows, opening an entry that a
+    writer is replacing at that instant fails with PermissionError; retry
+    briefly (same backoff as _publish) and return False if it never clears,
+    so probe() degrades to a miss instead of raising."""
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            shutil.copy2(entry, out_path)
+            return True
+        except PermissionError:
+            if attempt == _REPLACE_ATTEMPTS - 1:
+                return False
+            time.sleep(_REPLACE_BACKOFF_SECONDS * (2 ** attempt))
+    return False
+
+
 def file_sha256(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -280,7 +296,11 @@ class ContentCache:
         entry = self.entry_path(key)
         if not entry.is_file() or not is_valid_reusable_output(entry, self.output_format):
             return CacheProbe(key, original_size, None)
-        shutil.copy2(entry, out_path)
+        if not _copy_entry(entry, out_path):
+            # Still locked after the retries (Windows: a writer is replacing
+            # the entry right now). The cache is only an optimization, so
+            # treat it as a miss and let the caller recompress.
+            return CacheProbe(key, original_size, None)
         try:
             # Recency for LRU eviction.
             os.utime(entry, None)
