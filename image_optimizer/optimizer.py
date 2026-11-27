@@ -783,7 +783,7 @@ class Optimizer:
         (Pillow's icc_profile= argument), but pngquant's --strip and
         oxipng --strip can drop iCCP, so the last word belongs here: if the
         output already carries a profile, leave it alone (it came from the
-        same source); otherwise insert one before IEND. An iCCP payload is
+        same source); otherwise insert one right after IHDR. An iCCP payload is
         a NUL-terminated Latin-1 name, a compression method byte, and the
         zlib-compressed profile. Best-effort — never raises."""
         if not icc_bytes:
@@ -797,12 +797,36 @@ class Optimizer:
             chunk_body = b"ICC profile\x00\x00" + zlib.compress(icc_bytes, 9)
             chunk = struct.pack(">I", len(chunk_body)) + b"iCCP" + chunk_body
             chunk += struct.pack(">I", zlib.crc32(b"iCCP" + chunk_body) & 0xFFFFFFFF)
-            iend_start = Optimizer._find_png_chunk_offset(data, b"IEND")
-            if iend_start is None:
+            # The PNG spec wants iCCP before PLTE and IDAT, and sRGB/gAMA/cHRM
+            # must not accompany it (an sRGB chunk would claim the opposite
+            # of the profile). Right behind IHDR satisfies all of that.
+            for stale in (b"sRGB", b"gAMA", b"cHRM"):
+                data = Optimizer._strip_png_chunks(data, stale)
+            if data[12:16] != b"IHDR":
                 return
-            png_path.write_bytes(data[:iend_start] + chunk + data[iend_start:])
+            at = 8 + 8 + int.from_bytes(data[8:12], "big") + 4
+            png_path.write_bytes(data[:at] + chunk + data[at:])
         except Exception:
             pass
+
+    @staticmethod
+    def _write_without_icc(src: Path, dst: Path) -> bool:
+        """Write a copy of PNG `src` without its iCCP chunk to `dst`.
+        Returns False (and writes nothing) when there is nothing to strip.
+
+        pngquant colour-manages an input that carries a profile - it converts
+        the pixels to sRGB and replaces the profile with gAMA + sRGB. Feeding
+        it this copy keeps the pixels in the source's own space, so the
+        original profile can be attached to the result afterwards and still
+        describe them."""
+        try:
+            data = src.read_bytes()
+            if data[:8] != PNG_MAGIC or Optimizer._find_png_chunk_offset(data, b"iCCP") is None:
+                return False
+            dst.write_bytes(Optimizer._strip_png_chunks(data, b"iCCP"))
+            return True
+        except Exception:
+            return False
 
     @staticmethod
     def _remove_png_icc(png_path: Path) -> None:
@@ -1008,7 +1032,13 @@ class Optimizer:
                     else:
                         map_path = None
 
-                cmd += ["--output", str(pngquant_tmp), str(working_path)]
+                pq_input = working_path
+                if icc_profile:
+                    noicc = output_path.with_suffix(".noicc.png")
+                    if await asyncio.to_thread(self._write_without_icc, working_path, noicc):
+                        temp_files.append(noicc)
+                        pq_input = noicc
+                cmd += ["--output", str(pngquant_tmp), str(pq_input)]
 
                 async with self._semaphore:
                     proc = await asyncio.create_subprocess_exec(

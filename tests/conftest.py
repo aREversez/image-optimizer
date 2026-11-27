@@ -29,6 +29,25 @@ out_path = args[args.index("--output") + 1]
 in_path = args[-1]
 data = open(in_path, "rb").read()
 if data[:8] == PNG_MAGIC:
+    # Real pngquant colour-manages an input that carries an iCCP chunk: it
+    # converts the pixels to sRGB and writes gAMA + sRGB chunks instead of
+    # the profile (verified against pngquant 3.0.3). Mimic the chunk part.
+    pos, out, had_icc = 8, bytearray(data[:8]), False
+    while pos + 8 <= len(data):
+        n = int.from_bytes(data[pos:pos + 4], "big")
+        kind = data[pos + 4:pos + 8]
+        chunk = data[pos:pos + 12 + n]
+        if kind == b"iCCP":
+            had_icc = True
+        else:
+            out += chunk
+        pos += 12 + n
+    if had_icc:
+        import zlib
+        srgb = b"sRGB" + b"\\x00"
+        srgb_chunk = (1).to_bytes(4, "big") + srgb + (zlib.crc32(srgb) & 0xFFFFFFFF).to_bytes(4, "big")
+        out[33:33] = srgb_chunk
+        data = bytes(out)
     open(out_path, "wb").write(data)
     sys.exit(0)
 else:
