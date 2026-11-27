@@ -129,12 +129,23 @@ class TestOutputDirStructure:
         import asyncio
         import shutil
         import sys
+        import threading
+        import time
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         from image_optimizer.main import AppState, _process_files
         from image_optimizer.optimizer import Optimizer
 
+        # The first file to reach the optimizer finishes immediately; every
+        # other file blocks until the test has looked at output_dir. That
+        # makes "mid-run" deterministic instead of a sleep-timing window
+        # (which was flaky on slow Windows runners).
+        release = threading.Event()
+        calls = {"n": 0}
+
         async def slow_optimize(input_path, output_path, **kwargs):
-            await asyncio.sleep(0.25)
+            calls["n"] += 1
+            if calls["n"] > 1:
+                await asyncio.to_thread(release.wait, 30)
             shutil.copy2(input_path, output_path)
             return {"success": True, "original_size": 10, "compressed_size": 5, "error": None, "warning": None}
 
@@ -159,12 +170,20 @@ class TestOutputDirStructure:
 
         async def run_and_check():
             task = asyncio.create_task(_process_files(state, files, "medium", 0, "png", str(out_dir)))
-            await asyncio.sleep(0.3)  # let ~1 file finish, batch still running
-            mid_run_files = list(out_dir.rglob("*.png")) if out_dir.exists() else []
+            mid_run_files = []
+            deadline = time.monotonic() + 10
+            while not task.done() and time.monotonic() < deadline:
+                mid_run_files = list(out_dir.rglob("*.png")) if out_dir.exists() else []
+                if mid_run_files:
+                    break
+                await asyncio.sleep(0.01)
+            still_running = not task.done()
+            release.set()
             await task
-            return mid_run_files
+            return mid_run_files, still_running
 
-        mid_run_files = asyncio.run(run_and_check())
+        mid_run_files, still_running = asyncio.run(run_and_check())
+        assert still_running, "batch should still be running while the other files are blocked"
         assert len(mid_run_files) >= 1, "output_dir should already have partial contents mid-run"
         final_files = list(out_dir.rglob("*.png"))
         assert len(final_files) == 3

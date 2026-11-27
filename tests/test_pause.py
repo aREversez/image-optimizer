@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+import threading
 from io import BytesIO
 from zipfile import ZipFile
 
@@ -235,10 +236,17 @@ class TestPauseWithSkipExistingAndSubset:
         counts: dict[str, int] = {}
         opt = Optimizer(bin_dir=fake_bin_dir)
 
+        # The recompressions block on `gate` until the test has paused, so
+        # the run is guaranteed to still be in progress when /api/pause is
+        # called (no dependence on sleep timing or poll latency).
+        started = threading.Event()
+        gate = threading.Event()
+
         async def slow(input_path, output_path, **kwargs):
             fid = path_to_id[str(input_path)]
             counts[fid] = counts.get(fid, 0) + 1
-            await asyncio.sleep(0.15)
+            started.set()
+            await asyncio.to_thread(gate.wait, 30)
             shutil.copy2(input_path, output_path)
             return {"success": True, "original_size": 10, "compressed_size": 5,
                     "error": None, "warning": None}
@@ -255,11 +263,12 @@ class TestPauseWithSkipExistingAndSubset:
         }, headers=auth_headers)
         assert r.status_code == 200
 
-        # Pause once at least one result is in, then resume and finish.
-        wait_for(lambda: _progress(client, auth_headers)["current"] >= 1)
-        client.post("/api/pause", headers=auth_headers)
+        # Pause while a recompression is in flight, then resume and finish.
+        wait_for(started.is_set)
+        assert client.post("/api/pause", headers=auth_headers).status_code == 200
         assert _progress(client, auth_headers)["paused"] is True
         client.post("/api/resume", headers=auth_headers)
+        gate.set()
 
         prog = wait_for(lambda: (lambda p: not p["running"] and p)(
             _progress(client, auth_headers)
