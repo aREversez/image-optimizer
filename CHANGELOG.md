@@ -4,12 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-27
+
 ### Security
 - The server now validates the `Host` header (loopback names, IP addresses,
   the bound host, or names in `IMAGE_OPTIMIZER_ALLOWED_HOSTS`) and refuses
   state-changing requests that the browser marks as cross-site, closing a
   DNS-rebinding path to the app token and from there to local file read and
   write.
+- Encoder lookup searches the verified per-user directory before `PATH`, and
+  its `PATH` walk ignores empty and relative entries — on Windows the classic
+  search order includes the current directory, so a `pngquant.exe` dropped
+  next to a folder of images could have been executed.
+- The binary bootstrap stages each download under a unique temporary name
+  (two first runs shared one `.part` file) and records the installed file's
+  digest, so an oxipng whose pin only covers the release archive can still be
+  verified on later starts. `IMAGE_OPTIMIZER_<TOOL>_URL` points the fetcher at
+  a mirror when upstream replaces a version-less URL; the pinned digest still
+  applies.
 
 ### Fixed
 - PNG output in Standard/Screenshot mode no longer mislabels pixels: pngquant
@@ -82,18 +94,14 @@ All notable changes to this project will be documented in this file.
 - The encoder timeout scales with pixel count (1x at 4 MP up to 8x), and
   `--timeout` sets the base. A flat 120 s turned a legitimate pngquant
   `--speed 1` pass over a large photo into a reported failure.
-
-### Security
-- Encoder lookup searches the verified per-user directory before `PATH`, and
-  its `PATH` walk ignores empty and relative entries — on Windows the classic
-  search order includes the current directory, so a `pngquant.exe` dropped
-  next to a folder of images could have been executed.
-- The binary bootstrap stages each download under a unique temporary name
-  (two first runs shared one `.part` file) and records the installed file's
-  digest, so an oxipng whose pin only covers the release archive can still be
-  verified on later starts. `IMAGE_OPTIMIZER_<TOOL>_URL` points the fetcher at
-  a mirror when upstream replaces a version-less URL; the pinned digest still
-  applies.
+- The release build downloads the prebuilt oxipng archive from the oxipng
+  release (verified against a pinned SHA-256) instead of building it with
+  cargo. The v1.1.0 Windows and macOS builds died inside
+  `cargo install oxipng`, so that tag never got its desktop downloads;
+  PyPI was unaffected.
+- The staging-name tests skip on a Windows install without long-path
+  support (the OS default) instead of failing: the past-MAX_PATH names they
+  build cannot exist there at all, while the CI runners have the support on.
 
 ### Added
 - CLI: a warning up front when a missing encoder downgrades the requested

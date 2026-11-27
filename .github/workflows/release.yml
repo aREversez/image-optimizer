@@ -58,8 +58,9 @@ jobs:
           choco install nasm -y --no-progress
           "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append
 
-      # The encoders take a few minutes to build (oxipng, mozjpeg), so keep them
-      # between runs; the key changes whenever the pinned versions do.
+      # mozjpeg takes a few minutes to build (the rest are downloads), so
+      # keep the encoders between runs; the key changes whenever the pinned
+      # versions do.
       - name: Cache encoder binaries
         uses: actions/cache@v4
         with:
