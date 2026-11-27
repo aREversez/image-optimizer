@@ -1478,7 +1478,12 @@ class Optimizer:
             for index, chunk in enumerate(chunks, start=1):
                 payload = b"ICC_PROFILE\x00" + bytes((index, len(chunks))) + chunk
                 segments += b"\xff\xe2" + struct.pack(">H", len(payload) + 2) + payload
-            jpg_path.write_bytes(data[:2] + bytes(segments) + data[2:])
+            # Keep a leading JFIF APP0 directly after SOI (the JFIF spec
+            # requires it there); the profile goes right behind it.
+            at = 2
+            if data[2:4] == b"\xff\xe0" and len(data) >= 6:
+                at = 4 + struct.unpack(">H", data[4:6])[0]
+            jpg_path.write_bytes(data[:at] + bytes(segments) + data[at:])
         except Exception:
             pass
 

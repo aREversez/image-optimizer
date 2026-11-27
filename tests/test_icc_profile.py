@@ -140,6 +140,8 @@ def test_multi_segment_jpeg_profile_round_trips(tmp_path):
     data = jpg.read_bytes()
     segments = []
     pos = 2
+    if data[pos:pos + 2] == b"\xff\xe0":  # JFIF APP0 stays first; the profile follows it
+        pos += 2 + int.from_bytes(data[pos + 2:pos + 4], "big")
     while data[pos:pos + 2] == b"\xff\xe2":
         length = int.from_bytes(data[pos + 2:pos + 4], "big")
         segments.append(data[pos + 4:pos + 2 + length])
