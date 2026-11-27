@@ -3419,17 +3419,23 @@ async def _watch_loop(state: AppState, req: WatchRequest):
             # re-save replaces the previous output atomically and a failed
             # or killed encode never leaves a partial file under the real name.
             staged = persistence.staging_path(out_path)
-            result = await optimizer.optimize_image(
-                input_path=abs_path,
-                output_path=staged,
-                quality=req.quality,
-                max_width=req.max_width,
-                compression_mode=req.compression_mode,
-                protected_colors=req.protected_colors,
-                dithering=req.dithering,
-                output_format=req.output_format,
-                keep_exif=req.keep_exif,
-            )
+            try:
+                result = await optimizer.optimize_image(
+                    input_path=abs_path,
+                    output_path=staged,
+                    quality=req.quality,
+                    max_width=req.max_width,
+                    compression_mode=req.compression_mode,
+                    protected_colors=req.protected_colors,
+                    dithering=req.dithering,
+                    output_format=req.output_format,
+                    keep_exif=req.keep_exif,
+                )
+            except BaseException:
+                # Cancelled (Watch stopped) or crashed mid-encode: do not
+                # leave the half-written staging file behind.
+                persistence.discard(staged)
+                raise
 
             if result.get("success"):
                 try:
@@ -3966,13 +3972,17 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
                         "compressed_size": probe.hit_size, "error": None,
                     }
         if result is None:
-            result = await optimizer.optimize_image(
-                img_path, staged,
-                quality=args.quality, max_width=args.max_width, compression_mode=args.mode,
-                protected_colors=protected_colors, dithering=args.dithering,
-                output_format=args.format, keep_exif=args.keep_exif,
-                keep_icc=not getattr(args, "strip_icc", False),
-            )
+            try:
+                result = await optimizer.optimize_image(
+                    img_path, staged,
+                    quality=args.quality, max_width=args.max_width, compression_mode=args.mode,
+                    protected_colors=protected_colors, dithering=args.dithering,
+                    output_format=args.format, keep_exif=args.keep_exif,
+                    keep_icc=not getattr(args, "strip_icc", False),
+                )
+            except BaseException:
+                persistence.discard(staged)  # cancelled/crashed mid-encode
+                raise
             if cache is not None and cache_key is not None and result["success"]:
                 try:
                     protected_entries.add(
