@@ -8,7 +8,8 @@ Usage: python scripts/fetch_tools.py [--bin-dir DIR] [--only NAME ...]
 Sources (all produce binaries with no dependency on libraries from the
 machine that built them, apart from the C runtime):
   pngquant  the `pngquant-cli` wheel on PyPI (needs pip)
-  oxipng    `cargo install oxipng` (needs a Rust toolchain)
+  oxipng    the prebuilt archive from the oxipng GitHub release, verified
+            against the pinned SHA-256 below (no Rust toolchain needed)
   cjpeg     mozjpeg built from source with cmake (needs git, cmake and, on
             x86-64, nasm — the build fails rather than going without SIMD)
   avifenc   the static build libavif publishes with each release (needs the
@@ -16,15 +17,23 @@ machine that built them, apart from the C runtime):
 
 Bump the versions below deliberately: the release workflow caches bin/ keyed
 on this file's hash.
+
+The oxipng switch from `cargo install` to the prebuilt archive is not just
+speed: the v1.1.0 release's Windows and macOS builds died inside
+`cargo install oxipng`, so depending on whatever Rust toolchain the runner
+images happen to ship had already bitten this project once.
 """
 
 import argparse
+import hashlib
 import platform
 import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
+import urllib.request
 import zipfile
 from pathlib import Path
 
@@ -34,6 +43,24 @@ PNGQUANT_CLI_VERSION = "3.0.3"
 OXIPNG_VERSION = "10.2.1"
 MOZJPEG_REF = "v4.1.5"
 LIBAVIF_VERSION = "v1.4.2"
+
+# asset name in the oxipng release -> SHA-256 of that asset. Verified after
+# download, exactly like the runtime bootstrap (image_optimizer/binaries.py)
+# verifies what it fetches.
+OXIPNG_ASSETS = {
+    ("win32", "x64"): (
+        "oxipng-10.2.1-x86_64-pc-windows-msvc.zip",
+        "7e940f83ee46874b73f53031f96a15834cb70b220af27391fb06fe7b4dd798e1",
+    ),
+    ("darwin", "arm64"): (
+        "oxipng-10.2.1-aarch64-apple-darwin.tar.gz",
+        "7039fcfc78e8aa1ed2b57d848057a0296f082e92b3e1807ac65402d10d926764",
+    ),
+    ("linux", "x64"): (
+        "oxipng-10.2.1-x86_64-unknown-linux-gnu.tar.gz",
+        "46e3c4beb9aae57290ad809dd3374b07153579d3322a3778c53900633618b7c6",
+    ),
+}
 
 IS_WINDOWS = sys.platform == "win32"
 EXE = ".exe" if IS_WINDOWS else ""
@@ -62,10 +89,39 @@ def fetch_pngquant(bin_dir: Path, tmp: Path):
     install(exe, bin_dir / f"pngquant{EXE}")
 
 
-def build_oxipng(bin_dir: Path, tmp: Path):
-    run(["cargo", "install", "oxipng", "--locked", "--version", OXIPNG_VERSION,
-         "--root", tmp / "oxipng"])
-    install(tmp / "oxipng" / "bin" / f"oxipng{EXE}", bin_dir / f"oxipng{EXE}")
+def fetch_oxipng(bin_dir: Path, tmp: Path):
+    # libavif-style asset picking: the platform key is (sys.platform family,
+    # platform.machine), normalised.
+    machine = platform.machine().lower()
+    if machine in ("amd64", "x86_64"):
+        arch = "x64"
+    elif machine == "arm64":
+        arch = "arm64"
+    else:
+        arch = machine
+    platform_key = ("win32" if IS_WINDOWS else sys.platform, arch)
+    try:
+        asset, digest = OXIPNG_ASSETS[platform_key]
+    except KeyError:
+        sys.exit(f"No prebuilt oxipng {OXIPNG_VERSION} for {sys.platform}/{machine}")
+    url = (f"https://github.com/oxipng/oxipng/releases/download/"
+           f"v{OXIPNG_VERSION}/{asset}")
+    print(f"downloading {url}")
+    archive = tmp / asset
+    with urllib.request.urlopen(url) as r, open(archive, "wb") as f:
+        shutil.copyfileobj(r, f)
+    got = hashlib.sha256(archive.read_bytes()).hexdigest()
+    if got != digest:
+        sys.exit(f"{asset}: sha256 {got} does not match the pinned {digest}")
+    unpacked = tmp / "unpacked"
+    if asset.endswith(".zip"):
+        with zipfile.ZipFile(archive) as z:
+            z.extractall(unpacked)
+    else:
+        with tarfile.open(archive) as t:
+            t.extractall(unpacked, filter="data")
+    exe = next(p for p in unpacked.rglob(f"oxipng{EXE}") if p.is_file())
+    install(exe, bin_dir / f"oxipng{EXE}")
 
 
 def build_cjpeg(bin_dir: Path, tmp: Path):
@@ -111,7 +167,7 @@ def fetch_avifenc(bin_dir: Path, tmp: Path):
 # name -> (file in bin/ that means "already there", fetch function, version flag)
 TOOLS = {
     "pngquant": (f"pngquant{EXE}", fetch_pngquant, "--version"),
-    "oxipng": (f"oxipng{EXE}", build_oxipng, "--version"),
+    "oxipng": (f"oxipng{EXE}", fetch_oxipng, "--version"),
     "cjpeg": (f"cjpeg-static{EXE}", build_cjpeg, "-version"),
     "avifenc": (f"avifenc{EXE}", fetch_avifenc, "--version"),
 }
