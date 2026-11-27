@@ -1016,7 +1016,7 @@ class Optimizer:
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
-                    _, stderr, timed_out = await self._communicate_with_timeout(proc, timeout=self._timeout_for(working_path))
+                    _, stderr, timed_out = await self._communicate_with_timeout(proc, timeout=await asyncio.to_thread(self._timeout_for, working_path))
 
                 if timed_out:
                     # A killed pngquant can leave a partial file at its own
@@ -1092,7 +1092,7 @@ class Optimizer:
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
-                    _, stderr, timed_out = await self._communicate_with_timeout(proc, timeout=self._timeout_for(working_path))
+                    _, stderr, timed_out = await self._communicate_with_timeout(proc, timeout=await asyncio.to_thread(self._timeout_for, working_path))
 
                 if timed_out:
                     # Same partial-write hazard as pngquant above: a killed
@@ -1375,7 +1375,7 @@ class Optimizer:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                _, stderr, timed_out = await self._communicate_with_timeout(proc, timeout=self._timeout_for(input_path))
+                _, stderr, timed_out = await self._communicate_with_timeout(proc, timeout=await asyncio.to_thread(self._timeout_for, input_path))
 
             if timed_out:
                 # Killed cjpeg can leave a partial file at -outfile.
@@ -1605,7 +1605,7 @@ class Optimizer:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                _, stderr, timed_out = await self._communicate_with_timeout(proc, timeout=self._timeout_for(input_path))
+                _, stderr, timed_out = await self._communicate_with_timeout(proc, timeout=await asyncio.to_thread(self._timeout_for, input_path))
 
             if timed_out:
                 # Killed avifenc can leave a partial file at -o; the
