@@ -868,7 +868,35 @@ class Optimizer:
         except Exception:
             pass
 
-    async def optimize_image(
+    async def optimize_image(self, input_path: Path, output_path: Path, *args, **kwargs) -> dict:
+        """Run the pipeline for one file (see `_optimize_image` for the
+        parameters), then flag a result that came out larger than its
+        source."""
+        result = await self._optimize_image(input_path, output_path, *args, **kwargs)
+        self._warn_if_larger(input_path, output_path, result)
+        return result
+
+    @staticmethod
+    def _warn_if_larger(input_path: Path, output_path: Path, result: dict) -> None:
+        """A same-format result that grows is already replaced by the stripped
+        original (`_apply_growth_guard`). Across formats the original cannot
+        stand in, so a larger result is kept and flagged instead of being
+        reported as a plain success. An existing warning is never replaced."""
+        try:
+            if not result.get("success") or result.get("warning") or result.get("kept_original"):
+                return
+            orig, comp = result.get("original_size"), result.get("compressed_size")
+            if orig and comp and comp > orig:
+                result["warning"] = (
+                    f"output is larger than the original ({comp} vs {orig} bytes): "
+                    f"converting {Path(input_path).suffix.lower() or 'this'} to "
+                    f"{Path(output_path).suffix.lower()} can increase the size; "
+                    "keep the original format if size matters"
+                )
+        except Exception:
+            pass
+
+    async def _optimize_image(
         self,
         input_path: Path,
         output_path: Path,
