@@ -433,8 +433,11 @@ class TestJPEG:
         with Image.open(out) as img:
             assert img.format == "JPEG"
 
-    def test_jpeg_requires_cjpeg(self, tmp_path):
+    def test_jpeg_requires_cjpeg(self, tmp_path, monkeypatch):
         from image_optimizer.optimizer import Optimizer
+        # _find_binary falls back to PATH; a developer machine (e.g. Homebrew
+        # jpeg-turbo) may have a real cjpeg there, so empty PATH too.
+        monkeypatch.setenv("PATH", str(tmp_path / "empty_path_dir"))
         opt = Optimizer(bin_dir=tmp_path / "nonexistent_bin_dir")
         assert opt.cjpeg_path is None
 
@@ -649,9 +652,10 @@ class TestAvailableModes:
                 ("jpg", "standard"), ("jpg", "lossless"), ("jpg", "resize_only"),
                 ("avif", "standard"), ("avif", "lossless"), ("avif", "resize_only")} == modes
 
-    def test_no_binaries_drops_standard_png_and_all_jpeg(self, tmp_path):
+    def test_no_binaries_drops_standard_png_and_all_jpeg(self, tmp_path, monkeypatch):
         from image_optimizer.optimizer import Optimizer
-        # No binaries found in bin_dir → all paths None.
+        # No binaries found in bin_dir or on PATH → all paths None.
+        monkeypatch.setenv("PATH", str(tmp_path / "empty_path_dir"))
         opt = Optimizer(bin_dir=tmp_path / "nonexistent_bin_dir")
         assert opt.pngquant_path is None
         assert opt.oxipng_path is None
