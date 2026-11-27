@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import os
 import re
 import shutil
@@ -11,7 +12,7 @@ import zlib
 from pathlib import Path
 from typing import Callable, Optional
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageCms, ImageOps
 
 from image_optimizer import binaries
 
@@ -45,6 +46,34 @@ EXIF_TAG_ORIENTATION = 0x0112
 EXIF_TAG_GPS_INFO = 0x8825
 EXIF_TAG_EXIF_IFD = 0x8769
 EXIF_TAG_MAKER_NOTE = 0x927C
+
+
+def cmyk_to_rgb(img):
+    """Convert a CMYK image to RGB for the RGB-only output formats.
+
+    Image.convert("RGB") applies a naive formula that ignores the embedded
+    profile; against a colour-managed rendering it was about 30 levels off on
+    average. With a CMYK profile the conversion goes profile -> sRGB (relative
+    colorimetric with black point compensation, what print-to-screen
+    conversions normally use). Without one, or if the profile cannot be used,
+    it falls back to the plain conversion. The result is plain sRGB, so no
+    profile is carried forward (see Optimizer._capture_icc)."""
+    profile = img.info.get("icc_profile")
+    if profile and profile[16:20] == b"CMYK":
+        try:
+            out = ImageCms.profileToProfile(
+                img,
+                ImageCms.ImageCmsProfile(io.BytesIO(profile)),
+                ImageCms.createProfile("sRGB"),
+                renderingIntent=ImageCms.Intent.RELATIVE_COLORIMETRIC,
+                outputMode="RGB",
+                flags=ImageCms.Flags.BLACKPOINTCOMPENSATION,
+            )
+            if out is not None:
+                return out
+        except Exception:
+            pass
+    return img.convert("RGB")
 
 
 def fit_width(size: tuple[int, int], max_width: int):
@@ -566,7 +595,7 @@ class Optimizer:
             # sideways in the optimized output.
             img = ImageOps.exif_transpose(img)
             if img.mode == "CMYK":
-                img = img.convert("RGB")
+                img = cmyk_to_rgb(img)
             # Drop EXIF at normalization. The compress pipeline
             # (pngquant --strip / oxipng --strip safe) strips it anyway in
             # production, but the test stand-in binaries only copy bytes
@@ -1252,7 +1281,7 @@ class Optimizer:
                     # output shouldn't come out sideways either.
                     img = ImageOps.exif_transpose(opened)
                     if img.mode == "CMYK":
-                        img = img.convert("RGB")
+                        img = cmyk_to_rgb(img)
 
                     if max_width > 0:
                         new_size = fit_width(img.size, max_width)
@@ -1370,7 +1399,7 @@ class Optimizer:
                     # — a portrait phone JPEG must not come out sideways.
                     img = ImageOps.exif_transpose(opened)
                     if img.mode == "CMYK":
-                        img = img.convert("RGB")
+                        img = cmyk_to_rgb(img)
                     elif img.mode not in ("RGB", "L", "I;16"):
                         # RGBA/LA/PA/P carry an alpha channel JPEG can't
                         # hold — composite transparency onto white instead
@@ -1588,7 +1617,7 @@ class Optimizer:
                 with Image.open(input_path) as opened:
                     img = ImageOps.exif_transpose(opened)
                     if img.mode == "CMYK":
-                        img = img.convert("RGB")
+                        img = cmyk_to_rgb(img)
                     elif img.mode not in ("RGB", "RGBA", "L"):
                         # Anything else (P/palette, LA, etc.) — normalize to
                         # RGBA so a possible alpha channel survives; avifenc
