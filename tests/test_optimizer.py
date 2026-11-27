@@ -690,6 +690,42 @@ class TestAvailableModes:
         assert opt.ready is False
 
 
+class TestBinaryLookup:
+    """Every spelling is tried in the pinned directories before PATH is
+    consulted at all.
+
+    The macOS release smoke test caught the opposite: the bundle carries
+    mozjpeg's `cjpeg-static`, but the old lookup asked PATH for plain `cjpeg`
+    before it ever tried the second spelling, so Homebrew's jpeg-turbo cjpeg
+    won over the build the release actually ships."""
+
+    @staticmethod
+    def _fake(dir_: Path, name: str) -> Path:
+        exe = dir_ / f"{name}{'.exe' if sys.platform == 'win32' else ''}"
+        exe.write_text("")
+        exe.chmod(0o755)
+        return exe
+
+    def test_bundled_cjpeg_static_beats_a_cjpeg_on_path(self, tmp_path, monkeypatch):
+        from image_optimizer.optimizer import Optimizer
+        bin_dir, path_dir = tmp_path / "bin", tmp_path / "path"
+        bin_dir.mkdir()
+        path_dir.mkdir()
+        bundled = self._fake(bin_dir, "cjpeg-static")
+        self._fake(path_dir, "cjpeg")  # e.g. jpeg-turbo from Homebrew or apt
+        monkeypatch.setenv("PATH", str(path_dir))
+        assert Optimizer(bin_dir=bin_dir).cjpeg_path == bundled.resolve()
+
+    def test_path_cjpeg_still_used_when_the_pinned_dir_has_neither(self, tmp_path, monkeypatch):
+        from image_optimizer.optimizer import Optimizer
+        bin_dir, path_dir = tmp_path / "bin", tmp_path / "path"
+        bin_dir.mkdir()
+        path_dir.mkdir()
+        on_path = self._fake(path_dir, "cjpeg")
+        monkeypatch.setenv("PATH", str(path_dir))
+        assert Optimizer(bin_dir=bin_dir).cjpeg_path == on_path.resolve()
+
+
 class TestAVIF:
     """AVIF output via avifenc external binary."""
 
