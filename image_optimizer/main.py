@@ -1866,6 +1866,13 @@ async def _process_files(
         out_path = out_paths[file_info["id"]]
         if out_path is None:
             raise ValueError("unsafe file name escapes the output directory")
+        # Check the longest path this file will be written to: the final
+        # destination when a folder was chosen, else the workspace copy.
+        problem = planning.path_problem(
+            Path(output_dir) / out_path.relative_to(opt_output_dir) if output_dir else out_path
+        )
+        if problem:
+            raise ValueError(problem)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Resolve this file's effective parameters: a per-file override
@@ -3938,6 +3945,15 @@ async def _run_cli(args, optimizer_instance: Optional["Optimizer"] = None) -> in
                     img_path, "resolved output path escapes --output directory"
                 )
             log(f"[{d}/{total}] FAIL {rel}: resolved output path escapes --output directory")
+            return
+        problem = planning.path_problem(out_path)
+        if problem:
+            async with lock:
+                counters["done"] += 1
+                counters["failed"] += 1
+                d = counters["done"]
+                records[img_path] = fail_record(img_path, problem)
+            log(f"[{d}/{total}] FAIL {rel}: {problem}")
             return
         try:
             out_path.parent.mkdir(parents=True, exist_ok=True)

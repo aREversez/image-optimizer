@@ -205,6 +205,10 @@ image-optimizer --source ./raw --output ./out --json | jq .summary
 
 `status` is one of `compressed`, `cached` (served from `--cache-dir`), `kept_original` (the result was not smaller, so the original's pixels were kept with metadata stripped), `excluded`, `skipped` (an input that cannot be represented, such as an animated GIF/PNG/WebP or a multi-page TIFF: left untouched, the reason is in `warnings`, and it does not make the exit code `1`) or `failed`. Size totals and `saved_percent` cover the successful statuses; `total` counts every scanned file, excluded ones included. `warnings` (top level) lists run-level problems such as a missing encoder that downgrades the requested mode (for example only `oxipng` installed, so `--mode standard` is lossless-only); each file's `warnings` carries what the optimizer reported for that file, and `summary.warned` counts files with any. The exit code is `1` only if a file failed, or, with `--strict`, if the run produced any warning. Setup errors (bad arguments, missing `--source`, an `--output` directory that cannot be created) exit `1` with a message on stderr and no JSON.
 
+### Long file names and paths
+
+An output file name is limited to 255 bytes on every common filesystem, and Windows limits a whole path to 259 characters (including the temporary file written next to each output) unless long paths are enabled. A file whose output would exceed either limit is reported as failed up front with the reason, rather than with an OS error. Changing the format can push a name over the limit (`name.jpg` to `name.webp` is one character longer). On Windows, set the registry value `HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled` to `1` to lift the path limit.
+
 ## Configuration
 
 Command-line flags:

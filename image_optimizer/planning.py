@@ -98,3 +98,62 @@ def planned_outputs_hit_sources(
         if st.st_ino and (st.st_dev, st.st_ino) in source_ids:
             return p
     return None
+
+
+# Filesystem limits. A file NAME is capped at 255 bytes on every common
+# filesystem. Windows additionally caps a whole PATH at 259 characters unless
+# long paths are switched on (registry LongPathsEnabled, which also needs a
+# Python build that opts in). Temp files get a longer name than the final
+# file (see persistence.staging_path) plus a few extra suffix characters for
+# encoder scratch files, so the Windows check keeps that overhead in mind.
+_MAX_NAME_BYTES = 255
+_WINDOWS_MAX_PATH = 259
+_TEMP_NAME_OVERHEAD = 20
+
+
+def windows_long_paths_enabled() -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\FileSystem",
+        ) as key:
+            return bool(winreg.QueryValueEx(key, "LongPathsEnabled")[0])
+    except OSError:
+        return False
+
+
+def path_problem(
+    path: Path, windows: Optional[bool] = None, long_paths: Optional[bool] = None,
+) -> Optional[str]:
+    """Return a message if `path` (a planned output file) cannot be created
+    on this filesystem, else None. Reported up front so the person sees
+    what is wrong instead of an OS error from deep inside the run.
+    `windows` / `long_paths` exist for tests; by default they are detected."""
+    from . import persistence  # local: persistence has no other dependency on this module
+
+    path = Path(path)
+    name_bytes = len(path.name.encode("utf-8", "surrogateescape"))
+    if name_bytes > _MAX_NAME_BYTES:
+        return (
+            f"output file name is {name_bytes} bytes long (the limit is {_MAX_NAME_BYTES} on "
+            f"common filesystems): {path.name[:40]}... Rename the source file shorter."
+        )
+    if windows is None:
+        windows = os.name == "nt"
+    if not windows:
+        return None
+    if long_paths is None:
+        long_paths = windows_long_paths_enabled()
+    if long_paths:
+        return None
+    # The longest thing written for this output is its staging temp file.
+    longest = max(len(str(path)), len(str(persistence.staging_path(path))) + _TEMP_NAME_OVERHEAD)
+    if longest > _WINDOWS_MAX_PATH:
+        return (
+            f"output path is too long for Windows ({len(str(path))} characters, the limit is "
+            f"{_WINDOWS_MAX_PATH} including temp files): {path}. Use a shorter output folder or "
+            "file name, or enable Windows long paths (registry LongPathsEnabled = 1)."
+        )
+    return None
