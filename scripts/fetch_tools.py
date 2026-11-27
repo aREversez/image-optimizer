@@ -18,10 +18,9 @@ machine that built them, apart from the C runtime):
 Bump the versions below deliberately: the release workflow caches bin/ keyed
 on this file's hash.
 
-The oxipng switch from `cargo install` to the prebuilt archive is not just
-speed: the v1.1.0 release's Windows and macOS builds died inside
-`cargo install oxipng`, so depending on whatever Rust toolchain the runner
-images happen to ship had already bitten this project once.
+The oxipng archive is used instead of `cargo install oxipng`, so the build
+does not depend on whatever Rust toolchain a runner image happens to ship;
+mozjpeg is now the only part that compiles, and the slowest.
 """
 
 import argparse
@@ -66,9 +65,36 @@ IS_WINDOWS = sys.platform == "win32"
 EXE = ".exe" if IS_WINDOWS else ""
 
 
+class FetchError(Exception):
+    """A tool could not be installed; main() turns this into an annotation."""
+
+
 def run(cmd, **kwargs):
+    """Run a command, echo its output, and raise FetchError with the tail.
+
+    Output is captured rather than inherited so the last thing the command
+    said can ride along in the failure message; it is echoed either way.
+    """
     print("+ " + " ".join(str(c) for c in cmd), flush=True)
-    subprocess.run([str(c) for c in cmd], check=True, **kwargs)
+    result = subprocess.run([str(c) for c in cmd], capture_output=True, text=True, **kwargs)
+    for stream in (result.stdout, result.stderr):
+        if stream:
+            print(stream, end="", flush=True)
+    if result.returncode != 0:
+        tail = (result.stderr or result.stdout or "").strip()
+        raise FetchError(f"`{Path(str(cmd[0])).name}` exited with {result.returncode}"
+                         + (f": {tail[-800:]}" if tail else ""))
+    return result
+
+
+def fail(message: str):
+    """Exit with a message the CI run surfaces as an annotation.
+
+    A plain traceback only shows up deep in the step log, which needs repo
+    admin rights to read back; `::error::` lines land in the run summary too.
+    """
+    print("::error::" + " ".join(str(message).split()))
+    sys.exit(1)
 
 
 def install(src: Path, dest: Path):
@@ -103,7 +129,7 @@ def fetch_oxipng(bin_dir: Path, tmp: Path):
     try:
         asset, digest = OXIPNG_ASSETS[platform_key]
     except KeyError:
-        sys.exit(f"No prebuilt oxipng {OXIPNG_VERSION} for {sys.platform}/{machine}")
+        fail(f"No prebuilt oxipng {OXIPNG_VERSION} for {sys.platform}/{machine}")
     url = (f"https://github.com/oxipng/oxipng/releases/download/"
            f"v{OXIPNG_VERSION}/{asset}")
     print(f"downloading {url}")
@@ -112,7 +138,7 @@ def fetch_oxipng(bin_dir: Path, tmp: Path):
         shutil.copyfileobj(r, f)
     got = hashlib.sha256(archive.read_bytes()).hexdigest()
     if got != digest:
-        sys.exit(f"{asset}: sha256 {got} does not match the pinned {digest}")
+        fail(f"{asset}: sha256 {got} does not match the pinned {digest}")
     unpacked = tmp / "unpacked"
     if asset.endswith(".zip"):
         with zipfile.ZipFile(archive) as z:
@@ -132,7 +158,14 @@ def build_cjpeg(bin_dir: Path, tmp: Path):
     # support (and with it a libpng dependency) is not needed.
     configure = ["cmake", "-S", src, "-B", build, "-DCMAKE_BUILD_TYPE=Release",
                  "-DBUILD_SHARED_LIBS=OFF", "-DPNG_SUPPORTED=OFF",
-                 "-DWITH_TURBOJPEG=OFF", "-DREQUIRE_SIMD=ON"]
+                 "-DWITH_TURBOJPEG=OFF", "-DREQUIRE_SIMD=ON",
+                 # mozjpeg still declares cmake_minimum_required(VERSION
+                 # 2.8.12), and CMake 4 removed compatibility with anything
+                 # below 3.5 — it stops at CMakeLists.txt:1 on the GitHub
+                 # runners, which ship CMake 4 now. This restores the floor for
+                 # this build only; CMake 3.x ignores it as an unused variable,
+                 # so it is harmless on older machines.
+                 "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"]
     if IS_WINDOWS:
         configure += ["-A", "x64"]
     elif sys.platform == "darwin":
@@ -156,7 +189,7 @@ def fetch_avifenc(bin_dir: Path, tmp: Path):
     elif sys.platform.startswith("linux") and machine in ("x86_64", "amd64"):
         asset = "linux-artifacts.zip"
     else:
-        sys.exit(f"No prebuilt avifenc from libavif for {sys.platform}/{machine}")
+        fail(f"No prebuilt avifenc from libavif for {sys.platform}/{machine}")
     run(["gh", "release", "download", LIBAVIF_VERSION, "--repo", "AOMediaCodec/libavif",
          "--pattern", asset, "--dir", tmp])
     with zipfile.ZipFile(tmp / asset) as z:
@@ -187,14 +220,26 @@ def main():
             print(f"[{name}] already in {args.bin_dir}, skipping")
             continue
         print(f"[{name}] fetching")
-        with tempfile.TemporaryDirectory() as tmp:
-            fetch(args.bin_dir, Path(tmp))
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                fetch(args.bin_dir, Path(tmp))
+        except FetchError as exc:
+            fail(f"{name}: {exc}")
+        except subprocess.CalledProcessError as exc:
+            fail(f"{name}: `{exc.cmd[0]}` exited with {exc.returncode}")
+        except SystemExit:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the message is the point
+            fail(f"{name}: {type(exc).__name__}: {exc}")
         # Smoke-test the result so a binary that cannot run on this machine
         # fails here rather than inside the packaged app.
         result = subprocess.run([str(target), version_flag], capture_output=True, text=True, timeout=60)
-        print(f"[{name}] {(result.stdout or result.stderr).strip().splitlines()[0]}")
+        output = (result.stdout or result.stderr).strip()
+        if output:
+            print(f"[{name}] {output.splitlines()[0]}")
         if result.returncode != 0:
-            sys.exit(f"{target} exited with {result.returncode}")
+            fail(f"{name}: `{filename} {version_flag}` exited with {result.returncode}: "
+                 f"{output or '(no output)'}")
 
 
 if __name__ == "__main__":

@@ -94,11 +94,15 @@ All notable changes to this project will be documented in this file.
 - The encoder timeout scales with pixel count (1x at 4 MP up to 8x), and
   `--timeout` sets the base. A flat 120 s turned a legitimate pngquant
   `--speed 1` pass over a large photo into a reported failure.
+- The release build configures mozjpeg with
+  `-DCMAKE_POLICY_VERSION_MINIMUM=3.5`. The runners moved to CMake 4, which
+  rejects mozjpeg's `cmake_minimum_required(VERSION 2.8.12)` outright and
+  stops at `CMakeLists.txt:1`, so the Windows and macOS builds died while
+  fetching the encoders — v1.1.0 reached PyPI but never got a GitHub Release.
 - The release build downloads the prebuilt oxipng archive from the oxipng
   release (verified against a pinned SHA-256) instead of building it with
-  cargo. The v1.1.0 Windows and macOS builds died inside
-  `cargo install oxipng`, so that tag never got its desktop downloads;
-  PyPI was unaffected.
+  cargo. That drops the dependency on the runners' Rust toolchain and takes
+  several minutes off every build.
 - The staging-name tests skip on a Windows install without long-path
   support (the OS default) instead of failing: the past-MAX_PATH names they
   build cannot exist there at all, while the CI runners have the support on.
