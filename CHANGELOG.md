@@ -106,6 +106,12 @@ All notable changes to this project will be documented in this file.
 - The staging-name tests skip on a Windows install without long-path
   support (the OS default) instead of failing: the past-MAX_PATH names they
   build cannot exist there at all, while the CI runners have the support on.
+- A bundled mozjpeg encoder wins over a same-named `cjpeg` on `PATH` again.
+  Both spellings mozjpeg ships (`cjpeg` and `cjpeg-static`) are now looked
+  for in the app's own directories before `PATH` is consulted at all; the
+  JPEG encoder used to be taken from jpeg-turbo when it happened to be
+  installed (Homebrew, apt), so a machine with it produced worse JPEG output
+  than the release intends. Caught by the release smoke test on macOS.
 
 ### Added
 - CLI: a warning up front when a missing encoder downgrades the requested

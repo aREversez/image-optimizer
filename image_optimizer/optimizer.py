@@ -216,18 +216,10 @@ class Optimizer:
         return modes
 
     def _find_binary(self, name: str) -> Optional[Path]:
-        """Locate an encoder: the pinned directories first, PATH second.
+        """Locate an encoder: the pinned directories first, PATH second."""
+        return self._find_in_bin_dirs(name) or self._find_on_path(name)
 
-        Order matters. The pinned directory is populated by binaries.py,
-        which verifies a SHA-256 before anything becomes executable; PATH is
-        whatever the user's shell, an installer, or a malicious archive put
-        there. A downloaded-and-verified pngquant must therefore win over a
-        same-named file earlier on PATH, not lose to it.
-
-        The PATH walk is done here rather than with shutil.which because on
-        Windows shutil.which prepends the current working directory — for a
-        GUI that was launched from a folder of downloaded images, that means
-        a planted pngquant.exe next to them would be executed."""
+    def _find_in_bin_dirs(self, name: str) -> Optional[Path]:
         exe_name = f"{name}.exe" if sys.platform == "win32" else name
         for directory in self._bin_dirs:
             local = directory / exe_name
@@ -236,6 +228,21 @@ class Optimizer:
                     return local.resolve()
             except OSError:
                 continue
+        return None
+
+    def _find_on_path(self, name: str) -> Optional[Path]:
+        """Walk PATH by hand.
+
+        The pinned directories are searched before this and win. That order
+        matters: they are populated by binaries.py, which verifies a SHA-256
+        before anything becomes executable, while PATH is whatever the user's
+        shell, an installer, or a malicious archive put there.
+
+        Done here rather than with shutil.which because on Windows
+        shutil.which prepends the current working directory — for a GUI that
+        was launched from a folder of downloaded images, that means a planted
+        pngquant.exe next to them would be executed."""
+        exe_name = f"{name}.exe" if sys.platform == "win32" else name
         for entry in os.environ.get("PATH", "").split(os.pathsep):
             entry = entry.strip().strip('"')
             if not entry:
@@ -379,10 +386,19 @@ class Optimizer:
             self.avifenc_path = self._find_binary("avifenc")
 
     def _find_binary_any(self, names: list[str]) -> Optional[Path]:
-        for name in names:
-            path = self._find_binary(name)
-            if path is not None:
-                return path
+        """First spelling found in the pinned directories, then anywhere on PATH.
+
+        Both spellings are tried in the pinned directories *before* PATH is
+        consulted at all. mozjpeg's prebuilt encoder is called `cjpeg` in some
+        archives and `cjpeg-static` in others, and the release bundle carries
+        the second one — so a Homebrew or distro `cjpeg` earlier on PATH used
+        to win over the mozjpeg build the release actually ships (caught by
+        the macOS release smoke test, which found jpeg-turbo's cjpeg)."""
+        for finder in (self._find_in_bin_dirs, self._find_on_path):
+            for name in names:
+                path = finder(name)
+                if path is not None:
+                    return path
         return None
 
     @staticmethod
